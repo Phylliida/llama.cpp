@@ -1349,6 +1349,352 @@ static bool llama_model_load(
     }
 }
 
+// evaluate the transformer on multiple particles
+//
+//   - lctx:          llama context
+//   - tokens:        new batch of tokens to process
+//   - token_indices: indices of the tokens in the new batch
+//   - attn_mask:     attention mask ([N + n_past, N] of 0 or -Inf)
+//   - n_tokens:      number of tokens in the new batch
+//   - n_past:        the context size so far
+//   - n_threads:     number of threads to use
+//
+static bool llama_eval_multi_internal(
+        llama_context & lctx,
+    const llama_token * tokens,
+            const int * token_indices,
+          const float * attn_mask, // [N + n_past, N] of 0 or -Inf, gets added to KV attention logits
+            const int   n_tokens,
+            const int   n_past,
+            const int   n_threads) {
+
+    // enforce that the first token is BOS
+    if (n_past == 0 && tokens[0] != llama_token_bos()) {
+        fprintf(stderr, "%s: first token must be BOS\n", __func__);
+        return false;
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    const int N = n_tokens;
+
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+
+    auto & kv_self = model.kv_self;
+
+    LLAMA_ASSERT(!!kv_self.ctx);
+
+    const int n_embd  = hparams.n_embd;
+    const int n_layer = hparams.n_layer;
+    const int n_ctx   = hparams.n_ctx;
+    const int n_head  = hparams.n_head;
+    const int n_vocab = hparams.n_vocab;
+    const int n_rot   = hparams.n_embd/hparams.n_head;
+
+    auto & mem_per_token = lctx.mem_per_token;
+    auto & buf_compute   = lctx.buf_compute;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_compute.size,
+        /*.mem_buffer =*/ buf_compute.addr,
+        /*.no_alloc   =*/ false,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    // for big prompts, if BLAS is enabled, it is better to use only one thread
+    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
+    ggml_cgraph gf = {};
+    gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas() ? 1 : n_threads;
+
+    // embd : [N]
+    struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
+    memcpy(embd->data, tokens, N*ggml_element_size(embd));
+
+    // indices : [N]
+    struct ggml_tensor * indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
+    memcpy(indices->data, token_indices, N*ggml_element_size(indices));
+
+    // attention_mask : [N + n_past, N]
+    struct ggml_tensor * attention_mask_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, N * (N + n_past));
+    memcpy(attention_mask_tensor->data, attn_mask, N*(N + n_past)*ggml_element_size(attention_mask_tensor));
+    attention_mask_tensor = ggml_view_2d(ctx0, attention_mask_tensor, N + n_past, N, (N+n_past)*ggml_element_size(attention_mask_tensor), 0);
+
+    // tok_embeddings : [n_embd, n_vocab]
+    // inpL : [n_embd, N] (weirdly, 'rows' is the second dimension)
+    struct ggml_tensor * inpL = ggml_get_rows(ctx0, model.tok_embeddings, embd);
+
+    for (int il = 0; il < n_layer; ++il) {
+        // inpSA : [n_embd, N]
+        struct ggml_tensor * inpSA = inpL;
+
+        struct ggml_tensor * cur;
+
+        lctx.use_buf(ctx0, 0);
+
+        // norm
+        {
+            cur = ggml_rms_norm(ctx0, inpL);
+
+            // cur = attention_norm*cur
+            // attention_norm is a learned vector of weights, of size n_embd, 
+            // that is used to scale the output of the previous layer via elementwise multiplication
+            cur = ggml_mul(ctx0,
+                        ggml_repeat(ctx0, model.layers[il].attention_norm, cur),
+                        cur);
+        }
+
+        // self-attention
+        {
+            // compute Q and K and RoPE them
+            // Shape analysis:
+            //   ggml_mul_mat(ctx0, model.layers[il].wq, cur) - multiplies matrices of sizes [n_embd, n_embd] and [n_embd, N] to get [n_embd, N].
+            //   ggml_mul_mat expects the two matrices to be of shape [K, M] and [K, N] respectively, and returns a matrix of shape [M, N].
+            //   ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), n_embd/n_head, n_head, N) - reshapes the output of the previous operation to [n_embd/n_head, n_head, N].
+            //   ggml_rope(ctx0, ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), n_embd/n_head, n_head, N), n_past, n_rot, 0) - applies RoPE, yielding [n_embed/n_head, n_head, N]-dim tensor.
+            struct ggml_tensor * Qcur = ggml_rope_custom(ctx0, ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wq, cur), n_embd/n_head, n_head, N), indices);
+            struct ggml_tensor * Kcur = ggml_rope_custom(ctx0, ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wk, cur), n_embd/n_head, n_head, N), indices);
+            ggml_set_name(Qcur, "Qcur");
+            ggml_set_name(Kcur, "Kcur");
+
+            // store key and value to memory
+            {
+                // compute the transposed [N, n_embd] V matrix
+                //  ggml_mul_mat(ctx0, model.layers[il].wv, cur) - multiplies matrices of sizes [n_embd, n_embd] and [n_embd, N] to get [n_embd, N].
+                // Reshape appears to be unnecessary (was able to run, anyway...). Unless the point is to create a copy for backward?
+                struct ggml_tensor * Vcur = ggml_transpose(ctx0, ggml_mul_mat(ctx0, model.layers[il].wv, cur)); // ggml_reshape_2d(ctx0, ggml_mul_mat(ctx0, model.layers[il].wv, cur), n_embd, N));
+
+                // Kcur is [n_embd/n_head, n_head, N]. The KV cache is two big 1D tensors.
+                // However, intuitively K is laid out as follows:
+                //   For each layer, there are n_ctx sequences of n_embd elements each, storing the key for that token in the sequence.
+                //   In our layer, n_past have already been computed, but we are adding N new tokens.
+                struct ggml_tensor * k = ggml_view_1d(ctx0, kv_self.k, N*n_embd, (ggml_element_size(kv_self.k)*n_embd)*(il*n_ctx + n_past));
+                // Vcur is [N, n_embd]. Now, although kv_self.v is 1D, we are getting a 2D view of it. I am not 100% sure why...
+                struct ggml_tensor * v = ggml_view_2d(ctx0, kv_self.v, N, n_embd,
+                        (   n_ctx)*ggml_element_size(kv_self.v), // stride: n_ctx
+                        (il*n_ctx)*ggml_element_size(kv_self.v)*n_embd + n_past*ggml_element_size(kv_self.v)); // offset
+
+                // important: storing RoPE-ed version of K in the KV cache!
+                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
+                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Vcur, v));
+            }
+
+            // Switch N and n_head, yielding [n_embd/n_head, N, n_head]
+            struct ggml_tensor * Q =
+                ggml_permute(ctx0,
+                        Qcur,
+                        0, 2, 1, 3);
+            ggml_set_name(Q, "Q");
+
+            // Switch N and n_head, yielding [n_embd/n_head, n_past + N, n_head]
+            struct ggml_tensor * K =
+                ggml_permute(ctx0,
+                        ggml_reshape_3d(ctx0,
+                            ggml_view_1d(ctx0, kv_self.k, (n_past + N)*n_embd, il*n_ctx*ggml_element_size(kv_self.k)*n_embd),
+                            n_embd/n_head, n_head, n_past + N),
+                        0, 2, 1, 3);
+            ggml_set_name(K, "K");
+
+            // K * Q: [n_past + N, N, n_head]
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            ggml_set_name(KQ, "KQ");
+
+            // KQ_scaled = KQ / sqrt(n_embd/n_head)
+            struct ggml_tensor * KQ_scaled =
+                ggml_scale(ctx0,
+                        KQ,
+                        ggml_new_f32(ctx0, 1.0f/sqrtf(float(n_embd)/n_head)));
+            ggml_set_name(KQ_scaled, "KQ_scaled");
+
+            // KQ_masked = mask_past(KQ_scaled)
+            // struct ggml_tensor * KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
+            // struct ggml_tensor * attn_mask_repeated = ggml_repeat(ctx0, attention_mask_tensor, KQ_scaled);
+            //fprintf(stderr, "Shape of attn_mask_repeated: %d x %d x %d\n", attn_mask_repeated->ne[0], attn_mask_repeated->ne[1], attn_mask_repeated->ne[2]);
+
+            struct ggml_tensor * KQ_masked = ggml_custom_mask(ctx0, KQ_scaled, attention_mask_tensor);
+            ggml_set_name(KQ_masked, "KQ_masked");
+
+            // struct ggml_tensor * KQ_masked = ggml_add(ctx0,
+            //             KQ_scaled, ggml_repeat(ctx0, attention_mask_tensor, KQ_scaled));
+
+            // KQ = soft_max(KQ_masked)
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
+            ggml_set_name(KQ_soft_max, "KQ_soft_max");
+
+            // split cached V into n_head heads
+            struct ggml_tensor * V =
+                ggml_view_3d(ctx0, kv_self.v,
+                        n_past + N, n_embd/n_head, n_head,
+                        n_ctx*ggml_element_size(kv_self.v),
+                        n_ctx*ggml_element_size(kv_self.v)*n_embd/n_head,
+                        il*n_ctx*ggml_element_size(kv_self.v)*n_embd);
+            ggml_set_name(V, "V");
+
+#if 1
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+            ggml_set_name(KQV, "KQV");
+#else
+            // make V contiguous in memory to speed up the matmul, however we waste time on the copy
+            // on M1 this is faster for the perplexity computation, but ~5% slower for the single-token generation
+            // is there a better way?
+            struct ggml_tensor * V_cont = ggml_cpy(ctx0, V, ggml_new_tensor_3d(ctx0, kv_self.v->type, n_past + N, n_embd/n_head, n_head));
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V_cont, KQ_soft_max);
+#endif
+
+            // KQV_merged = KQV.permute(0, 2, 1, 3)
+            struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+            ggml_set_name(KQV_merged, "KQV_merged");
+
+            // cur = KQV_merged.contiguous().view(n_embd, N)
+            cur = ggml_cpy(ctx0,
+                    KQV_merged,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N));
+            ggml_set_name(cur, "KQV_merged_contiguous");
+
+            // projection (no bias)
+            cur = ggml_mul_mat(ctx0,
+                    model.layers[il].wo,
+                    cur);
+        }
+
+        lctx.use_buf(ctx0, 1);
+
+        struct ggml_tensor * inpFF = ggml_add(ctx0, cur, inpSA);
+
+        // feed-forward network
+        {
+            // norm
+            {
+                cur = ggml_rms_norm(ctx0, inpFF);
+
+                // cur = ffn_norm*cur
+                cur = ggml_mul(ctx0,
+                        ggml_repeat(ctx0, model.layers[il].ffn_norm, cur),
+                        cur);
+            }
+
+            struct ggml_tensor * tmp = ggml_mul_mat(ctx0,
+                    model.layers[il].w3,
+                    cur);
+
+            cur = ggml_mul_mat(ctx0,
+                    model.layers[il].w1,
+                    cur);
+
+            // SILU activation
+            cur = ggml_silu(ctx0, cur);
+
+            cur = ggml_mul(ctx0, cur, tmp);
+
+            cur = ggml_mul_mat(ctx0,
+                    model.layers[il].w2,
+                    cur);
+        }
+
+        cur = ggml_add(ctx0, cur, inpFF);
+
+        // input for next layer
+        inpL = cur;
+    }
+
+    lctx.use_buf(ctx0, 0);
+
+    // used at the end to optionally extract the embeddings
+    struct ggml_tensor * embeddings = NULL;
+
+    // norm
+    {
+
+        inpL = ggml_rms_norm(ctx0, inpL);
+
+        // inpL = norm*inpL
+        inpL = ggml_mul(ctx0,
+                    ggml_repeat(ctx0, model.norm, inpL),
+                    inpL);
+
+        embeddings = inpL;
+    }
+
+    // lm_head
+    inpL = ggml_mul_mat(ctx0, model.output, inpL);
+
+    lctx.use_buf(ctx0, -1);
+
+    // logits -> probs
+    //inpL = ggml_soft_max_inplace(ctx0, inpL);
+
+    // run the computation
+    ggml_build_forward_expand(&gf, inpL);
+    ggml_graph_compute       (ctx0, &gf);
+
+#ifdef GGML_PERF
+    // print timing information per ggml operation (for debugging purposes)
+    // requires GGML_PERF to be defined
+    ggml_graph_print(&gf);
+#endif
+
+    // plot the computation graph in dot format (for debugging purposes)
+    //if (n_past%100 == 0) {
+    //    ggml_graph_dump_dot(&gf, NULL, "llama.dot");
+    //}
+
+    //embd_w.resize(n_vocab*N);
+    //memcpy(embd_w.data(), ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+
+    // update the kv token count
+    lctx.model.kv_self.n = n_past + N;
+
+    // extract logits
+    {
+        auto & logits_out = lctx.logits;
+
+        if (lctx.logits_all) {
+            logits_out.resize(n_vocab * N);
+            memcpy(logits_out.data(), (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+        } else {
+            // return result for just the last token
+            logits_out.resize(n_vocab);
+            memcpy(logits_out.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
+        }
+    }
+
+    // extract embeddings
+    if (lctx.embedding.size()) {
+        auto & embedding_out = lctx.embedding;
+
+        embedding_out.resize(n_embd);
+        memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(N - 1)), sizeof(float)*n_embd);
+    }
+
+    if (mem_per_token == 0) {
+        mem_per_token = ggml_used_mem(ctx0)/N;
+    }
+
+#if 0
+    printf("\n%s: used_mem = %.3f MB, scratch -- %.3f MB %.3f MB\n", __func__,
+            ggml_used_mem(ctx0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(1)/1024.0/1024.0);
+#endif
+
+    ggml_free(ctx0);
+
+    // measure the performance only for the single-token evals
+    if (N == 1) {
+        lctx.t_eval_us += ggml_time_us() - t_start_us;
+        lctx.n_eval++;
+    }
+    else if (N > 1) {
+        lctx.t_p_eval_us += ggml_time_us() - t_start_us;
+        lctx.n_p_eval += N;
+    }
+
+    return true;
+}
+
+
+
 // evaluate the transformer
 //
 //   - lctx:         llama context
@@ -2763,6 +3109,27 @@ int llama_model_quantize(
         fprintf(stderr, "%s: failed to quantize: %s\n", __func__, err.what());
         return 1;
     }
+}
+
+int llama_eval_multi(
+        struct llama_context * ctx,
+           const llama_token * tokens,
+                   const int * token_indices,
+                 const float * attn_mask, // [N + n_past, N] of 0 or -Inf, gets added to KV attention logits
+                         int   n_tokens,
+                         int   n_past,
+                         int   n_threads) {
+    if (!llama_eval_multi_internal(*ctx, tokens, token_indices, attn_mask, n_tokens, n_past, n_threads)) {
+        fprintf(stderr, "%s: failed to eval\n", __func__);
+        return 1;
+    }
+    // get a more accurate load time, upon first eval
+    // TODO: fix this
+    if (!ctx->has_evaluated_once) {
+        ctx->t_load_us = ggml_time_us() - ctx->t_start_us;
+        ctx->has_evaluated_once = true;
+    }
+    return 0;
 }
 
 int llama_apply_lora_from_file_internal(struct llama_context * ctx, const char * path_lora, const char * path_base_model, int n_threads) {

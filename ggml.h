@@ -326,10 +326,12 @@ extern "C" {
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
+        GGML_OP_CUSTOM_MASK,
         GGML_OP_SOFT_MAX,
         GGML_OP_SOFT_MAX_BACK,
         GGML_OP_ROPE,
         GGML_OP_ROPE_BACK,
+        GGML_OP_ROPE_CUSTOM,
         GGML_OP_ALIBI,
         GGML_OP_CLAMP,
         GGML_OP_CONV_1D_S1_PH,
@@ -1005,6 +1007,13 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+	// adds a mask to the tensor
+    // TODO: implement in-place vs. non-in-place variant as above
+    GGML_API struct ggml_tensor * ggml_custom_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1052,6 +1061,17 @@ extern "C" {
             int                   n_past,
             int                   n_dims,
             int                   mode);
+
+	// rotary position embedding with custom positions
+    // in-place, returns view(a)
+    // the argument b contains the integer indices of the tokens in a
+    // TODO: avoid creating a new tensor every time
+    // TODO: implement backward pass as for ROPE above.
+    GGML_API struct ggml_tensor * ggml_rope_custom(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
 
     // alibi position embedding
     // in-place, returns view(a)

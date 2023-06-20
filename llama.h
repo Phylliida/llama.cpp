@@ -151,6 +151,15 @@ extern "C" {
             const char * fname_inp,
             const char * fname_out,
             const llama_model_quantize_params * params);
+		
+	LLAMA_API int llama_eval_multi(
+		struct llama_context * ctx,
+		   const llama_token * tokens,
+				   const int * token_indices, // for rotary embeddings
+				 const float * attn_mask, // [N + n_past, N] of 0 or -inf
+						 int   n_tokens,
+						 int   n_past, // total number of tokens in kv-cache so far
+						 int   n_threads);
 
     // Apply a LoRA adapter to a loaded model
     // path_base_model is the path to a higher quality model to use as a base for
