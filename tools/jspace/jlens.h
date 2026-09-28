@@ -30,9 +30,19 @@ struct jlens_hparams {
     float   norm_eps       = 1e-5f;
 };
 
-struct jlens_model {
+// minimal weight-access interface needed by the graph builders, so the same
+// graph code can run against either our own GGUF loader (jlens_model) or a
+// model already loaded inside llama-server (adapter over its tensors_by_name)
+struct jlens_weights {
     jlens_hparams hparams;
 
+    virtual ~jlens_weights() = default;
+    virtual ggml_tensor * get(const std::string & name) const = 0;
+
+    ggml_tensor * blk(const char * fmt, int il) const; // fmt like "blk.%d.attn_q.weight"
+};
+
+struct jlens_model : public jlens_weights {
     gguf_context *             gguf = nullptr;
     ggml_context *             wctx = nullptr; // owns weight tensors (no_alloc)
     ggml_backend_buffer_t      wbuf = nullptr; // device buffer holding weight data
@@ -46,8 +56,7 @@ struct jlens_model {
     // tokenizer.ggml.tokens for id -> string in readout
     std::vector<std::string> vocab_tokens;
 
-    ggml_tensor * get(const std::string & name) const;
-    ggml_tensor * blk(const char * fmt, int il) const; // fmt like "blk.%d.attn_q.weight"
+    ggml_tensor * get(const std::string & name) const override;
 };
 
 // load GGUF, create tensors in the given backend buffer type (e.g. CUDA), upload data
@@ -77,8 +86,10 @@ struct jlens_forward {
 // for the loss node to seed the VJP.
 // if perturb_layer >= 0 (requires with_grad_flags): an additive f32 input is
 // inserted right after that block's output, for finite-difference checks.
-bool jlens_build_forward(const jlens_model & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer = -1);
+// use_flash_attn: forward-only variant with ggml_flash_attn_ext (small compute
+// buffer for long contexts; incompatible with with_grad_flags)
+bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
+                         int perturb_layer = -1, bool use_flash_attn = false);
 
 // single-block graph for local validation: h_in leaf -> (+zero_pad param) -> block -> h_out (loss)
 struct jlens_block {
@@ -91,8 +102,8 @@ struct jlens_block {
     ggml_tensor *  mask = nullptr;
     ggml_tensor *  h_out = nullptr;    // loss-flagged [n_embd, n_tokens]
 };
-bool jlens_build_block(const jlens_model & m, int il, int n_tokens, jlens_block & out);
+bool jlens_build_block(const jlens_weights & m, int il, int n_tokens, jlens_block & out);
 
 // build graph: mul_mat(m.get("output.weight"), rms_norm(x)*output_norm) -> [n_vocab, 1]
 // used for logit-lens readout of an arbitrary activation column
-ggml_cgraph * jlens_build_head(const jlens_model & m, ggml_context * gctx, ggml_tensor ** x_in);
+ggml_cgraph * jlens_build_head(const jlens_weights & m, ggml_context * gctx, ggml_tensor ** x_in);

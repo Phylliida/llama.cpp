@@ -17,7 +17,7 @@ ggml_tensor * jlens_model::get(const std::string & name) const {
     return it->second;
 }
 
-ggml_tensor * jlens_model::blk(const char * fmt, int il) const {
+ggml_tensor * jlens_weights::blk(const char * fmt, int il) const {
     char name[128];
     snprintf(name, sizeof(name), fmt, il);
     return get(name);

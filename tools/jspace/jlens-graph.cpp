@@ -17,8 +17,9 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x, ggml_tens
 }
 
 // one GLM-4 dense block: post-norm attention + swiglu MLP with residuals
-static ggml_tensor * glm_block(ggml_context * ctx, const jlens_model & m, int il, int n_tokens,
-                               ggml_tensor * inpL, ggml_tensor * pos, ggml_tensor * mask) {
+static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int il, int n_tokens,
+                               ggml_tensor * inpL, ggml_tensor * pos, ggml_tensor * mask,
+                               bool use_flash_attn) {
     const auto & hp = m.hparams;
     const int64_t n_embd      = hp.n_embd;
     const int64_t n_head      = hp.n_head;
@@ -51,24 +52,43 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_model & m, int il
     // GQA: ggml_mul_mat broadcasts a's head dims (b head i maps to a head i / (Hb/Ha),
     // contiguous groups) and the MUL_MAT backward handles the broadcast, so no manual
     // kv-head expansion is needed.
-    // to [n_embd_head, n_tokens, n_head] layout (heads last) for batched attention matmuls
-    ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
-    ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor * kqv;
+    if (use_flash_attn) {
+        // forward-only path: flash attention keeps the score matrix off VRAM.
+        // layout [n_embd_head, n_tokens, n_head], k/v cast to f16 (CUDA fattn),
+        // GQA (n_head_kv < n_head) handled by the kernel. No backward support.
+        ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        kp = ggml_cast(ctx, kp, GGML_TYPE_F16);
+        vp = ggml_cast(ctx, vp, GGML_TYPE_F16);
+        qp = ggml_cast(ctx, qp, GGML_TYPE_F16);
+        ggml_tensor * fmask = ggml_cast(ctx, mask, GGML_TYPE_F16); // flash attn requires f16 mask
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx, qp, kp, vp, fmask, kq_scale,
+                                               /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        kqv = ggml_cont(ctx, ggml_permute(ctx, fa, 0, 2, 1, 3));       // [n_embd_head, n_head, n_q]
+        kqv = ggml_reshape_2d(ctx, kqv, n_embd, n_tokens);
+    } else {
+        // to [n_embd_head, n_tokens, n_head] layout (heads last) for batched attention matmuls
+        ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
+        ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
 
-    // attention scores [n_kv, n_q, n_head] (k broadcast 2 -> 48 heads)
-    ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);
-    kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, /*max_bias=*/0.0f);
+        // attention scores [n_kv, n_q, n_head] (k broadcast 2 -> 48 heads)
+        ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);
+        kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, /*max_bias=*/0.0f);
 
-    // weighted values: [n_embd_head, n_q, n_head]
-    // nb: build vt with a single permute+cont from v. A cont->transpose->cont chain
-    // (or cont+mul_mat on a transposed view) makes the backward pass hand a
-    // non-contiguous grad view to a CONT node, which ggml asserts against.
-    ggml_tensor * vt  = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [n_kv, n_embd_head, n_head_kv]
-    ggml_tensor * kqv = ggml_mul_mat(ctx, vt, kq);                        // [n_embd_head, n_q, n_head]
+        // weighted values: [n_embd_head, n_q, n_head]
+        // nb: build vt with a single permute+cont from v. A cont->transpose->cont chain
+        // (or cont+mul_mat on a transposed view) makes the backward pass hand a
+        // non-contiguous grad view to a CONT node, which ggml asserts against.
+        ggml_tensor * vt  = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [n_kv, n_embd_head, n_head_kv]
+        kqv = ggml_mul_mat(ctx, vt, kq);                        // [n_embd_head, n_q, n_head]
 
-    // merge heads -> [n_embd, n_q]
-    kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));       // [n_embd_head, n_head, n_q]
-    kqv = ggml_reshape_2d(ctx, kqv, n_embd, n_tokens);
+        // merge heads -> [n_embd, n_q]
+        kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));       // [n_embd_head, n_head, n_q]
+        kqv = ggml_reshape_2d(ctx, kqv, n_embd, n_tokens);
+    }
 
     cur = ggml_mul_mat(ctx, m.blk("blk.%d.attn_output.weight", il), kqv);
 
@@ -93,7 +113,7 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_model & m, int il
     return ggml_add(ctx, cur, ffn_inp);
 }
 
-bool jlens_build_block(const jlens_model & m, int il, int n_tokens, jlens_block & out) {
+bool jlens_build_block(const jlens_weights & m, int il, int n_tokens, jlens_block & out) {
     const auto & hp = m.hparams;
 
     const int    gsize    = 512;
@@ -123,7 +143,7 @@ bool jlens_build_block(const jlens_model & m, int il, int n_tokens, jlens_block 
     ggml_set_param(out.zero_pad);
     out.x = ggml_add(ctx, out.h_in, out.zero_pad);
 
-    out.h_out = glm_block(ctx, m, il, n_tokens, out.x, out.pos, out.mask);
+    out.h_out = glm_block(ctx, m, il, n_tokens, out.x, out.pos, out.mask, /*use_flash_attn=*/false);
     ggml_set_name(out.h_out, "jlens_blk_h_out");
     out.h_out->flags |= GGML_TENSOR_FLAG_LOSS; // caller supplies the grad_accs seed
     ggml_build_forward_expand(out.gf, out.h_out);
@@ -131,8 +151,12 @@ bool jlens_build_block(const jlens_model & m, int il, int n_tokens, jlens_block 
 }
 
 
-bool jlens_build_forward(const jlens_model & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer) {
+bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
+                         int perturb_layer, bool use_flash_attn) {
+    if (with_grad_flags && use_flash_attn) {
+        fprintf(stderr, "jlens_build_forward: flash attention has no backward path\n");
+        return false;
+    }
     const auto & hp = m.hparams;
     const int64_t n_embd      = hp.n_embd;
     const int64_t n_head      = hp.n_head;
@@ -182,7 +206,7 @@ bool jlens_build_forward(const jlens_model & m, int n_tokens, bool with_grad_fla
     out.l_out.resize(hp.n_layer, nullptr);
 
     for (int il = 0; il < hp.n_layer; ++il) {
-        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask);
+        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, use_flash_attn);
 
         {
             char name[64];
@@ -217,7 +241,7 @@ bool jlens_build_forward(const jlens_model & m, int n_tokens, bool with_grad_fla
     return true;
 }
 
-ggml_cgraph * jlens_build_head(const jlens_model & m, ggml_context * gctx, ggml_tensor ** x_in) {
+ggml_cgraph * jlens_build_head(const jlens_weights & m, ggml_context * gctx, ggml_tensor ** x_in) {
     ggml_tensor * x = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, m.hparams.n_embd, 1);
     ggml_set_name(x, "jlens_head_x");
     ggml_set_input(x);

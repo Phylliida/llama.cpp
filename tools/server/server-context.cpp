@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-jlens.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -1123,6 +1124,15 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        if (!params_base.jlens_path.empty()) {
+            std::string jlens_err;
+            if (!server_jlens_init(model_tgt, params_base.jlens_path, jlens_err)) {
+                SRV_ERR("failed to initialize jlens: %s\n", jlens_err.c_str());
+                return false;
+            }
+            SRV_INF("jlens endpoint enabled, matrices from '%s'\n", params_base.jlens_path.c_str());
+        }
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
@@ -5130,6 +5140,83 @@ void server_routes::init_routes() {
         }
 
         res->ok(json{{"tokens", std::move(tokens_response)}});
+        return res;
+    };
+
+    this->post_jlens = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!server_jlens_enabled()) {
+            res->error(json{
+                {"code", 404},
+                {"message", "jlens endpoint is not enabled (start the server with --jlens PATH)"},
+                {"type", "not_found_error"},
+            });
+            return res;
+        }
+        const json body = json::parse(req.body);
+
+        llama_tokens tokens;
+        if (body.count("tokens") != 0) {
+            for (const auto & t : body.at("tokens")) {
+                tokens.push_back(t.get<llama_token>());
+            }
+        } else if (body.count("content") != 0 || body.count("prompt") != 0) {
+            const json & content = body.count("content") != 0 ? body.at("content") : body.at("prompt");
+            tokens = tokenize_mixed(ctx_server.vocab, content, /*add_special=*/false, /*parse_special=*/true);
+        } else {
+            res->error(json{
+                {"code", 400},
+                {"message", "request must contain \"tokens\" or \"content\""},
+                {"type", "invalid_request_error"},
+            });
+            return res;
+        }
+
+        const int pos  = json_value(body, "pos", -1);
+        const int topk = json_value(body, "topk", 5);
+        std::vector<int> layers;
+        if (body.count("layers") != 0 && body.at("layers").is_array()) {
+            for (const auto & l : body.at("layers")) {
+                layers.push_back(l.get<int>());
+            }
+        }
+
+        std::vector<server_jlens_layer_result> layer_results;
+        std::vector<std::pair<std::string, float>> model_topk;
+        std::string err;
+        if (!server_jlens_compute(ctx_server.vocab, tokens, pos, topk,
+                                  layers.empty() ? nullptr : &layers,
+                                  layer_results, model_topk, err)) {
+            res->error(json{
+                {"code", 400},
+                {"message", err},
+                {"type", "invalid_request_error"},
+            });
+            return res;
+        }
+
+        auto topk_json = [](const std::vector<std::pair<std::string, float>> & tk) {
+            json arr = json::array();
+            for (const auto & [piece, logit] : tk) {
+                arr.push_back({{"token", piece}, {"logit", logit}});
+            }
+            return arr;
+        };
+
+        json layers_json = json::array();
+        for (const auto & lr : layer_results) {
+            layers_json.push_back({
+                {"layer", lr.layer},
+                {"topk",  topk_json(lr.topk)},
+            });
+        }
+
+        res->ok(json{
+            {"pos", pos < 0 ? (int) tokens.size() + pos : pos},
+            {"n_tokens", (int) tokens.size()},
+            {"model_topk", topk_json(model_topk)},
+            {"layers", std::move(layers_json)},
+        });
         return res;
     };
 

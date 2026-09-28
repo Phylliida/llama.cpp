@@ -23,6 +23,10 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-jlens.cpp
+    server-jlens.h
+    ../jspace/jlens-graph.cpp
+    ../jspace/jlens-model.cpp
 )
 
 if (BUILD_SHARED_LIBS)
@@ -31,6 +35,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ../jspace)
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 # llama-server-impl: server logic, reusable by app

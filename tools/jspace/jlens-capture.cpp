@@ -9,6 +9,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-cuda.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -39,6 +40,8 @@ int main(int argc, char ** argv) {
     int layer = -1; // default: last
     int pos   = -1; // last position
     int topk  = 10;
+    bool use_flash = false;
+    std::string backend_name = "cuda";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -47,6 +50,8 @@ int main(int argc, char ** argv) {
         else if (a == "--layer") layer = atoi(argv[++i]);
         else if (a == "--pos")   pos   = atoi(argv[++i]);
         else if (a == "--topk")  topk  = atoi(argv[++i]);
+        else if (a == "--flash") use_flash = true;
+        else if (a == "--backend") backend_name = argv[++i];
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty() || tokens_str.empty()) {
@@ -63,9 +68,16 @@ int main(int argc, char ** argv) {
     const int n_tokens = (int) ids.size();
     if (n_tokens < 2) { fprintf(stderr, "need at least 2 tokens\n"); return 1; }
 
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) { fprintf(stderr, "no CUDA backend\n"); return 1; }
-    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(0);
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (backend_name == "cuda") {
+        backend = ggml_backend_cuda_init(0);
+        buft = ggml_backend_cuda_buffer_type(0);
+    } else if (backend_name == "cpu") {
+        backend = ggml_backend_cpu_init();
+        buft = ggml_backend_cpu_buffer_type();
+    }
+    if (!backend || !buft) { fprintf(stderr, "no %s backend\n", backend_name.c_str()); return 1; }
 
     jlens_model model;
     if (!jlens_model_load(model_path.c_str(), buft, model)) return 1;
@@ -74,7 +86,7 @@ int main(int argc, char ** argv) {
     if (pos   < 0) pos   = n_tokens - 1;
 
     jlens_forward fwd;
-    if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/false, fwd)) return 1;
+    if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/false, fwd, -1, use_flash)) return 1;
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(galloc, fwd.gf)) { fprintf(stderr, "galloc failed\n"); return 1; }
