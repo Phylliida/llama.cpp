@@ -24,7 +24,9 @@ bool server_jlens_enabled();
 // returns false on error (err set). Token pieces are produced via the vocab.
 struct server_jlens_layer_result {
     int layer;
-    std::vector<std::pair<std::string, float>> topk; // (token piece, logit)
+    std::vector<std::pair<std::string, float>> topk; // (token piece, logit), single-position mode
+    // all-positions mode: topk per position (parallel to the token array)
+    std::vector<std::vector<std::pair<std::string, float>>> positions;
 };
 
 bool server_jlens_compute(
@@ -33,6 +35,7 @@ bool server_jlens_compute(
         int pos,
         int topk,
         const std::vector<int> * layers,
+        bool all_positions,
         std::vector<server_jlens_layer_result> & out_layers,
         std::vector<std::pair<std::string, float>> & out_model_topk,
         std::string & err);

@@ -66,6 +66,16 @@ struct server_jlens_state {
     ggml_tensor *  x_in  = nullptr;
     ggml_cgraph *  hgf   = nullptr;
     ggml_tensor *  hlogits = nullptr;
+
+    // dedicated allocator for the head graph so its transients can never
+    // overlap forward-graph l_out storage
+    ggml_gallocr_t hgalloc = nullptr;
+
+    // staging buffer for one layer's J matrix on device (all-positions mode)
+    ggml_context *         jctx = nullptr;
+    ggml_backend_buffer_t  jbuf = nullptr;
+    ggml_tensor *          jt   = nullptr;
+    int                    jt_layer = -1;
 };
 
 server_jlens_state g_jlens;
@@ -139,6 +149,21 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         return false;
     }
     g_jlens.hlogits = ggml_graph_get_tensor(g_jlens.hgf, "jlens_head_logits");
+    g_jlens.hgalloc = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+    if (!ggml_gallocr_alloc_graph(g_jlens.hgalloc, g_jlens.hgf)) {
+        err = "jlens: head graph alloc failed";
+        return false;
+    }
+
+    // staging tensor for one layer's J (6144^2 f32 = 151 MB), uploaded on demand
+    ggml_init_params jp = { 4 * ggml_tensor_overhead(), nullptr, true };
+    g_jlens.jctx = ggml_init(jp);
+    g_jlens.jt   = ggml_new_tensor_2d(g_jlens.jctx, GGML_TYPE_F32, n_embd, n_embd);
+    g_jlens.jbuf = ggml_backend_alloc_ctx_tensors_from_buft(g_jlens.jctx, ggml_backend_cuda_buffer_type(0));
+    if (!g_jlens.jbuf) {
+        err = "jlens: J staging alloc failed";
+        return false;
+    }
 
     g_jlens.weights = std::move(weights);
 
@@ -157,6 +182,7 @@ bool server_jlens_compute(
         int pos,
         int topk,
         const std::vector<int> * layers_in,
+        bool all_positions,
         std::vector<server_jlens_layer_result> & out_layers,
         std::vector<std::pair<std::string, float>> & out_model_topk,
         std::string & err) {
@@ -195,7 +221,7 @@ bool server_jlens_compute(
     ggml_set_output(fwd.logits);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
-    if (!ggml_gallocr_alloc_graph(galloc, fwd.gf) || !ggml_gallocr_alloc_graph(galloc, g_jlens.hgf)) {
+    if (!ggml_gallocr_alloc_graph(galloc, fwd.gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(fwd.gctx);
         err = "jlens: graph alloc failed (out of VRAM?)";
@@ -245,47 +271,130 @@ bool server_jlens_compute(
         out_model_topk = topk_of(full_logits);
     }
 
-    // per-layer: y = J_l . a_l[:, pos] on CPU, decode through the head on GPU
-    std::vector<float> a(n_embd), y(n_embd), lens_logits(n_vocab);
     const int n_threads = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
     out_layers.clear();
-    for (int il : layers) {
-        if (il < 0 || il >= g_jlens.n_layer) {
-            continue;
-        }
-        ggml_backend_tensor_get(fwd.l_out[il], a.data(),
-                                ((size_t) pos * n_embd) * sizeof(float), n_embd * sizeof(float));
-        const std::vector<float> & Jl = g_jlens.J[il];
-        {
-            std::vector<std::thread> ts;
-            const int64_t rows_per = (n_embd + n_threads - 1) / n_threads;
-            for (int t = 0; t < n_threads; ++t) {
-                const int64_t r0 = t * rows_per, r1 = std::min(n_embd, r0 + rows_per);
-                if (r0 >= r1) break;
-                ts.emplace_back([&, r0, r1] {
-                    for (int64_t i = r0; i < r1; ++i) {
-                        const float * row = Jl.data() + (size_t) i * n_embd;
-                        double s = 0;
-                        for (int64_t j = 0; j < n_embd; ++j) s += (double) row[j] * a[j];
-                        y[i] = (float) s;
-                    }
-                });
-            }
-            for (auto & t : ts) t.join();
-        }
-        ggml_backend_tensor_set(g_jlens.x_in, y.data(), 0, y.size() * sizeof(float));
-        if (ggml_backend_graph_compute(g_jlens.backend, g_jlens.hgf) != GGML_STATUS_SUCCESS) {
-            ggml_gallocr_free(galloc);
-            ggml_free(fwd.gctx);
-            err = "jlens: head compute failed";
-            return false;
-        }
-        ggml_backend_tensor_get(g_jlens.hlogits, lens_logits.data(), 0, n_vocab * sizeof(float));
 
-        server_jlens_layer_result lr;
-        lr.layer = il;
-        lr.topk  = topk_of(lens_logits);
-        out_layers.push_back(std::move(lr));
+    if (all_positions) {
+        // batched: for each layer, y = J_l . a_l for ALL positions on the GPU in
+        // position chunks, decode through the head, top-k on CPU.
+        ggml_tensor * out_norm = g_jlens.weights->get("output_norm.weight");
+        ggml_tensor * out_w    = g_jlens.weights->get("output.weight");
+        // separate allocator: chunk graphs must not reuse the buffer holding fwd.l_out
+        ggml_gallocr_t galloc2 = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+        const int chunk = 512;
+        std::vector<float> lg;
+        for (int il : layers) {
+            if (il < 0 || il >= g_jlens.n_layer) {
+                continue;
+            }
+            if (g_jlens.jt_layer != il) {
+                ggml_backend_tensor_set(g_jlens.jt, g_jlens.J[il].data(), 0,
+                                        g_jlens.J[il].size() * sizeof(float));
+                g_jlens.jt_layer = il;
+            }
+            server_jlens_layer_result lr;
+            lr.layer = il;
+            lr.positions.resize(n_tokens);
+            for (int p0 = 0; p0 < n_tokens; p0 += chunk) {
+                const int np = std::min(chunk, n_tokens - p0);
+                ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+                ggml_context * c = ggml_init(ip);
+                ggml_tensor * av = ggml_view_2d(c, fwd.l_out[il], n_embd, np,
+                                                fwd.l_out[il]->nb[1], (size_t) p0 * fwd.l_out[il]->nb[1]);
+                ggml_tensor * y  = ggml_mul_mat(c, g_jlens.jt, ggml_cont(c, av));
+                ggml_tensor * yn = ggml_rms_norm(c, y, g_jlens.weights->hparams.norm_eps);
+                yn = ggml_mul(c, yn, out_norm);
+                ggml_tensor * logits = ggml_mul_mat(c, out_w, yn);
+                ggml_cgraph * gf = ggml_new_graph(c);
+                ggml_build_forward_expand(gf, logits);
+                if (!ggml_gallocr_alloc_graph(galloc2, gf)) {
+                    ggml_free(c);
+                    ggml_gallocr_free(galloc2);
+                    ggml_gallocr_free(galloc);
+                    ggml_free(fwd.gctx);
+                    err = "jlens: chunk graph alloc failed";
+                    return false;
+                }
+                if (ggml_backend_graph_compute(g_jlens.backend, gf) != GGML_STATUS_SUCCESS) {
+                    ggml_free(c);
+                    ggml_gallocr_free(galloc2);
+                    ggml_gallocr_free(galloc);
+                    ggml_free(fwd.gctx);
+                    err = "jlens: chunk compute failed";
+                    return false;
+                }
+                lg.resize((size_t) n_vocab * np);
+                ggml_backend_tensor_get(logits, lg.data(), 0, lg.size() * sizeof(float));
+                ggml_free(c);
+                // per-position top-k, positions spread across threads
+                {
+                    std::vector<std::thread> ts;
+                    const int per = (np + n_threads - 1) / n_threads;
+                    for (int t = 0; t < n_threads; ++t) {
+                        const int q0 = t * per, q1 = std::min(np, q0 + per);
+                        if (q0 >= q1) break;
+                        ts.emplace_back([&, q0, q1] {
+                            std::vector<int> idx(n_vocab);
+                            for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+                            for (int q = q0; q < q1; ++q) {
+                                const float * col = lg.data() + (size_t) q * n_vocab;
+                                const int k = std::min(topk, (int) n_vocab);
+                                std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                                                  [&](int a2, int b2) { return col[a2] > col[b2]; });
+                                auto & dst = lr.positions[p0 + q];
+                                for (int i = 0; i < k; ++i) {
+                                    dst.emplace_back(llama_vocab_get_text(vocab, idx[i]), col[idx[i]]);
+                                }
+                            }
+                        });
+                    }
+                    for (auto & t : ts) t.join();
+                }
+            }
+            out_layers.push_back(std::move(lr));
+        }
+        ggml_gallocr_free(galloc2);
+    } else {
+        // single position: y = J_l . a_l[:, pos] on CPU, decode through the head on GPU
+        std::vector<float> a(n_embd), y(n_embd), lens_logits(n_vocab);
+        for (int il : layers) {
+            if (il < 0 || il >= g_jlens.n_layer) {
+                continue;
+            }
+            ggml_backend_tensor_get(fwd.l_out[il], a.data(),
+                                    ((size_t) pos * n_embd) * sizeof(float), n_embd * sizeof(float));
+            const std::vector<float> & Jl = g_jlens.J[il];
+            {
+                std::vector<std::thread> ts;
+                const int64_t rows_per = (n_embd + n_threads - 1) / n_threads;
+                for (int t = 0; t < n_threads; ++t) {
+                    const int64_t r0 = t * rows_per, r1 = std::min(n_embd, r0 + rows_per);
+                    if (r0 >= r1) break;
+                    ts.emplace_back([&, r0, r1] {
+                        for (int64_t i = r0; i < r1; ++i) {
+                            const float * row = Jl.data() + (size_t) i * n_embd;
+                            double s = 0;
+                            for (int64_t j = 0; j < n_embd; ++j) s += (double) row[j] * a[j];
+                            y[i] = (float) s;
+                        }
+                    });
+                }
+                for (auto & t : ts) t.join();
+            }
+            ggml_backend_tensor_set(g_jlens.x_in, y.data(), 0, y.size() * sizeof(float));
+            if (ggml_backend_graph_compute(g_jlens.backend, g_jlens.hgf) != GGML_STATUS_SUCCESS) {
+                ggml_gallocr_free(galloc);
+                ggml_free(fwd.gctx);
+                err = "jlens: head compute failed";
+                return false;
+            }
+            ggml_backend_tensor_get(g_jlens.hlogits, lens_logits.data(), 0, n_vocab * sizeof(float));
+
+            server_jlens_layer_result lr;
+            lr.layer = il;
+            lr.topk  = topk_of(lens_logits);
+            out_layers.push_back(std::move(lr));
+        }
     }
 
     ggml_gallocr_free(galloc);

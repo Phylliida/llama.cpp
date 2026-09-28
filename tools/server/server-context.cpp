@@ -5174,6 +5174,7 @@ void server_routes::init_routes() {
 
         const int pos  = json_value(body, "pos", -1);
         const int topk = json_value(body, "topk", 5);
+        const bool all_positions = json_value(body, "all_positions", false);
         std::vector<int> layers;
         if (body.count("layers") != 0 && body.at("layers").is_array()) {
             for (const auto & l : body.at("layers")) {
@@ -5186,6 +5187,7 @@ void server_routes::init_routes() {
         std::string err;
         if (!server_jlens_compute(ctx_server.vocab, tokens, pos, topk,
                                   layers.empty() ? nullptr : &layers,
+                                  all_positions,
                                   layer_results, model_topk, err)) {
             res->error(json{
                 {"code", 400},
@@ -5205,10 +5207,21 @@ void server_routes::init_routes() {
 
         json layers_json = json::array();
         for (const auto & lr : layer_results) {
-            layers_json.push_back({
-                {"layer", lr.layer},
-                {"topk",  topk_json(lr.topk)},
-            });
+            if (all_positions) {
+                json positions_json = json::array();
+                for (const auto & p : lr.positions) {
+                    positions_json.push_back(topk_json(p));
+                }
+                layers_json.push_back({
+                    {"layer", lr.layer},
+                    {"positions", std::move(positions_json)},
+                });
+            } else {
+                layers_json.push_back({
+                    {"layer", lr.layer},
+                    {"topk",  topk_json(lr.topk)},
+                });
+            }
         }
 
         res->ok(json{
