@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -59,7 +60,8 @@ struct server_jlens_state {
     int64_t n_layer = 0;
     std::vector<std::vector<float>> J;
 
-    ggml_backend_t backend = nullptr; // CUDA device 0, separate from llama's ctx
+    ggml_backend_t backend = nullptr; // on the CUDA device holding the weights
+    int            device  = -1;
 
     // head decode graph (fixed shape [n_embd] -> [n_vocab]), built once
     ggml_context * hctx  = nullptr;
@@ -80,15 +82,87 @@ struct server_jlens_state {
 
 server_jlens_state g_jlens;
 
+// caller must hold g_jlens.mutex
+void server_jlens_deinit_locked() {
+    g_jlens.weights.reset(); // drop raw tensor pointers before the model dies
+    g_jlens.J.clear();
+    g_jlens.n_embd  = 0;
+    g_jlens.n_layer = 0;
+    if (g_jlens.hgalloc) { ggml_gallocr_free(g_jlens.hgalloc);      g_jlens.hgalloc = nullptr; }
+    if (g_jlens.hctx)    { ggml_free(g_jlens.hctx);                 g_jlens.hctx    = nullptr; }
+    if (g_jlens.jbuf)    { ggml_backend_buffer_free(g_jlens.jbuf);  g_jlens.jbuf    = nullptr; }
+    if (g_jlens.jctx)    { ggml_free(g_jlens.jctx);                 g_jlens.jctx    = nullptr; }
+    if (g_jlens.backend) { ggml_backend_free(g_jlens.backend);      g_jlens.backend = nullptr; }
+    g_jlens.x_in     = nullptr;
+    g_jlens.hgf      = nullptr;
+    g_jlens.hlogits  = nullptr;
+    g_jlens.jt       = nullptr;
+    g_jlens.jt_layer = -1;
+    g_jlens.device   = -1;
+}
+
 } // namespace
 
+void server_jlens_deinit() {
+    // blocks until any in-flight /jlens compute finishes
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    server_jlens_deinit_locked();
+}
+
 bool server_jlens_init(const llama_model * model, const std::string & jlens_path, std::string & err) {
-    if (g_jlens.weights) {
-        err = "jlens already initialized";
-        return false;
-    }
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    server_jlens_deinit_locked(); // idempotent: safe re-init after model reload
 
     auto weights = std::make_unique<server_jlens_weights>(model);
+
+    // every tensor the hand-built graphs need must exist and live on a single
+    // CUDA device; compute runs there (buffer pointers are device-local)
+    int dev = -1;
+    auto check_tensor = [&](const std::string & name) -> bool {
+        ggml_tensor * t = weights->get(name);
+        if (!t) {
+            err = "jlens: model is missing tensor " + name;
+            return false;
+        }
+        if (!t->buffer) {
+            err = "jlens: tensor has no backend buffer: " + name;
+            return false;
+        }
+        const char * bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+        if (strncmp(bn, "CUDA", 4) != 0) {
+            err = "jlens: tensor is not on a CUDA device: " + name;
+            return false;
+        }
+        const int d = atoi(bn + 4);
+        if (dev < 0) {
+            dev = d;
+        } else if (dev != d) {
+            err = "jlens: model weights span multiple CUDA devices";
+            return false;
+        }
+        return true;
+    };
+    static const char * blk_names[] = {
+        "blk.%d.attn_norm.weight",       "blk.%d.attn_q.weight",
+        "blk.%d.attn_k.weight",          "blk.%d.attn_v.weight",
+        "blk.%d.attn_output.weight",     "blk.%d.post_attention_norm.weight",
+        "blk.%d.ffn_norm.weight",        "blk.%d.ffn_up.weight",
+        "blk.%d.ffn_down.weight",        "blk.%d.post_ffw_norm.weight",
+    };
+    for (const char * n : {"token_embd.weight", "output_norm.weight", "output.weight"}) {
+        if (!check_tensor(n)) {
+            return false;
+        }
+    }
+    for (int64_t il = 0; il < weights->hparams.n_layer; ++il) {
+        for (const char * fmt : blk_names) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), fmt, (int) il);
+            if (!check_tensor(buf)) {
+                return false;
+            }
+        }
+    }
 
     // load + normalize the accumulators
     FILE * f = fopen(jlens_path.c_str(), "rb");
@@ -108,6 +182,11 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         err = "bad jlens header: " + jlens_path;
         return false;
     }
+    if (n_positions == 0) {
+        fclose(f);
+        err = "jlens file has 0 positions: " + jlens_path;
+        return false;
+    }
     const int64_t n_embd  = hdr[2];
     const int64_t n_layer = hdr[3];
     if (n_embd != weights->hparams.n_embd || n_layer != weights->hparams.n_layer) {
@@ -123,6 +202,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         g_jlens.J[il].resize((size_t) n_embd * n_embd);
         if (fread(g_jlens.J[il].data(), sizeof(float), g_jlens.J[il].size(), f) != g_jlens.J[il].size()) {
             fclose(f);
+            g_jlens.J.clear();
             err = "short jlens file";
             return false;
         }
@@ -134,11 +214,13 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
     g_jlens.n_embd  = n_embd;
     g_jlens.n_layer = n_layer;
 
-    g_jlens.backend = ggml_backend_cuda_init(0);
+    g_jlens.backend = ggml_backend_cuda_init(dev);
     if (!g_jlens.backend) {
         err = "jlens: cuda init failed";
         return false;
     }
+    g_jlens.device = dev;
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(dev);
 
     // head decode graph, fixed shape
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -149,7 +231,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         return false;
     }
     g_jlens.hlogits = ggml_graph_get_tensor(g_jlens.hgf, "jlens_head_logits");
-    g_jlens.hgalloc = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+    g_jlens.hgalloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(g_jlens.hgalloc, g_jlens.hgf)) {
         err = "jlens: head graph alloc failed";
         return false;
@@ -159,7 +241,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
     ggml_init_params jp = { 4 * ggml_tensor_overhead(), nullptr, true };
     g_jlens.jctx = ggml_init(jp);
     g_jlens.jt   = ggml_new_tensor_2d(g_jlens.jctx, GGML_TYPE_F32, n_embd, n_embd);
-    g_jlens.jbuf = ggml_backend_alloc_ctx_tensors_from_buft(g_jlens.jctx, ggml_backend_cuda_buffer_type(0));
+    g_jlens.jbuf = ggml_backend_alloc_ctx_tensors_from_buft(g_jlens.jctx, buft);
     if (!g_jlens.jbuf) {
         err = "jlens: J staging alloc failed";
         return false;
@@ -167,8 +249,8 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
 
     g_jlens.weights = std::move(weights);
 
-    fprintf(stderr, "srv  jlens: loaded %" PRId64 " layers x [%" PRId64 " x %" PRId64 "], %" PRIu64 " positions\n",
-            n_layer, n_embd, n_embd, n_positions);
+    fprintf(stderr, "srv  jlens: loaded %" PRId64 " layers x [%" PRId64 " x %" PRId64 "], %" PRIu64 " positions (CUDA%d)\n",
+            n_layer, n_embd, n_embd, n_positions, dev);
     return true;
 }
 
@@ -188,6 +270,10 @@ bool server_jlens_compute(
         std::string & err) {
 
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    if (!g_jlens.weights) {
+        err = "jlens: not initialized (model reloading?)";
+        return false;
+    }
 
     const int n_tokens = (int) tokens.size();
     if (n_tokens == 0 || n_tokens > 8192) {
@@ -201,26 +287,44 @@ bool server_jlens_compute(
         err = "jlens: pos out of range";
         return false;
     }
+    if (topk < 1) {
+        err = "jlens: topk must be >= 1";
+        return false;
+    }
 
     std::vector<int> layers;
     if (layers_in && !layers_in->empty()) {
         layers = *layers_in;
     } else {
         for (int il = 0; il < g_jlens.n_layer; il += 5) layers.push_back(il);
-        layers.push_back((int) g_jlens.n_layer - 1);
+        if (layers.back() != (int) g_jlens.n_layer - 1) {
+            layers.push_back((int) g_jlens.n_layer - 1);
+        }
+    }
+    for (int il : layers) {
+        if (il < 0 || il >= (int) g_jlens.n_layer) {
+            err = "jlens: layer out of range [0, " + std::to_string(g_jlens.n_layer) + ")";
+            return false;
+        }
     }
 
-    // forward pass exposing every block output (flash attention, forward only)
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(g_jlens.device);
+
+    // forward pass exposing block outputs (flash attention, forward only).
+    // with_head=false: skip the full-sequence logits GEMM + [n_vocab, n_tokens]
+    // tensor; the model reference is decoded per-position through the head graph.
     jlens_forward fwd;
     if (!jlens_build_forward(*g_jlens.weights, n_tokens, /*with_grad_flags=*/false, fwd,
-                             -1, /*use_flash_attn=*/true)) {
+                             -1, /*use_flash_attn=*/true, /*with_head=*/false)) {
         err = "jlens: graph build failed";
         return false;
     }
-    for (auto * t : fwd.l_out) ggml_set_output(t);
-    ggml_set_output(fwd.logits);
+    // pin only the activations we actually fetch: every ggml_set_output'd tensor
+    // is retained by the allocator for the whole graph lifetime
+    for (int il : layers) ggml_set_output(fwd.l_out[il]);
+    ggml_set_output(fwd.l_out.back()); // model_topk reference decode
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+    ggml_gallocr_t galloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(galloc, fwd.gf)) {
         ggml_gallocr_free(galloc);
         ggml_free(fwd.gctx);
@@ -249,6 +353,7 @@ bool server_jlens_compute(
 
     const int64_t n_embd  = g_jlens.n_embd;
     const int64_t n_vocab = g_jlens.weights->hparams.n_vocab;
+    const int     n_real  = llama_vocab_n_tokens(vocab); // logits may be padded
 
     auto topk_of = [&](const std::vector<float> & logits) {
         std::vector<int> idx(logits.size());
@@ -257,17 +362,33 @@ bool server_jlens_compute(
         std::partial_sort(idx.begin(), idx.begin() + n, idx.end(),
                           [&](int a, int b) { return logits[a] > logits[b]; });
         std::vector<std::pair<std::string, float>> out;
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < n && idx[i] < n_real; ++i) {
             out.emplace_back(llama_vocab_get_text(vocab, idx[i]), logits[idx[i]]);
         }
         return out;
     };
 
-    // full-model reference at pos
+    // decode one [n_embd] activation through the head graph (rms norm + lm_head)
+    auto head_decode = [&](const float * a, std::vector<float> & logits) -> bool {
+        ggml_backend_tensor_set(g_jlens.x_in, a, 0, (size_t) n_embd * sizeof(float));
+        if (ggml_backend_graph_compute(g_jlens.backend, g_jlens.hgf) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_tensor_get(g_jlens.hlogits, logits.data(), 0, (size_t) n_vocab * sizeof(float));
+        return true;
+    };
+
+    // full-model reference at pos: final block output through the head
     {
-        std::vector<float> full_logits(n_vocab);
-        ggml_backend_tensor_get(fwd.logits, full_logits.data(),
-                                (size_t) pos * n_vocab * sizeof(float), n_vocab * sizeof(float));
+        std::vector<float> a(n_embd), full_logits(n_vocab);
+        ggml_backend_tensor_get(fwd.l_out.back(), a.data(),
+                                ((size_t) pos * n_embd) * sizeof(float), n_embd * sizeof(float));
+        if (!head_decode(a.data(), full_logits)) {
+            ggml_gallocr_free(galloc);
+            ggml_free(fwd.gctx);
+            err = "jlens: head compute failed";
+            return false;
+        }
         out_model_topk = topk_of(full_logits);
     }
 
@@ -280,13 +401,10 @@ bool server_jlens_compute(
         ggml_tensor * out_norm = g_jlens.weights->get("output_norm.weight");
         ggml_tensor * out_w    = g_jlens.weights->get("output.weight");
         // separate allocator: chunk graphs must not reuse the buffer holding fwd.l_out
-        ggml_gallocr_t galloc2 = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+        ggml_gallocr_t galloc2 = ggml_gallocr_new(buft);
         const int chunk = 512;
         std::vector<float> lg;
         for (int il : layers) {
-            if (il < 0 || il >= g_jlens.n_layer) {
-                continue;
-            }
             if (g_jlens.jt_layer != il) {
                 ggml_backend_tensor_set(g_jlens.jt, g_jlens.J[il].data(), 0,
                                         g_jlens.J[il].size() * sizeof(float));
@@ -299,9 +417,16 @@ bool server_jlens_compute(
                 const int np = std::min(chunk, n_tokens - p0);
                 ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
                 ggml_context * c = ggml_init(ip);
-                ggml_tensor * av = ggml_view_2d(c, fwd.l_out[il], n_embd, np,
-                                                fwd.l_out[il]->nb[1], (size_t) p0 * fwd.l_out[il]->nb[1]);
-                ggml_tensor * y  = ggml_mul_mat(c, g_jlens.jt, ggml_cont(c, av));
+                // leaf aliasing the forward activation slice (l_out is contiguous
+                // [n_embd, n_tokens] f32, so a column range is contiguous too).
+                // gallocr skips tensors with pre-set data (ggml-alloc.c:594), so
+                // this reads the forward buffer in place; crucially, a plain
+                // ggml_view_2d would make build_forward_expand pull the ENTIRE
+                // forward graph (~2000 nodes) into this tiny chunk graph.
+                ggml_tensor * av = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_embd, np);
+                av->data   = (char *) fwd.l_out[il]->data + (size_t) p0 * fwd.l_out[il]->nb[1];
+                av->buffer = fwd.l_out[il]->buffer;
+                ggml_tensor * y  = ggml_mul_mat(c, g_jlens.jt, av);
                 ggml_tensor * yn = ggml_rms_norm(c, y, g_jlens.weights->hparams.norm_eps);
                 yn = ggml_mul(c, yn, out_norm);
                 ggml_tensor * logits = ggml_mul_mat(c, out_w, yn);
@@ -342,7 +467,7 @@ bool server_jlens_compute(
                                 std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
                                                   [&](int a2, int b2) { return col[a2] > col[b2]; });
                                 auto & dst = lr.positions[p0 + q];
-                                for (int i = 0; i < k; ++i) {
+                                for (int i = 0; i < k && idx[i] < n_real; ++i) {
                                     dst.emplace_back(llama_vocab_get_text(vocab, idx[i]), col[idx[i]]);
                                 }
                             }
@@ -358,9 +483,6 @@ bool server_jlens_compute(
         // single position: y = J_l . a_l[:, pos] on CPU, decode through the head on GPU
         std::vector<float> a(n_embd), y(n_embd), lens_logits(n_vocab);
         for (int il : layers) {
-            if (il < 0 || il >= g_jlens.n_layer) {
-                continue;
-            }
             ggml_backend_tensor_get(fwd.l_out[il], a.data(),
                                     ((size_t) pos * n_embd) * sizeof(float), n_embd * sizeof(float));
             const std::vector<float> & Jl = g_jlens.J[il];
@@ -381,14 +503,12 @@ bool server_jlens_compute(
                 }
                 for (auto & t : ts) t.join();
             }
-            ggml_backend_tensor_set(g_jlens.x_in, y.data(), 0, y.size() * sizeof(float));
-            if (ggml_backend_graph_compute(g_jlens.backend, g_jlens.hgf) != GGML_STATUS_SUCCESS) {
+            if (!head_decode(y.data(), lens_logits)) {
                 ggml_gallocr_free(galloc);
                 ggml_free(fwd.gctx);
                 err = "jlens: head compute failed";
                 return false;
             }
-            ggml_backend_tensor_get(g_jlens.hlogits, lens_logits.data(), 0, n_vocab * sizeof(float));
 
             server_jlens_layer_result lr;
             lr.layer = il;

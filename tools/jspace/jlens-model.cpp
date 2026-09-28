@@ -105,6 +105,10 @@ bool jlens_model_load(const char * path, ggml_backend_buffer_type_t buft, jlens_
         const char * name   = gguf_get_tensor_name(out.gguf, i);
         const size_t offset = data_base + gguf_get_tensor_offset(out.gguf, i);
         const size_t size   = gguf_get_tensor_size(out.gguf, i);
+        if (offset > out.file_size || size > out.file_size - offset) {
+            fprintf(stderr, "%s: tensor %s out of bounds (corrupt gguf?)\n", __func__, name);
+            return false;
+        }
         ggml_tensor * t = out.tensors[name];
         ggml_backend_tensor_set(t, (const uint8_t *) out.file_map + offset, 0, size);
     }

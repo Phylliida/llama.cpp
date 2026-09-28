@@ -79,7 +79,8 @@ struct jlens_forward {
 };
 
 // build the GLM-4 dense forward graph; n_tokens must be fixed at build time.
-// if with_grad_flags: the final block output gets ggml_set_loss (VJP seed point)
+// if with_grad_flags: the final block output is flagged GGML_TENSOR_FLAG_LOSS
+// (VJP seed point; set directly because ggml_set_loss asserts a scalar shape)
 // and the graph/context are created with grads=true and sized for
 // ggml_build_backward_expand. The caller must additionally flag one leaf with
 // ggml_set_param (ggml requires at least one PARAM) and pass a grad_accs entry
@@ -88,8 +89,11 @@ struct jlens_forward {
 // inserted right after that block's output, for finite-difference checks.
 // use_flash_attn: forward-only variant with ggml_flash_attn_ext (small compute
 // buffer for long contexts; incompatible with with_grad_flags)
+// with_head: build the full-model head (final norm + lm_head over all
+// positions); pass false when only block outputs are needed to skip the
+// [n_vocab, n_tokens] logits tensor and its GEMM
 bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer = -1, bool use_flash_attn = false);
+                         int perturb_layer = -1, bool use_flash_attn = false, bool with_head = true);
 
 // R-lens (LRP backward): two-phase variant of the above.
 //

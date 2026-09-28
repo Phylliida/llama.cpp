@@ -78,20 +78,22 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
     ggml_tensor * kqv;
     if (use_flash_attn) {
         // forward-only path: flash attention keeps the score matrix off VRAM.
-        // layout [n_embd_head, n_tokens, n_head], k/v cast to f16 (CUDA fattn),
+        // layout [n_embd_head, n_tokens, n_head]; k/v + mask cast to f16, q stays
+        // f32 (CUDA mma kernels assert Q->type == F32; matches llama's own usage).
         // GQA (n_head_kv < n_head) handled by the kernel. No backward support.
         ggml_tensor * qp = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
         ggml_tensor * kp = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
         ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
         kp = ggml_cast(ctx, kp, GGML_TYPE_F16);
         vp = ggml_cast(ctx, vp, GGML_TYPE_F16);
-        qp = ggml_cast(ctx, qp, GGML_TYPE_F16);
         ggml_tensor * fmask = ggml_cast(ctx, mask, GGML_TYPE_F16); // flash attn requires f16 mask
         ggml_tensor * fa = ggml_flash_attn_ext(ctx, qp, kp, vp, fmask, kq_scale,
                                                /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
         ggml_prec_set_acc(fa, GGML_PREC_F32);
-        kqv = ggml_cont(ctx, ggml_permute(ctx, fa, 0, 2, 1, 3));       // [n_embd_head, n_head, n_q]
-        kqv = ggml_reshape_2d(ctx, kqv, n_embd, n_tokens);
+        // flash_attn_ext output is ALREADY permuted back to
+        // [n_embd_head, n_head, n_q] (ggml.c: ne = {v->ne[0], q->ne[2], q->ne[1], ...})
+        // — do NOT permute again
+        kqv = ggml_reshape_2d(ctx, fa, n_embd, n_tokens);
     } else {
         // to [n_embd_head, n_tokens, n_head] layout (heads last) for batched attention matmuls
         ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
@@ -192,7 +194,7 @@ bool jlens_build_block(const jlens_weights & m, int il, int n_tokens, jlens_bloc
 
 
 bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer, bool use_flash_attn) {
+                         int perturb_layer, bool use_flash_attn, bool with_head) {
     if (with_grad_flags && use_flash_attn) {
         fprintf(stderr, "jlens_build_forward: flash attention has no backward path\n");
         return false;
@@ -271,13 +273,17 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
         inpL = cur;
     }
 
-    // full-model head: rms norm + output projection, [n_vocab, n_tokens]
-    ggml_tensor * normed = rms_norm_mul(ctx, inpL, m.get("output_norm.weight"), hp.norm_eps);
-    out.logits = ggml_mul_mat(ctx, m.get("output.weight"), normed);
-    ggml_set_name(out.logits, "jlens_logits");
-    ggml_build_forward_expand(out.gf, out.logits);
-
-    ggml_set_output(out.logits);
+    if (with_head) {
+        // full-model head: rms norm + output projection, [n_vocab, n_tokens]
+        ggml_tensor * normed = rms_norm_mul(ctx, inpL, m.get("output_norm.weight"), hp.norm_eps);
+        out.logits = ggml_mul_mat(ctx, m.get("output.weight"), normed);
+        ggml_set_name(out.logits, "jlens_logits");
+        ggml_build_forward_expand(out.gf, out.logits);
+        ggml_set_output(out.logits);
+    } else {
+        out.logits = nullptr;
+        ggml_build_forward_expand(out.gf, inpL);
+    }
     return true;
 }
 

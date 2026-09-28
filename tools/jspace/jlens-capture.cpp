@@ -84,9 +84,20 @@ int main(int argc, char ** argv) {
 
     if (layer < 0) layer = (int) model.hparams.n_layer - 1;
     if (pos   < 0) pos   = n_tokens - 1;
+    if (layer >= (int) model.hparams.n_layer) {
+        fprintf(stderr, "--layer out of range [0, %d)\n", (int) model.hparams.n_layer);
+        return 1;
+    }
+    if (pos >= n_tokens) {
+        fprintf(stderr, "--pos out of range [0, %d)\n", n_tokens);
+        return 1;
+    }
 
     jlens_forward fwd;
     if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/false, fwd, -1, use_flash)) return 1;
+
+    // fetched after compute; pin against ggml_gallocr lifetime reuse
+    ggml_set_output(fwd.l_out[layer]);
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(galloc, fwd.gf)) { fprintf(stderr, "galloc failed\n"); return 1; }

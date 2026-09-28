@@ -34,3 +34,9 @@ add_executable(jlens-readout
 target_link_libraries(jlens-readout PRIVATE ggml)
 target_include_directories(jlens-readout PRIVATE .)
 install(TARGETS jlens-readout RUNTIME)
+
+add_executable(jlens-fattn-test
+    jlens-fattn-test.cpp)
+target_link_libraries(jlens-fattn-test PRIVATE ggml)
+target_include_directories(jlens-fattn-test PRIVATE .)
+install(TARGETS jlens-fattn-test RUNTIME)

@@ -96,11 +96,10 @@ static run_result run_backend(const std::string & backend_name, const std::strin
     x->data   = x_buf->data;
     x->buffer = x_buf->buffer;
     if (scenario == "rope") {
-        // find pos leaf
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * t = ggml_graph_node(gf, i);
-            if (strcmp(ggml_get_name(t), "pos") == 0) { t->data = pos_buf->data; t->buffer = pos_buf->buffer; }
-        }
+        // pos is a non-PARAM leaf -> lives in gf->leafs; ggml_graph_get_tensor
+        // scans leafs (and nodes), unlike ggml_graph_node which scans nodes only
+        ggml_tensor * pt = ggml_graph_get_tensor(gf, "pos");
+        if (pt) { pt->data = pos_buf->data; pt->buffer = pos_buf->buffer; }
     }
 
     std::vector<ggml_tensor *> grad_accs(ggml_graph_n_nodes(gf), nullptr);

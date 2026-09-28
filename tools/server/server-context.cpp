@@ -948,6 +948,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // jlens holds raw ggml_tensor pointers into the model; release them
+        // (after any in-flight /jlens compute) before the model is freed
+        server_jlens_deinit();
+
         spec.reset();
         spec_init.reset();
 
@@ -5157,8 +5161,18 @@ void server_routes::init_routes() {
 
         llama_tokens tokens;
         if (body.count("tokens") != 0) {
+            const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
             for (const auto & t : body.at("tokens")) {
-                tokens.push_back(t.get<llama_token>());
+                const llama_token id = t.get<llama_token>();
+                if (id < 0 || id >= n_vocab) {
+                    res->error(json{
+                        {"code", 400},
+                        {"message", "token id out of range"},
+                        {"type", "invalid_request_error"},
+                    });
+                    return res;
+                }
+                tokens.push_back(id);
             }
         } else if (body.count("content") != 0 || body.count("prompt") != 0) {
             const json & content = body.count("content") != 0 ? body.at("content") : body.at("prompt");

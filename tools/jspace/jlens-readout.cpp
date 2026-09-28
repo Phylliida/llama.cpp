@@ -1,7 +1,9 @@
 // jlens-readout: apply fitted J-lens transport matrices to a prompt's per-layer
 // residual outputs and decode through the model's final norm + unembedding:
 //
-//   y_l = J_l . a_l[:, pos]        (J_l = M_l / (n_probes * n_positions))
+//   y_l = J_l . a_l[:, pos]        (J_l = M_l / n_positions; n_positions
+//                                   accumulates n_tokens per probe, so it
+//                                   already spans all probes)
 //   logits_l = W_u . (rms_norm(y_l) * output_norm)
 //
 // usage: jlens-readout -m model.gguf --jlens accum.jlns --tokens "1,2,3"
@@ -98,6 +100,7 @@ int main(int argc, char ** argv) {
     std::vector<std::vector<float>> J(n_layer, std::vector<float>((size_t) n_embd * n_embd));
     // J = M / n_positions: each probe chunk contributes n_tokens rank-1 samples, so the
     // positions counter already spans all probes (do NOT multiply by n_probes)
+    if (n_positions == 0) die("jlens file has 0 positions");
     const double scale = 1.0 / (double) n_positions;
     for (int64_t il = 0; il < n_layer; ++il) {
         if (fread(J[il].data(), sizeof(float), J[il].size(), f) != J[il].size()) die("short jlens file");
@@ -143,18 +146,20 @@ int main(int argc, char ** argv) {
         print_topk(full_logits, model.vocab_tokens, topk, "full-model");
     }
 
-    // head graph for decoding transported activations
+    // head graph for decoding transported activations; separate allocator so its
+    // transients can never overlap the forward graph's pinned l_out storage
     ggml_init_params hparams = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * hctx = ggml_init(hparams);
     ggml_tensor *  x_in = nullptr;
     ggml_cgraph *  hgf  = jlens_build_head(model, hctx, &x_in);
-    if (!ggml_gallocr_alloc_graph(galloc, hgf)) die("galloc head failed");
+    ggml_gallocr_t hgalloc = ggml_gallocr_new(ggml_backend_cuda_buffer_type(0));
+    if (!ggml_gallocr_alloc_graph(hgalloc, hgf)) die("galloc head failed");
     ggml_tensor * hlogits = ggml_graph_get_tensor(hgf, "jlens_head_logits");
     std::vector<float> lens_logits(n_vocab);
 
     if (layers.empty()) {
         for (int il = 0; il < n_layer; il += 5) layers.push_back((int) il);
-        layers.push_back((int) n_layer - 1);
+        if (layers.back() != n_layer - 1) layers.push_back((int) n_layer - 1);
     }
 
     // per-layer: y = J_l . a_l[:, pos], decode

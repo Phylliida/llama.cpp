@@ -14,9 +14,16 @@
 struct llama_model;
 struct llama_vocab;
 
-// load transport matrices + initialize the compute backend (CUDA device 0).
-// call once after the model is loaded. Returns false on error (err set).
+// load transport matrices + initialize the compute backend (on the CUDA device
+// holding the model weights). Called after every model (re)load, including
+// wake-from-sleep; idempotent (deinitializes any previous state first).
+// Returns false on error (err set).
 bool server_jlens_init(const llama_model * model, const std::string & jlens_path, std::string & err);
+
+// release all jlens state. Must be called before the model is destroyed
+// (sleep/shutdown): the weights adapter holds raw ggml_tensor pointers into
+// the llama model. Blocks until any in-flight compute finishes.
+void server_jlens_deinit();
 
 bool server_jlens_enabled();
 

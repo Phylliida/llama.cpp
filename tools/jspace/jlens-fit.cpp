@@ -22,7 +22,8 @@
 //
 // file format (little endian): "JLNS" u32, version u32, n_embd u32, n_layer u32,
 //   n_probes u64, n_positions u64, then n_layer * n_embd * n_embd f32 row-major.
-//   J_l = M_l / (n_probes * n_positions) is left to the readout side.
+//   J_l = M_l / n_positions is left to the readout side (n_positions accumulates
+//   n_tokens per probe, so it already spans all probes).
 
 #include "jlens.h"
 
@@ -67,14 +68,14 @@ static bool acc_save(const char * path, const std::vector<std::vector<float>> & 
 }
 
 static bool acc_load(const char * path, std::vector<std::vector<float>> & M,
-                     int64_t n_embd, uint64_t & n_probes, uint64_t & n_positions) {
+                     int64_t n_embd, int64_t n_layer, uint64_t & n_probes, uint64_t & n_positions) {
     FILE * f = fopen(path, "rb");
     if (!f) return false;
     uint32_t magic, version, ne, nl;
     if (fread(&magic, 4, 1, f) != 1 || magic != 0x4A4C4E53) { fclose(f); return false; }
     if (fread(&version, 4, 1, f) != 1 || version != 1)       { fclose(f); return false; }
     if (fread(&ne, 4, 1, f) != 1 || ne != (uint32_t) n_embd) { fclose(f); return false; }
-    if (fread(&nl, 4, 1, f) != 1)                            { fclose(f); return false; }
+    if (fread(&nl, 4, 1, f) != 1 || nl != (uint32_t) n_layer){ fclose(f); return false; }
     if (fread(&n_probes, 8, 1, f) != 1 || fread(&n_positions, 8, 1, f) != 1) { fclose(f); return false; }
     M.resize(nl);
     for (auto & m : M) {
@@ -112,6 +113,7 @@ int main(int argc, char ** argv) {
     int fd_layer = -1, fd_block = -1, fd_k = 6;
     float fd_eps = 0.5f;
     int chunk_len = 128, n_chunks = 0, stride = 0; // stride 0 -> chunk_len (non-overlapping)
+    int start_chunk = 0; // --start-chunk: resume a chunked run after a crash (with --in)
     int save_every = 50; // checkpoint accumulators every N chunks (0 = only at end)
     bool lrp = false; // --lrp: fit the R-lens (LRP backward rules) instead of the J-lens
 
@@ -122,6 +124,7 @@ int main(int argc, char ** argv) {
         else if (a == "--tokens-file") tokens_file = argv[++i];
         else if (a == "--chunk-len")   chunk_len = atoi(argv[++i]);
         else if (a == "--n-chunks")    n_chunks  = atoi(argv[++i]);
+        else if (a == "--start-chunk") start_chunk = atoi(argv[++i]);
         else if (a == "--stride")      stride    = atoi(argv[++i]);
         else if (a == "--save-every")  save_every = atoi(argv[++i]);
         else if (a == "--backend")  backend_name = argv[++i];
@@ -175,6 +178,12 @@ int main(int argc, char ** argv) {
         stride   = 0;
     }
     if (n_tokens < 2) die("need at least 2 tokens");
+    if (stride < 0) die("--stride must be >= 0");
+    if (start_chunk < 0) die("--start-chunk must be >= 0");
+    if (start_chunk > 0 && in_path.empty())
+        die("--start-chunk without --in would discard the earlier chunks' contributions; refusing");
+    if (start_chunk >= n_chunks)
+        die("--start-chunk >= --n-chunks: nothing to do");
     if (lrp && fd_layer >= 0) die("--lrp has no perturb input; use --fd-block or drop --fd-check");
 
     ggml_backend_t backend = nullptr;
@@ -195,6 +204,8 @@ int main(int argc, char ** argv) {
     if (!jlens_model_load(model_path.c_str(), buft, model)) die("model load failed");
     const int64_t n_embd  = model.hparams.n_embd;
     const int64_t n_layer = model.hparams.n_layer;
+    if (fd_layer >= n_layer) die("--fd-check layer out of range");
+    if (fd_block >  n_layer) die("--fd-block out of range");
 
     jlens_forward fwd_plain;
     jlens_lrp_forward fwd_lrp;
@@ -242,6 +253,7 @@ int main(int argc, char ** argv) {
         ggml_set_output(u_t[il]);
     }
     if (fd_layer >= 0) ggml_set_output(fwd.l_out.back()); // fetched in fd mode
+    if (fd_block >= 1) ggml_set_output(fwd.l_out[fd_block - 1]); // reference fetch in fd-block mode
 
     // Give ALL graph inputs dedicated storage outside ggml_gallocr. We observed
     // gallocr placing a transient tensor exactly on the gallocr-allocated tokens
@@ -544,25 +556,15 @@ int main(int argc, char ** argv) {
         for (auto & x : v_host) x = gauss(rng);
         ggml_backend_tensor_set(vjp_seed, v_host.data(), 0, v_host.size() * sizeof(float));
         std::vector<float> zero(u_host.size(), 0.0f);
-        auto print_tokens = [&](const char * tag) {
-            std::vector<int32_t> chk(ids.size());
-            ggml_backend_tensor_get(fwd.tokens, chk.data(), 0, chk.size() * sizeof(int32_t));
-            fprintf(stderr, "DBG tokens @%s: %d %d %d %d %d\n", tag, chk[0], chk[1], chk[2], chk[3], chk[4]);
-        };
-        print_tokens("pre-zero");
         ggml_backend_tensor_set(fwd.perturb, zero.data(), 0, zero.size() * sizeof(float));
-        print_tokens("post-zero");
 
         if (ggml_backend_graph_compute(backend, gb) != GGML_STATUS_SUCCESS) die("compute failed");
-        print_tokens("post-compute");
         ggml_backend_tensor_get(u_t[fd_layer], u_host.data(), 0, u_host.size() * sizeof(float));
 
         std::vector<float> h_host(u_host.size());
         std::vector<float> pbuf(u_host.size());
         std::mt19937 frng(7);
         std::uniform_int_distribution<int64_t> pick(0, (int64_t) u_host.size() - 1);
-        fprintf(stderr, "DBG tokens=%p pos=%p mask=%p perturb=%p seed=%p\n",
-                fwd.tokens->data, fwd.pos->data, fwd.mask->data, fwd.perturb->data, vjp_seed->data);
         printf("fd-check layer %d, eps=%g, %d entries (VJP vs central difference)\n", fd_layer, (double) fd_eps, fd_k);
         for (int k = 0; k < fd_k; ++k) {
             const int64_t idx = pick(frng);
@@ -598,7 +600,7 @@ int main(int argc, char ** argv) {
     if (fitting) {
         p_host.resize((size_t) n_embd * n_embd);
         if (!in_path.empty()) {
-            if (!acc_load(in_path.c_str(), M, n_embd, acc_probes, acc_positions))
+            if (!acc_load(in_path.c_str(), M, n_embd, n_layer, acc_probes, acc_positions))
                 die("failed to load --in accumulator");
             fprintf(stderr, "jlens-fit: continuing from %s (%llu probes, %llu positions)\n",
                     in_path.c_str(), (unsigned long long) acc_probes, (unsigned long long) acc_positions);
@@ -611,7 +613,7 @@ int main(int argc, char ** argv) {
 
     // dump-grads reference loading happens after probe 0 compute
 
-    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+    for (int chunk = start_chunk; chunk < n_chunks; ++chunk) {
         if (!tokens_file.empty()) {
             ggml_backend_tensor_set(fwd.tokens, ids.data() + (size_t) chunk * stride, 0,
                                     n_tokens * sizeof(int32_t));
