@@ -1,4 +1,5 @@
 #include "out-prod.cuh"
+#include "convert.cuh"
 
 #include <cstdint>
 
@@ -30,7 +31,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -44,17 +44,39 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne2 == src1->ne[2]);
     GGML_ASSERT(ne3 == src1->ne[3]);
 
+    cudaStream_t   stream = ctx.stream();
+
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
-    cudaStream_t   stream = ctx.stream();
+    // quantized src0 (e.g. frozen weight matrices in a backward pass):
+    // dequantize into a contiguous F32 staging buffer, then run the regular cublas path
+    size_t nb01_eff = nb01;
+    size_t nb02_eff = nb02;
+    size_t nb03_eff = nb03;
+    ggml_cuda_pool_alloc<float> src0_f32;
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+
+        src0_f32.alloc(ctx.pool(), ggml_nelements(src0));
+        to_fp32(src0->data, src0_f32.get(), ggml_nelements(src0), stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        src0_d   = src0_f32.get();
+        nb01_eff = ne00*sizeof(float);
+        nb02_eff = ne01*nb01_eff;
+        nb03_eff = ne02*nb02_eff;
+    }
+
     cublasHandle_t handle = ctx.cublas_handle();
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    const int64_t lda = nb01 / sizeof(float);
+    const int64_t lda = nb01_eff / sizeof(float);
     const int64_t ldc = nb1  / sizeof(float);
 
     const bool src1_T = ggml_is_transposed(src1);
@@ -63,8 +85,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
     // data strides in dimensions 2/3
-    const size_t s02 = nb02 / sizeof(float);
-    const size_t s03 = nb03 / sizeof(float);
+    const size_t s02 = nb02_eff / sizeof(float);
+    const size_t s03 = nb03_eff / sizeof(float);
     const size_t s12 = nb12 / sizeof(float);
     const size_t s13 = nb13 / sizeof(float);
     const size_t s2  = nb2  / sizeof(float);
