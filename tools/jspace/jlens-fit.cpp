@@ -113,6 +113,7 @@ int main(int argc, char ** argv) {
     float fd_eps = 0.5f;
     int chunk_len = 128, n_chunks = 0, stride = 0; // stride 0 -> chunk_len (non-overlapping)
     int save_every = 50; // checkpoint accumulators every N chunks (0 = only at end)
+    bool lrp = false; // --lrp: fit the R-lens (LRP backward rules) instead of the J-lens
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -135,6 +136,7 @@ int main(int argc, char ** argv) {
         else if (a == "--fd-block")   fd_block = atoi(argv[++i]);
         else if (a == "--fd-k")       fd_k     = atoi(argv[++i]);
         else if (a == "--fd-eps")     fd_eps   = (float) atof(argv[++i]);
+        else if (a == "--lrp")        lrp        = true;
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty() || (tokens_str.empty() && tokens_file.empty())) {
@@ -173,6 +175,7 @@ int main(int argc, char ** argv) {
         stride   = 0;
     }
     if (n_tokens < 2) die("need at least 2 tokens");
+    if (lrp && fd_layer >= 0) die("--lrp has no perturb input; use --fd-block or drop --fd-check");
 
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
@@ -193,8 +196,14 @@ int main(int argc, char ** argv) {
     const int64_t n_embd  = model.hparams.n_embd;
     const int64_t n_layer = model.hparams.n_layer;
 
-    jlens_forward fwd;
-    if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/true, fwd, fd_layer)) die("graph build failed");
+    jlens_forward fwd_plain;
+    jlens_lrp_forward fwd_lrp;
+    jlens_forward & fwd = lrp ? static_cast<jlens_forward &>(fwd_lrp) : fwd_plain;
+    if (lrp) {
+        if (!jlens_build_forward_lrp(model, n_tokens, fwd_lrp)) die("lrp graph build failed");
+    } else {
+        if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/true, fwd_plain, fd_layer)) die("graph build failed");
+    }
     if (!fwd.zero_pad) die("graph missing zero_pad param leaf");
     if (fd_layer >= 0 && !fwd.perturb) die("graph missing perturb input");
 
@@ -239,13 +248,23 @@ int main(int argc, char ** argv) {
     // leaf (offset 0), corrupting token ids mid-compute — params not being
     // registered as leafs (ggml.c:7281) was one instance; rather than chase every
     // lifetime-analysis edge case in this ggml version, bypass it for inputs.
-    ggml_init_params inparams = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params inparams = { (8 + 7 * n_layer) * ggml_tensor_overhead(), nullptr, true };
     ggml_context * inctx = ggml_init(inparams);
     ggml_tensor * t_tokens  = ggml_dup_tensor(inctx, fwd.tokens);
     ggml_tensor * t_pos     = ggml_dup_tensor(inctx, fwd.pos);
     ggml_tensor * t_mask    = ggml_dup_tensor(inctx, fwd.mask);
     ggml_tensor * t_zero    = ggml_dup_tensor(inctx, fwd.zero_pad);
     ggml_tensor * t_perturb = fwd.perturb ? ggml_dup_tensor(inctx, fwd.perturb) : nullptr;
+    std::vector<ggml_tensor *> t_leaves; // lrp detach-leaf storage
+    if (lrp) {
+        for (int il = 0; il < n_layer; ++il) {
+            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
+            for (int k = 0; k < 4; ++k) t_leaves.push_back(ggml_dup_tensor(inctx, lv.rms_inv[k]));
+            t_leaves.push_back(ggml_dup_tensor(inctx, lv.sig_gate));
+            t_leaves.push_back(ggml_dup_tensor(inctx, lv.silu_gate));
+            t_leaves.push_back(ggml_dup_tensor(inctx, lv.up));
+        }
+    }
     if (!ggml_backend_alloc_ctx_tensors_from_buft(inctx, buft)) die("input buffer alloc failed");
     auto wire = [](ggml_tensor * dst, const ggml_tensor * src) {
         dst->data   = src->data;
@@ -256,6 +275,16 @@ int main(int argc, char ** argv) {
     wire(fwd.mask, t_mask);
     wire(fwd.zero_pad, t_zero);
     if (fwd.perturb) wire(fwd.perturb, t_perturb);
+    if (lrp) {
+        int li = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
+            for (int k = 0; k < 4; ++k) wire(lv.rms_inv[k], t_leaves[li++]);
+            wire(lv.sig_gate,  t_leaves[li++]);
+            wire(lv.silu_gate, t_leaves[li++]);
+            wire(lv.up,        t_leaves[li++]);
+        }
+    }
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(galloc, gb)) die("galloc failed");
@@ -276,6 +305,78 @@ int main(int argc, char ** argv) {
         const float zero = 0.0f;
         ggml_backend_tensor_set(fwd.zero_pad, &zero, 0, sizeof(float));
     }
+
+    // ---- R-lens phase 1: detach-value harvest (per chunk, amortized over probes) ----
+    jlens_forward dt;
+    ggml_gallocr_t dt_galloc = nullptr;
+    std::vector<ggml_tensor *> dt_rms;  // [n_layer * 4] norm inputs
+    std::vector<ggml_tensor *> dt_gate; // [n_layer]
+    std::vector<ggml_tensor *> dt_up;   // [n_layer]
+    std::vector<float> h_rms((size_t) n_embd * n_tokens);
+    std::vector<float> h_gate, h_up, h_sig, h_silu;
+    std::vector<float> h_rms_inv;
+    if (lrp) {
+        if (!jlens_build_forward_dt(model, n_tokens, dt)) die("dt graph build failed");
+        // shares token/pos/mask storage with the main graph
+        wire(dt.tokens, t_tokens);
+        wire(dt.pos,    t_pos);
+        wire(dt.mask,   t_mask);
+        dt_galloc = ggml_gallocr_new(buft);
+        if (!ggml_gallocr_alloc_graph(dt_galloc, dt.gf)) die("dt galloc failed");
+        fprintf(stderr, "jlens-fit: dt compute buffer %.2f GiB\n",
+                ggml_gallocr_get_buffer_size(dt_galloc, 0) / (1024.0 * 1024.0 * 1024.0));
+        for (int il = 0; il < n_layer; ++il) {
+            char name[64];
+            for (int k = 0; k < 4; ++k) {
+                snprintf(name, sizeof(name), "jlens_dt_%d_rms_%d", il, k);
+                ggml_tensor * t = ggml_graph_get_tensor(dt.gf, name);
+                if (!t) die("dt rms source missing");
+                dt_rms.push_back(t);
+            }
+            snprintf(name, sizeof(name), "jlens_dt_%d_gate", il);
+            ggml_tensor * g = ggml_graph_get_tensor(dt.gf, name);
+            snprintf(name, sizeof(name), "jlens_dt_%d_up", il);
+            ggml_tensor * u = ggml_graph_get_tensor(dt.gf, name);
+            if (!g || !u) die("dt gate/up source missing");
+            dt_gate.push_back(g);
+            dt_up.push_back(u);
+        }
+        const int64_t n_ff = model.hparams.n_ff;
+        h_gate.resize((size_t) n_ff * n_tokens);
+        h_up.resize((size_t) n_ff * n_tokens);
+        h_sig.resize((size_t) n_ff * n_tokens);
+        h_silu.resize((size_t) n_ff * n_tokens);
+        h_rms_inv.resize(n_tokens);
+    }
+    auto harvest = [&]() {
+        const int64_t n_ff = model.hparams.n_ff;
+        const float eps = model.hparams.norm_eps;
+        if (ggml_backend_graph_compute(backend, dt.gf) != GGML_STATUS_SUCCESS) die("dt compute failed");
+        for (int il = 0; il < n_layer; ++il) {
+            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
+            for (int k = 0; k < 4; ++k) {
+                ggml_backend_tensor_get(dt_rms[il * 4 + k], h_rms.data(), 0, h_rms.size() * sizeof(float));
+                // rms_inv[j] = 1/sqrt(mean_i x[i,j]^2 + eps); layout [n_embd, n_tokens]
+                for (int j = 0; j < n_tokens; ++j) {
+                    const float * x = h_rms.data() + (size_t) j * n_embd;
+                    double ss = 0;
+                    for (int64_t i = 0; i < n_embd; ++i) ss += (double) x[i] * x[i];
+                    h_rms_inv[j] = (float) (1.0 / sqrt(ss / n_embd + eps));
+                }
+                ggml_backend_tensor_set(lv.rms_inv[k], h_rms_inv.data(), 0, n_tokens * sizeof(float));
+            }
+            ggml_backend_tensor_get(dt_gate[il], h_gate.data(), 0, h_gate.size() * sizeof(float));
+            ggml_backend_tensor_get(dt_up[il],   h_up.data(),   0, h_up.size()   * sizeof(float));
+            for (size_t i = 0; i < h_gate.size(); ++i) {
+                const float sg = 1.0f / (1.0f + expf(-h_gate[i]));
+                h_sig[i]  = sg;
+                h_silu[i] = h_gate[i] * sg;
+            }
+            ggml_backend_tensor_set(lv.sig_gate,  h_sig.data(),  0, h_sig.size()  * sizeof(float));
+            ggml_backend_tensor_set(lv.silu_gate, h_silu.data(), 0, h_silu.size() * sizeof(float));
+            ggml_backend_tensor_set(lv.up,        h_up.data(),   0, h_up.size()   * sizeof(float));
+        }
+    };
 
     // outer-product graph for the rank-n_tokens accumulator updates:
     //   P = out_prod(V, U)  [n_embd, n_embd],  P[i,j] = sum_k V[i,k]*U[j,k] = (V U^T)[i,j]
@@ -514,6 +615,12 @@ int main(int argc, char ** argv) {
         if (!tokens_file.empty()) {
             ggml_backend_tensor_set(fwd.tokens, ids.data() + (size_t) chunk * stride, 0,
                                     n_tokens * sizeof(int32_t));
+        }
+        if (lrp) {
+            const int64_t th0 = ggml_time_us();
+            harvest();
+            fprintf(stderr, "chunk %d/%d: harvest %.1f ms\n",
+                    chunk + 1, n_chunks, (ggml_time_us() - th0) / 1000.0);
         }
     for (int probe = 0; probe < n_probes; ++probe) {
         for (auto & x : v_host) x = gauss(rng);

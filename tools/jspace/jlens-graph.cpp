@@ -19,7 +19,9 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x, ggml_tens
 // one GLM-4 dense block: post-norm attention + swiglu MLP with residuals
 static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int il, int n_tokens,
                                ggml_tensor * inpL, ggml_tensor * pos, ggml_tensor * mask,
-                               bool use_flash_attn) {
+                               bool use_flash_attn,
+                               jlens_lrp_leaves * lrp = nullptr,
+                               std::vector<ggml_tensor *> * dt_src = nullptr) {
     const auto & hp = m.hparams;
     const int64_t n_embd      = hp.n_embd;
     const int64_t n_head      = hp.n_head;
@@ -30,8 +32,29 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
 
     ggml_tensor * inpSA = inpL;
 
+    // rms-norm site k. LRP mode applies the LN-rule (detached denominator) by
+    // construction; dt_src mode records the norm input for harvesting.
+    int n_norm_site = 0;
+    auto norm_site = [&](ggml_tensor * x, ggml_tensor * w) {
+        if (dt_src) {
+            char name[64];
+            snprintf(name, sizeof(name), "jlens_dt_%d_rms_%d", il, n_norm_site);
+            ggml_set_name(x, name);
+            ggml_set_output(x);
+            dt_src->push_back(x);
+        }
+        ggml_tensor * y;
+        if (lrp) {
+            y = ggml_mul(ctx, ggml_mul(ctx, x, lrp->rms_inv[n_norm_site]), w);
+        } else {
+            y = ggml_mul(ctx, ggml_rms_norm(ctx, x, hp.norm_eps), w);
+        }
+        n_norm_site++;
+        return y;
+    };
+
     // pre-attention norm
-    ggml_tensor * cur = rms_norm_mul(ctx, inpL, m.blk("blk.%d.attn_norm.weight", il), hp.norm_eps);
+    ggml_tensor * cur = norm_site(inpL, m.blk("blk.%d.attn_norm.weight", il));
 
     // qkv
     ggml_tensor * q = ggml_mul_mat(ctx, m.blk("blk.%d.attn_q.weight", il), cur); // [n_embd, n]
@@ -93,11 +116,11 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
     cur = ggml_mul_mat(ctx, m.blk("blk.%d.attn_output.weight", il), kqv);
 
     // post-attention norm, residual
-    cur = rms_norm_mul(ctx, cur, m.blk("blk.%d.post_attention_norm.weight", il), hp.norm_eps);
+    cur = norm_site(cur, m.blk("blk.%d.post_attention_norm.weight", il));
     ggml_tensor * ffn_inp = ggml_add(ctx, cur, inpSA);
 
     // pre-MLP norm
-    cur = rms_norm_mul(ctx, ffn_inp, m.blk("blk.%d.ffn_norm.weight", il), hp.norm_eps);
+    cur = norm_site(ffn_inp, m.blk("blk.%d.ffn_norm.weight", il));
 
     // combined gate|up projection [2*n_ff, n]; split for swiglu_split (backward needs split form)
     ggml_tensor * up_out = ggml_mul_mat(ctx, m.blk("blk.%d.ffn_up.weight", il), cur);
@@ -105,11 +128,28 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
                                     up_out->nb[1], 0));
     ggml_tensor * up     = ggml_cont(ctx, ggml_view_2d(ctx, up_out, n_ff, n_tokens,
                                     up_out->nb[1], n_ff * up_out->nb[0]));
-    cur = ggml_swiglu_split(ctx, gate, up);                          // silu(gate) * up, [n_ff, n]
+    if (dt_src) {
+        char name[64];
+        snprintf(name, sizeof(name), "jlens_dt_%d_gate", il);
+        ggml_set_name(gate, name); ggml_set_output(gate); dt_src->push_back(gate);
+        snprintf(name, sizeof(name), "jlens_dt_%d_up", il);
+        ggml_set_name(up, name);   ggml_set_output(up);   dt_src->push_back(up);
+    }
+    if (lrp) {
+        // identity + half rule by construction:
+        //   y = 0.5*(g*sig_leaf)*up_leaf + 0.5*silu_leaf*u
+        // autodiff gives dg = 0.5*dy*sig*u (identity rule on silu, half rule on the
+        // product) and du = 0.5*dy*silu(g) (half rule). Forward value unchanged.
+        ggml_tensor * a = ggml_mul(ctx, ggml_mul(ctx, gate, lrp->sig_gate), lrp->up);
+        ggml_tensor * b = ggml_mul(ctx, lrp->silu_gate, up);
+        cur = ggml_add(ctx, ggml_scale(ctx, a, 0.5f), ggml_scale(ctx, b, 0.5f));
+    } else {
+        cur = ggml_swiglu_split(ctx, gate, up);                      // silu(gate) * up, [n_ff, n]
+    }
     cur = ggml_mul_mat(ctx, m.blk("blk.%d.ffn_down.weight", il), cur);
 
     // post-MLP norm, residual
-    cur = rms_norm_mul(ctx, cur, m.blk("blk.%d.post_ffw_norm.weight", il), hp.norm_eps);
+    cur = norm_site(cur, m.blk("blk.%d.post_ffw_norm.weight", il));
     return ggml_add(ctx, cur, ffn_inp);
 }
 
@@ -255,4 +295,124 @@ ggml_cgraph * jlens_build_head(const jlens_weights & m, ggml_context * gctx, ggm
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, 8, false);
     ggml_build_forward_expand(gf, logits);
     return gf;
+}
+
+// phase 1: ordinary forward with detach sources named + marked as outputs
+bool jlens_build_forward_dt(const jlens_weights & m, int n_tokens, jlens_forward & out) {
+    const auto & hp = m.hparams;
+
+    const int    gsize    = hp.n_layer * 64;
+    const int    n_tensors= hp.n_layer * 72;
+    const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, false);
+    struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
+    out.gctx = ggml_init(iparams);
+    ggml_context * ctx = out.gctx;
+
+    out.gf = ggml_new_graph_custom(ctx, gsize, /*grads=*/false);
+
+    out.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.tokens, "jlens_tokens");
+    ggml_set_input(out.tokens);
+
+    out.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.pos, "jlens_pos");
+    ggml_set_input(out.pos);
+
+    out.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_set_name(out.mask, "jlens_mask");
+    ggml_set_input(out.mask);
+
+    ggml_tensor * inpL = ggml_get_rows(ctx, m.get("token_embd.weight"), out.tokens);
+
+    std::vector<ggml_tensor *> dt_src;
+    dt_src.reserve(hp.n_layer * 6);
+    out.l_out.resize(hp.n_layer, nullptr);
+
+    for (int il = 0; il < hp.n_layer; ++il) {
+        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask,
+                                      /*use_flash_attn=*/false, /*lrp=*/nullptr, &dt_src);
+        char name[64];
+        snprintf(name, sizeof(name), "jlens_l_out_%d", il);
+        ggml_set_name(cur, name);
+        ggml_build_forward_expand(out.gf, cur);
+        out.l_out[il] = cur;
+        inpL = cur;
+    }
+
+    out.logits = ggml_mul_mat(ctx, m.get("output.weight"),
+                              rms_norm_mul(ctx, inpL, m.get("output_norm.weight"), hp.norm_eps));
+    ggml_set_name(out.logits, "jlens_logits");
+    ggml_build_forward_expand(out.gf, out.logits);
+    ggml_set_output(out.logits);
+    return true;
+}
+
+// phase 2: LRP-structured graph (LN-rule + identity/half rule via detached leaves);
+// ordinary autodiff over it yields the R-lens backward
+bool jlens_build_forward_lrp(const jlens_weights & m, int n_tokens, jlens_lrp_forward & out) {
+    const auto & hp = m.hparams;
+
+    const int    gsize    = hp.n_layer * 256;
+    const int    n_tensors= hp.n_layer * 236;
+    const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, true);
+    struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
+    out.gctx = ggml_init(iparams);
+    ggml_context * ctx = out.gctx;
+
+    out.gf = ggml_new_graph_custom(ctx, gsize, /*grads=*/true);
+
+    out.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.tokens, "jlens_tokens");
+    ggml_set_input(out.tokens);
+
+    out.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.pos, "jlens_pos");
+    ggml_set_input(out.pos);
+
+    out.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_set_name(out.mask, "jlens_mask");
+    ggml_set_input(out.mask);
+
+    ggml_tensor * inpL = ggml_get_rows(ctx, m.get("token_embd.weight"), out.tokens);
+
+    // param-coverage hack (see jlens_build_forward)
+    out.zero_pad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(out.zero_pad, "jlens_zero_pad");
+    ggml_set_param(out.zero_pad);
+    inpL = ggml_add(ctx, inpL, out.zero_pad);
+
+    out.leaves.resize(hp.n_layer);
+    out.l_out.resize(hp.n_layer, nullptr);
+
+    for (int il = 0; il < hp.n_layer; ++il) {
+        jlens_lrp_leaves & lv = out.leaves[il];
+        for (int k = 0; k < 4; ++k) {
+            lv.rms_inv[k] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+            char name[64];
+            snprintf(name, sizeof(name), "jlens_lrp_%d_rms_%d", il, k);
+            ggml_set_name(lv.rms_inv[k], name);
+            ggml_set_input(lv.rms_inv[k]);
+        }
+        lv.sig_gate  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_ff, n_tokens);
+        lv.silu_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_ff, n_tokens);
+        lv.up        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_ff, n_tokens);
+        char name[64];
+        snprintf(name, sizeof(name), "jlens_lrp_%d_sig",  il); ggml_set_name(lv.sig_gate,  name); ggml_set_input(lv.sig_gate);
+        snprintf(name, sizeof(name), "jlens_lrp_%d_silu", il); ggml_set_name(lv.silu_gate, name); ggml_set_input(lv.silu_gate);
+        snprintf(name, sizeof(name), "jlens_lrp_%d_up",   il); ggml_set_name(lv.up,        name); ggml_set_input(lv.up);
+
+        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask,
+                                      /*use_flash_attn=*/false, &lv, nullptr);
+
+        snprintf(name, sizeof(name), "jlens_l_out_%d", il);
+        ggml_set_name(cur, name);
+        if (il == (int) hp.n_layer - 1) {
+            cur->flags |= GGML_TENSOR_FLAG_LOSS; // caller supplies the grad_accs seed
+        }
+        ggml_build_forward_expand(out.gf, cur);
+        out.l_out[il] = cur;
+        inpL = cur;
+    }
+
+    return true;
 }

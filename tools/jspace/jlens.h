@@ -91,6 +91,37 @@ struct jlens_forward {
 bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
                          int perturb_layer = -1, bool use_flash_attn = false);
 
+// R-lens (LRP backward): two-phase variant of the above.
+//
+// jlens_build_forward_dt builds the ordinary forward but additionally names and
+// marks as outputs the tensors the LRP rules need detached values of (4 rms-norm
+// inputs + gate/up per block):
+//   jlens_dt_<il>_rms_<k>  [n_embd, n_tokens]  k = 0 attn, 1 post_attn, 2 ffn, 3 post_ffw
+//   jlens_dt_<il>_gate     [n_ff, n_tokens]
+//   jlens_dt_<il>_up       [n_ff, n_tokens]
+// The caller computes the detach values from these (rms_inv, sigmoid(gate),
+// silu(gate), up) and hands them to the phase-2 graph via jlens_lrp_leaves.
+//
+// jlens_build_forward_lrp builds the same network with the LRP rules baked in as
+// detached-leaf structure, so ordinary autodiff over it yields the LRP backward:
+//   rms_norm(x)*w  -> (x * rms_inv_leaf) * w                 (LN-rule)
+//   swiglu(g, u)   -> 0.5*(g*sig_leaf)*up_detached + 0.5*silu_leaf*u
+//                                                        (identity + half rule)
+// The forward value is identical. All other ops keep their ordinary backward.
+struct jlens_lrp_leaves {
+    ggml_tensor * rms_inv[4] = {}; // [1, n_tokens], one per norm site
+    ggml_tensor * sig_gate   = nullptr; // [n_ff, n_tokens]
+    ggml_tensor * silu_gate  = nullptr; // [n_ff, n_tokens]
+    ggml_tensor * up         = nullptr; // [n_ff, n_tokens]
+};
+
+struct jlens_lrp_forward : jlens_forward {
+    std::vector<jlens_lrp_leaves> leaves; // [n_layer], graph inputs to be wired by caller
+};
+
+bool jlens_build_forward_dt (const jlens_weights & m, int n_tokens, jlens_forward & out);
+bool jlens_build_forward_lrp(const jlens_weights & m, int n_tokens, jlens_lrp_forward & out);
+
 // single-block graph for local validation: h_in leaf -> (+zero_pad param) -> block -> h_out (loss)
 struct jlens_block {
     ggml_context * gctx = nullptr;
