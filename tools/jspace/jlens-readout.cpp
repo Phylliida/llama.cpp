@@ -104,7 +104,11 @@ int main(int argc, char ** argv) {
     const double scale = 1.0 / (double) n_positions;
     for (int64_t il = 0; il < n_layer; ++il) {
         if (fread(J[il].data(), sizeof(float), J[il].size(), f) != J[il].size()) die("short jlens file");
-        for (auto & x : J[il]) x = (float) (x * scale);
+        double norm2 = 0;
+        for (auto & x : J[il]) { x = (float) (x * scale); norm2 += (double) x * x; }
+        if (norm2 == 0)
+            fprintf(stderr, "jlens-readout: WARNING: layer %lld is all zeros (not fitted; above the fitter's --target-layer?)\n",
+                    (long long) il);
     }
     fclose(f);
 
@@ -169,6 +173,10 @@ int main(int argc, char ** argv) {
         ggml_backend_tensor_get(fwd.l_out[il], a.data(),
                                 ((size_t) pos * n_embd) * sizeof(float), n_embd * sizeof(float));
         const std::vector<float> & Jl = J[il];
+        // J is stored in ggml column-major layout: J[i,j] at offset i + j*n_embd,
+        // so y = J·a is a column-wise axpy accumulation (row-wise dot products
+        // would compute Jᵀ·a instead)
+        std::fill(y.begin(), y.end(), 0.0f);
         {
             std::vector<std::thread> ts;
             const int64_t rows_per = (n_embd + n_threads - 1) / n_threads;
@@ -176,11 +184,10 @@ int main(int argc, char ** argv) {
                 const int64_t r0 = t * rows_per, r1 = std::min(n_embd, r0 + rows_per);
                 if (r0 >= r1) break;
                 ts.emplace_back([&, r0, r1] {
-                    for (int64_t i = r0; i < r1; ++i) {
-                        const float * row = Jl.data() + (size_t) i * n_embd;
-                        double s = 0;
-                        for (int64_t j = 0; j < n_embd; ++j) s += (double) row[j] * a[j];
-                        y[i] = (float) s;
+                    for (int64_t j = 0; j < n_embd; ++j) {
+                        const float * col = Jl.data() + (size_t) j * n_embd;
+                        const float aj = a[j];
+                        for (int64_t i = r0; i < r1; ++i) y[i] += col[i] * aj;
                     }
                 });
             }

@@ -17,13 +17,25 @@
 //     --seed S             RNG seed for probes (default 42)
 //     --out jlens.bin      write raw accumulator sums + counts (enables fitting)
 //     --in  jlens.bin      load accumulators first (continue a run)
+//     --xpos               cross-position mode: same probe vector at every
+//                          valid position, so E[M_l] sums the Jacobian over all
+//                          (source t, target t') pairs, not just t'=t
+//                          (anthropics/jacobian-lens reference estimator)
+//     --skip-first N       exclude the first N positions and the last position
+//                          from both the seed and the source mean (default 16,
+//                          matching the reference's attention-sink handling)
+//     --target-layer N     seed the VJP at block N's output instead of the
+//                          final block (paper default: penultimate layer)
 //     --dump-grads path    after probe 0, write all per-layer VJPs U_l and exit
 //     --compare path       after probe 0, compare U_l against a --dump-grads file
 //
 // file format (little endian): "JLNS" u32, version u32, n_embd u32, n_layer u32,
-//   n_probes u64, n_positions u64, then n_layer * n_embd * n_embd f32 row-major.
+//   n_probes u64, n_positions u64, then n_layer * n_embd * n_embd f32 in ggml
+//   column-major layout (element [i,j] at offset i + j*n_embd, so y = J·h is a
+//   column-wise axpy; a ggml mul_mat with the raw data gives the same result).
 //   J_l = M_l / n_positions is left to the readout side (n_positions accumulates
-//   n_tokens per probe, so it already spans all probes).
+//   the number of VALID source positions per probe, so it already spans all
+//   probes and gives the reference estimator's mean over source positions).
 
 #include "jlens.h"
 
@@ -116,6 +128,9 @@ int main(int argc, char ** argv) {
     int start_chunk = 0; // --start-chunk: resume a chunked run after a crash (with --in)
     int save_every = 50; // checkpoint accumulators every N chunks (0 = only at end)
     bool lrp = false; // --lrp: fit the R-lens (LRP backward rules) instead of the J-lens
+    bool xpos = false; // --xpos: same probe at every valid position (cross-position Jacobian terms)
+    int skip_first = 16; // --skip-first: positions excluded from seed + source mean (last position always excluded)
+    int target_layer = -1; // --target-layer: VJP seed location (default: final block output)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -140,6 +155,9 @@ int main(int argc, char ** argv) {
         else if (a == "--fd-k")       fd_k     = atoi(argv[++i]);
         else if (a == "--fd-eps")     fd_eps   = (float) atof(argv[++i]);
         else if (a == "--lrp")        lrp        = true;
+        else if (a == "--xpos")       xpos       = true;
+        else if (a == "--skip-first")   skip_first   = atoi(argv[++i]);
+        else if (a == "--target-layer") target_layer = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty() || (tokens_str.empty() && tokens_file.empty())) {
@@ -207,6 +225,25 @@ int main(int argc, char ** argv) {
     if (fd_layer >= n_layer) die("--fd-check layer out of range");
     if (fd_block >  n_layer) die("--fd-block out of range");
 
+    // valid position range for the estimator: [skip_first, n_tokens-1)
+    // (reference: first positions are attention sinks, last has no target).
+    // Clamp for short smoke-test inputs rather than failing outright.
+    if (skip_first < 0) die("--skip-first must be >= 0");
+    if (skip_first > n_tokens - 2) {
+        fprintf(stderr, "jlens-fit: clamping --skip-first %d -> %d for n_tokens=%d\n",
+                skip_first, n_tokens - 2, n_tokens);
+        skip_first = n_tokens - 2;
+    }
+    const int64_t n_valid = n_tokens - skip_first - 1;
+
+    // VJP seed location: final block output by default, or --target-layer
+    // (the paper's default is the penultimate block).
+    if (target_layer < 0) target_layer = (int) n_layer - 1;
+    if (target_layer >= n_layer) die("--target-layer out of range");
+    if (target_layer < n_layer - 1)
+        fprintf(stderr, "jlens-fit: VJP target = block %d output (layers > %d receive no gradient)\n",
+                target_layer, target_layer);
+
     jlens_forward fwd_plain;
     jlens_lrp_forward fwd_lrp;
     jlens_forward & fwd = lrp ? static_cast<jlens_forward &>(fwd_lrp) : fwd_plain;
@@ -226,11 +263,11 @@ int main(int argc, char ** argv) {
     ggml_set_name(vjp_seed, "jlens_vjp_seed");
     if (!ggml_backend_alloc_ctx_tensors_from_buft(sctx, buft)) die("seed buffer alloc failed");
 
-    // locate the loss node (final block output) in the forward graph
+    // locate the loss node (VJP seed location) in the forward graph
     std::vector<ggml_tensor *> grad_accs(ggml_graph_n_nodes(fwd.gf), nullptr);
     bool found_loss = false;
     for (int i = 0; i < ggml_graph_n_nodes(fwd.gf); ++i) {
-        if (ggml_graph_node(fwd.gf, i) == fwd.l_out.back()) {
+        if (ggml_graph_node(fwd.gf, i) == fwd.l_out[target_layer]) {
             grad_accs[i] = vjp_seed;
             found_loss = true;
             break;
@@ -238,14 +275,22 @@ int main(int argc, char ** argv) {
     }
     if (!found_loss) die("loss node not found in forward graph");
 
+    // the builders always mark the final block output as the loss node; move the
+    // flag to the target block when seeding upstream of it
+    if (target_layer < n_layer - 1) {
+        fwd.l_out.back()->flags &= ~GGML_TENSOR_FLAG_LOSS;
+        fwd.l_out[target_layer]->flags |= GGML_TENSOR_FLAG_LOSS;
+    }
+
     ggml_cgraph * gb = ggml_graph_dup(fwd.gctx, fwd.gf, /*force_grads=*/true);
     ggml_build_backward_expand(fwd.gctx, gb, grad_accs.data());
     if (getenv("JLENS_DOT")) ggml_graph_dump_dot(gb, nullptr, getenv("JLENS_DOT"));
     fprintf(stderr, "jlens-fit: graph nodes fwd=%d fwd+bwd=%d\n", ggml_graph_n_nodes(fwd.gf), ggml_graph_n_nodes(gb));
 
-    // per-layer VJP result tensors (transient grads, recomputed every pass)
+    // per-layer VJP result tensors (transient grads, recomputed every pass);
+    // layers downstream of the target receive no gradient and are skipped
     std::vector<ggml_tensor *> u_t(n_layer, nullptr);
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il <= target_layer; ++il) {
         u_t[il] = ggml_graph_get_grad(gb, fwd.l_out[il]);
         if (!u_t[il]) die("no grad tensor for a block output");
         // critical: nothing in the graph consumes these grads, so ggml_gallocr would
@@ -405,7 +450,22 @@ int main(int argc, char ** argv) {
     ggml_context * actx = ggml_init(aparams);
     ggml_tensor * av = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_tensor * au = ggml_new_tensor_2d(actx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_tensor * aP = ggml_out_prod(actx, av, au);
+    // source-position mask [1, n_tokens]: 1 at valid positions, 0 at the first
+    // skip_first positions and the last position (reference-estimator behavior:
+    // early positions are attention sinks, the last has no next-token target).
+    // Applied to U before the outer product so invalid source positions do not
+    // contribute to the mean.
+    ggml_tensor * amask = ggml_new_tensor_2d(actx, GGML_TYPE_F32, 1, n_tokens);
+    ggml_set_name(amask, "jlens_pos_mask");
+    if (!ggml_backend_alloc_ctx_tensors_from_buft(actx, acc_on_gpu ? buft : ggml_backend_cpu_buffer_type())) {
+        die("mask alloc failed");
+    }
+    {
+        std::vector<float> mask_host(n_tokens, 0.0f);
+        for (int t = skip_first; t < n_tokens - 1; ++t) mask_host[t] = 1.0f;
+        ggml_backend_tensor_set(amask, mask_host.data(), 0, mask_host.size() * sizeof(float));
+    }
+    ggml_tensor * aP = ggml_out_prod(actx, av, ggml_mul(actx, au, amask));
     ggml_cgraph * acc_gf = ggml_new_graph_custom(actx, 8, false);
     ggml_build_forward_expand(acc_gf, aP);
     if (acc_on_gpu) {
@@ -625,7 +685,22 @@ int main(int argc, char ** argv) {
                     chunk + 1, n_chunks, (ggml_time_us() - th0) / 1000.0);
         }
     for (int probe = 0; probe < n_probes; ++probe) {
-        for (auto & x : v_host) x = gauss(rng);
+        // fill the seed at valid TARGET positions only ([skip_first, n_tokens-1)),
+        // zero elsewhere, matching the reference estimator's cotangent mask
+        memset(v_host.data(), 0, v_host.size() * sizeof(float));
+        if (xpos) {
+            // cross-position mode: the SAME probe vector at every valid position,
+            // so E[M] = sum_{t,t'} A_{t',t} includes the attention-mediated
+            // cross-position Jacobian blocks (with iid-per-position probes they
+            // cancel in expectation and only the diagonal t'=t blocks survive)
+            for (int64_t d = 0; d < n_embd; ++d) v_host[d] = gauss(rng);
+            for (int t = skip_first; t < n_tokens - 1; ++t)
+                memcpy(v_host.data() + (size_t) t * n_embd, v_host.data(), n_embd * sizeof(float));
+        } else {
+            for (int t = skip_first; t < n_tokens - 1; ++t)
+                for (int64_t d = 0; d < n_embd; ++d)
+                    v_host[(size_t) t * n_embd + d] = gauss(rng);
+        }
         ggml_backend_tensor_set(vjp_seed, v_host.data(), 0, v_host.size() * sizeof(float));
 
         const int64_t t0 = ggml_time_us();
@@ -683,9 +758,9 @@ int main(int argc, char ** argv) {
         }
 
         if (fitting) {
-            // fetch VJPs and accumulate M_l += V U_l^T per layer
+            // fetch VJPs and accumulate M_l += V (mask*U_l)^T per fitted layer
             if (!acc_on_gpu) memcpy(av->data, v_host.data(), v_host.size() * sizeof(float));
-            for (int il = 0; il < n_layer; ++il) {
+            for (int il = 0; il <= target_layer; ++il) {
                 if (acc_on_gpu) {
                     au->data   = u_t[il]->data;
                     au->buffer = u_t[il]->buffer;
@@ -700,7 +775,7 @@ int main(int argc, char ** argv) {
                 }
             }
             acc_probes    += 1;
-            acc_positions += n_tokens;
+            acc_positions += n_valid;
         }
         const int64_t t2 = ggml_time_us();
         fprintf(stderr, "chunk %d/%d probe %d/%d: compute %.1f ms, accumulate %.1f ms\n",

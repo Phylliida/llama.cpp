@@ -51,33 +51,15 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float       *  dst_d = (float       *)  dst->data;
 
     // quantized src0 (e.g. frozen weight matrices in a backward pass):
-    // dequantize into a contiguous F32 staging buffer, then run the regular cublas path
-    size_t nb01_eff = nb01;
-    size_t nb02_eff = nb02;
-    size_t nb03_eff = nb03;
-    ggml_cuda_pool_alloc<float> src0_f32;
-    if (src0->type != GGML_TYPE_F32) {
-        GGML_ASSERT(ggml_is_contiguous(src0));
-        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
-        GGML_ASSERT(to_fp32 != nullptr);
-
-        src0_f32.alloc(ctx.pool(), ggml_nelements(src0));
-        to_fp32(src0->data, src0_f32.get(), ggml_nelements(src0), stream);
-        CUDA_CHECK(cudaGetLastError());
-
-        src0_d   = src0_f32.get();
-        nb01_eff = ne00*sizeof(float);
-        nb02_eff = ne01*nb01_eff;
-        nb03_eff = ne02*nb02_eff;
-    }
+    // dequantize into an F32 staging buffer, then run the regular cublas path.
+    // The staging is chunked along the contraction dimension (src0 dim 1, whose
+    // ranges are contiguous in the quantized source) with a capped budget, so
+    // backward passes over large weights do not allocate a full-size F32 copy.
+    const int64_t stage_budget_elems = 64ll*1024*1024; // 256 MiB as F32
 
     cublasHandle_t handle = ctx.cublas_handle();
 
     const float alpha = 1.0f;
-    const float beta = 0.0f;
-
-    const int64_t lda = nb01_eff / sizeof(float);
-    const int64_t ldc = nb1  / sizeof(float);
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -85,8 +67,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
     // data strides in dimensions 2/3
-    const size_t s02 = nb02_eff / sizeof(float);
-    const size_t s03 = nb03_eff / sizeof(float);
     const size_t s12 = nb12 / sizeof(float);
     const size_t s13 = nb13 / sizeof(float);
     const size_t s2  = nb2  / sizeof(float);
@@ -96,52 +76,94 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t dps2 = ne2 / ne02;
     const int64_t dps3 = ne3 / ne03;
 
-    if (dps2 == 1 && ne2 > 1) {
-        // src0 has uniform stride s02 along dim 2; batch the inner loop with a strided GEMM
-        GGML_ASSERT(ne2 <= std::numeric_limits<int>::max());
-        const int batch_count = (int) ne2;
-        for (int64_t i3 = 0; i3 < ne3; ++i3) {
-            CUBLAS_CHECK(
-                cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_cublas_op,
-                        ne0, ne1, ne01,
-                        &alpha, src0_d + (i3/dps3)*s03, lda, s02,
-                                src1_d +  i3     *s13, ldb, s12,
-                        &beta,  dst_d  +  i3     *s3,  ldc, s2,
-                        batch_count));
+    const to_fp32_cuda_t to_fp32 = src0->type != GGML_TYPE_F32 ? ggml_get_to_fp32_cuda(src0->type) : nullptr;
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        GGML_ASSERT(to_fp32 != nullptr);
+        GGML_ASSERT(ne00 % ggml_blck_size(src0->type) == 0);
+    }
+
+    // number of contraction steps (columns of src0) per chunk
+    const int64_t k_chunk = to_fp32 ? std::max<int64_t>(1, std::min(ne01, stage_budget_elems / ne00)) : ne01;
+
+    ggml_cuda_pool_alloc<float> src0_f32;
+    if (to_fp32) src0_f32.alloc(ctx.pool(), k_chunk*ne00);
+
+    for (int64_t k0 = 0; k0 < ne01; k0 += k_chunk) {
+        const int64_t k_len = std::min(k_chunk, ne01 - k0);
+        const float beta = k0 == 0 ? 0.0f : 1.0f;
+
+        size_t nb01_eff = nb01;
+        size_t nb02_eff = nb02;
+        size_t nb03_eff = nb03;
+        if (to_fp32) {
+            const size_t elem_off = (size_t) k0*ne00;
+            const size_t byte_off = elem_off / ggml_blck_size(src0->type) * ggml_type_size(src0->type);
+            to_fp32((const char *) src0->data + byte_off, src0_f32.get(), k_len*ne00, stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            src0_d   = src0_f32.get();
+            nb01_eff = ne00*sizeof(float);
+            nb02_eff = ne01*nb01_eff; // uniform-stride paths only use s02 within one chunk
+            nb03_eff = ne02*nb02_eff;
+        } else {
+            src0_d = (const float *) src0->data + k0*nb01/sizeof(float);
         }
-    } else if (ne2 > 1 || ne3 > 1) {
-        // dps2 > 1 (src0 broadcast along dim 2 with non-uniform stride) or multiple GEMMs
-        // along dim 3: compute per-GEMM pointers on the device and use a single batched GEMM.
-        GGML_ASSERT(ne3 > 0);
-        GGML_ASSERT(ne2 <= (int64_t) std::numeric_limits<int>::max() / ne3);
-        const int batch_count = (int) (ne2 * ne3);
+        const float * src1_c = src1_d + k0*nb11/sizeof(float);
 
-        ggml_cuda_pool_alloc<const float *> ptrs_a(ctx.pool(), batch_count);
-        ggml_cuda_pool_alloc<const float *> ptrs_b(ctx.pool(), batch_count);
-        ggml_cuda_pool_alloc<      float *> ptrs_c(ctx.pool(), batch_count);
+        const int64_t lda = nb01_eff / sizeof(float);
+        const int64_t ldc = nb1  / sizeof(float);
 
-        const dim3 block_dims(16, 16);
-        const dim3 grid_dims((ne2 + block_dims.x - 1)/block_dims.x, (ne3 + block_dims.y - 1)/block_dims.y);
-        k_compute_out_prod_ptrs<<<grid_dims, block_dims, 0, stream>>>(
-            src0_d, src1_d, dst_d,
-            ptrs_a.get(), ptrs_b.get(), ptrs_c.get(),
-            ne2, ne3, dps2, dps3, s02, s03, s12, s13, s2, s3);
-        CUDA_CHECK(cudaGetLastError());
+        const size_t s02 = nb02_eff / sizeof(float);
+        const size_t s03 = nb03_eff / sizeof(float);
 
-        CUBLAS_CHECK(
-            cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
-                    ne0, ne1, ne01,
-                    &alpha, ptrs_a.get(), lda,
-                            ptrs_b.get(), ldb,
-                    &beta,  ptrs_c.get(), ldc,
-                    batch_count));
-    } else {
-        // ne2 == 1 && ne3 == 1: single GEMM
-        CUBLAS_CHECK(
-            cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
-                    ne0, ne1, ne01,
-                    &alpha, src0_d, lda,
-                            src1_d, ldb,
-                    &beta,  dst_d,  ldc));
+        if (dps2 == 1 && ne2 > 1) {
+            // src0 has uniform stride s02 along dim 2; batch the inner loop with a strided GEMM
+            GGML_ASSERT(ne2 <= std::numeric_limits<int>::max());
+            const int batch_count = (int) ne2;
+            for (int64_t i3 = 0; i3 < ne3; ++i3) {
+                CUBLAS_CHECK(
+                    cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                            ne0, ne1, k_len,
+                            &alpha, src0_d + (i3/dps3)*s03, lda, s02,
+                                    src1_c +  i3     *s13, ldb, s12,
+                            &beta,  dst_d  +  i3     *s3,  ldc, s2,
+                            batch_count));
+            }
+        } else if (ne2 > 1 || ne3 > 1) {
+            // dps2 > 1 (src0 broadcast along dim 2 with non-uniform stride) or multiple GEMMs
+            // along dim 3: compute per-GEMM pointers on the device and use a single batched GEMM.
+            GGML_ASSERT(ne3 > 0);
+            GGML_ASSERT(ne2 <= (int64_t) std::numeric_limits<int>::max() / ne3);
+            const int batch_count = (int) (ne2 * ne3);
+
+            ggml_cuda_pool_alloc<const float *> ptrs_a(ctx.pool(), batch_count);
+            ggml_cuda_pool_alloc<const float *> ptrs_b(ctx.pool(), batch_count);
+            ggml_cuda_pool_alloc<      float *> ptrs_c(ctx.pool(), batch_count);
+
+            const dim3 block_dims(16, 16);
+            const dim3 grid_dims((ne2 + block_dims.x - 1)/block_dims.x, (ne3 + block_dims.y - 1)/block_dims.y);
+            k_compute_out_prod_ptrs<<<grid_dims, block_dims, 0, stream>>>(
+                src0_d, src1_c, dst_d,
+                ptrs_a.get(), ptrs_b.get(), ptrs_c.get(),
+                ne2, ne3, dps2, dps3, s02, s03, s12, s13, s2, s3);
+            CUDA_CHECK(cudaGetLastError());
+
+            CUBLAS_CHECK(
+                cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                        ne0, ne1, k_len,
+                        &alpha, ptrs_a.get(), lda,
+                                ptrs_b.get(), ldb,
+                        &beta,  ptrs_c.get(), ldc,
+                        batch_count));
+        } else {
+            // ne2 == 1 && ne3 == 1: single GEMM
+            CUBLAS_CHECK(
+                cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                        ne0, ne1, k_len,
+                        &alpha, src0_d, lda,
+                                src1_c, ldb,
+                        &beta,  dst_d,  ldc));
+        }
     }
 }

@@ -4,7 +4,8 @@
 // custom forward graphs that expose every block's residual-stream output.
 //
 // The graphs are built by hand (not via llama.cpp's graph builders) so that
-//   - every op has a working ggml backward path (no flash attention, split swiglu)
+//   - every op has a working ggml backward path (explicit attention by default;
+//     the flash-attention variant is forward-only, used by the server readout)
 //   - block outputs can be flagged for gradient accumulation (J-lens VJP fitting)
 
 #include "ggml.h"

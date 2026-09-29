@@ -101,6 +101,7 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
 
         // attention scores [n_kv, n_q, n_head] (k broadcast 2 -> 48 heads)
         ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);
+        ggml_prec_set_acc(kq, GGML_PREC_F32); // matches llama-graph.cpp's GLM4 handling
         kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, /*max_bias=*/0.0f);
 
         // weighted values: [n_embd_head, n_q, n_head]
@@ -116,6 +117,7 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
     }
 
     cur = ggml_mul_mat(ctx, m.blk("blk.%d.attn_output.weight", il), kqv);
+    ggml_prec_set_acc(cur, GGML_PREC_F32); // matches llama-graph.cpp's GLM4 handling
 
     // post-attention norm, residual
     cur = norm_site(cur, m.blk("blk.%d.post_attention_norm.weight", il));
@@ -149,6 +151,7 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
         cur = ggml_swiglu_split(ctx, gate, up);                      // silu(gate) * up, [n_ff, n]
     }
     cur = ggml_mul_mat(ctx, m.blk("blk.%d.ffn_down.weight", il), cur);
+    ggml_prec_set_acc(cur, GGML_PREC_F32); // matches llama-graph.cpp's GLM4 handling
 
     // post-MLP norm, residual
     cur = norm_site(cur, m.blk("blk.%d.post_ffw_norm.weight", il));
