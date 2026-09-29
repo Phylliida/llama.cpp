@@ -2,8 +2,8 @@
 // residual outputs and decode through the model's final norm + unembedding:
 //
 //   y_l = J_l . a_l[:, pos]        (J_l = M_l / n_positions; n_positions
-//                                   accumulates n_tokens per probe, so it
-//                                   already spans all probes)
+//                                   accumulates the valid source positions per
+//                                   probe, so it already spans all probes)
 //   logits_l = W_u . (rms_norm(y_l) * output_norm)
 //
 // usage: jlens-readout -m model.gguf --jlens accum.jlns --tokens "1,2,3"
@@ -93,13 +93,14 @@ int main(int argc, char ** argv) {
     const int64_t  n_layer = hdr[3];
     uint64_t n_probes, n_positions;
     if (fread(&n_probes, 8, 1, f) != 1 || fread(&n_positions, 8, 1, f) != 1) die("bad jlens header");
-    if (version != 1) die("unsupported jlens version");
+    if (version < 1 || version > 2) die("unsupported jlens version");
     fprintf(stderr, "jlens-readout: %lld layers x [%lld x %lld], %llu probes, %llu positions\n",
             (long long) n_layer, (long long) n_embd, (long long) n_embd,
             (unsigned long long) n_probes, (unsigned long long) n_positions);
     std::vector<std::vector<float>> J(n_layer, std::vector<float>((size_t) n_embd * n_embd));
-    // J = M / n_positions: each probe chunk contributes n_tokens rank-1 samples, so the
-    // positions counter already spans all probes (do NOT multiply by n_probes)
+    // J = M / n_positions: each probe contributes n_valid rank-1 samples (valid
+    // source positions), so the positions counter already spans all probes
+    // (do NOT multiply by n_probes)
     if (n_positions == 0) die("jlens file has 0 positions");
     const double scale = 1.0 / (double) n_positions;
     for (int64_t il = 0; il < n_layer; ++il) {

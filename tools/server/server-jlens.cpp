@@ -78,6 +78,7 @@ struct server_jlens_state {
     ggml_backend_buffer_t  jbuf = nullptr;
     ggml_tensor *          jt   = nullptr;
     int                    jt_layer = -1;
+    std::vector<float>     jt_host; // host scratch for the transpose before upload
 };
 
 server_jlens_state g_jlens;
@@ -98,6 +99,7 @@ void server_jlens_deinit_locked() {
     g_jlens.hlogits  = nullptr;
     g_jlens.jt       = nullptr;
     g_jlens.jt_layer = -1;
+    g_jlens.jt_host.clear();
     g_jlens.device   = -1;
 }
 
@@ -172,7 +174,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
     }
     uint32_t hdr[4];
     uint64_t n_probes = 0, n_positions = 0;
-    if (fread(hdr, 4, 4, f) != 4 || hdr[0] != 0x4A4C4E53 || hdr[1] != 1) {
+    if (fread(hdr, 4, 4, f) != 4 || hdr[0] != 0x4A4C4E53 || hdr[1] < 1 || hdr[1] > 2) {
         fclose(f);
         err = "bad jlens header: " + jlens_path;
         return false;
@@ -195,8 +197,8 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         return false;
     }
     g_jlens.J.resize(n_layer);
-    // J = M / n_positions: each probe chunk contributes n_tokens rank-1 samples,
-    // so the positions counter already spans all probes
+    // J = M / n_positions: each probe contributes n_valid rank-1 samples (valid
+    // source positions), so the positions counter already spans all probes
     const double scale = 1.0 / (double) n_positions;
     for (int64_t il = 0; il < n_layer; ++il) {
         g_jlens.J[il].resize((size_t) n_embd * n_embd);
@@ -412,8 +414,27 @@ bool server_jlens_compute(
         std::vector<float> lg;
         for (int il : layers) {
             if (g_jlens.jt_layer != il) {
-                ggml_backend_tensor_set(g_jlens.jt, g_jlens.J[il].data(), 0,
-                                        g_jlens.J[il].size() * sizeof(float));
+                // mul_mat(A, x)[i] = sum_k A[k + i*n_embd] * x[k], but the JLNS
+                // file stores J[i,j] at i + j*n_embd — so upload J transposed to
+                // get y = J·a (matching the axpy form in the single-position path)
+                const std::vector<float> & Jl = g_jlens.J[il];
+                g_jlens.jt_host.resize(Jl.size());
+                {
+                    std::vector<std::thread> ts;
+                    const int64_t rows_per = (n_embd + n_threads - 1) / n_threads;
+                    for (int t = 0; t < n_threads; ++t) {
+                        const int64_t r0 = t * rows_per, r1 = std::min(n_embd, r0 + rows_per);
+                        if (r0 >= r1) break;
+                        ts.emplace_back([&, r0, r1] {
+                            for (int64_t i = r0; i < r1; ++i)
+                                for (int64_t j = 0; j < n_embd; ++j)
+                                    g_jlens.jt_host[(size_t) j * n_embd + i] = Jl[(size_t) i * n_embd + j];
+                        });
+                    }
+                    for (auto & t : ts) t.join();
+                }
+                ggml_backend_tensor_set(g_jlens.jt, g_jlens.jt_host.data(), 0,
+                                        g_jlens.jt_host.size() * sizeof(float));
                 g_jlens.jt_layer = il;
             }
             server_jlens_layer_result lr;
@@ -432,7 +453,7 @@ bool server_jlens_compute(
                 ggml_tensor * av = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_embd, np);
                 av->data   = (char *) fwd.l_out[il]->data + (size_t) p0 * fwd.l_out[il]->nb[1];
                 av->buffer = fwd.l_out[il]->buffer;
-                ggml_tensor * y  = ggml_mul_mat(c, g_jlens.jt_t, av);
+                ggml_tensor * y  = ggml_mul_mat(c, g_jlens.jt, av);
                 ggml_tensor * yn = ggml_rms_norm(c, y, g_jlens.weights->hparams.norm_eps);
                 yn = ggml_mul(c, yn, out_norm);
                 ggml_tensor * logits = ggml_mul_mat(c, out_w, yn);

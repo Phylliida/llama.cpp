@@ -60,12 +60,27 @@ static void die(const char * msg) {
 
 // ---- accumulator file ----
 
+// estimator configuration recorded in a trailer after the matrix data (version
+// 2 files), so resumed runs can't silently mix incompatible estimators. v1
+// files have no trailer; readouts ignore trailing bytes.
+struct acc_config {
+    int32_t  skip_first   = -1; // -1: unknown (v1 file without trailer)
+    int32_t  xpos         = -1;
+    int32_t  target_layer = -1;
+    int32_t  n_tokens     = -1;
+    uint64_t next_chunk   = 0;  // first chunk index NOT yet accumulated
+    bool     has_trailer  = false;
+};
+
 static bool acc_save(const char * path, const std::vector<std::vector<float>> & M,
-                     int64_t n_embd, uint64_t n_probes, uint64_t n_positions) {
-    FILE * f = fopen(path, "wb");
+                     int64_t n_embd, uint64_t n_probes, uint64_t n_positions,
+                     const acc_config & cfg) {
+    // atomic: write to a temp file, then rename over the destination
+    const std::string tmp = std::string(path) + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
     const uint32_t magic = 0x4A4C4E53; // "JLNS"
-    const uint32_t version = 1;
+    const uint32_t version = 2;
     const uint32_t ne = (uint32_t) n_embd;
     const uint32_t nl = (uint32_t) M.size();
     fwrite(&magic,   4, 1, f);
@@ -75,24 +90,43 @@ static bool acc_save(const char * path, const std::vector<std::vector<float>> & 
     fwrite(&n_probes,    8, 1, f);
     fwrite(&n_positions, 8, 1, f);
     for (const auto & m : M) fwrite(m.data(), sizeof(float), m.size(), f);
+    const uint32_t tmagic = 0x544C4E53; // "TLNS" config trailer
+    fwrite(&tmagic,           4, 1, f);
+    fwrite(&cfg.skip_first,   4, 1, f);
+    fwrite(&cfg.xpos,         4, 1, f);
+    fwrite(&cfg.target_layer, 4, 1, f);
+    fwrite(&cfg.n_tokens,     4, 1, f);
+    fwrite(&cfg.next_chunk,   8, 1, f);
     fclose(f);
+    if (rename(tmp.c_str(), path) != 0) { remove(tmp.c_str()); return false; }
     return true;
 }
 
 static bool acc_load(const char * path, std::vector<std::vector<float>> & M,
-                     int64_t n_embd, int64_t n_layer, uint64_t & n_probes, uint64_t & n_positions) {
+                     int64_t n_embd, int64_t n_layer, uint64_t & n_probes, uint64_t & n_positions,
+                     acc_config & cfg) {
     FILE * f = fopen(path, "rb");
     if (!f) return false;
     uint32_t magic, version, ne, nl;
-    if (fread(&magic, 4, 1, f) != 1 || magic != 0x4A4C4E53) { fclose(f); return false; }
-    if (fread(&version, 4, 1, f) != 1 || version != 1)       { fclose(f); return false; }
-    if (fread(&ne, 4, 1, f) != 1 || ne != (uint32_t) n_embd) { fclose(f); return false; }
-    if (fread(&nl, 4, 1, f) != 1 || nl != (uint32_t) n_layer){ fclose(f); return false; }
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x4A4C4E53)      { fclose(f); return false; }
+    if (fread(&version, 4, 1, f) != 1 || version < 1 || version > 2) { fclose(f); return false; }
+    if (fread(&ne, 4, 1, f) != 1 || ne != (uint32_t) n_embd)     { fclose(f); return false; }
+    if (fread(&nl, 4, 1, f) != 1 || nl != (uint32_t) n_layer)    { fclose(f); return false; }
     if (fread(&n_probes, 8, 1, f) != 1 || fread(&n_positions, 8, 1, f) != 1) { fclose(f); return false; }
     M.resize(nl);
     for (auto & m : M) {
         m.resize((size_t) n_embd * n_embd);
         if (fread(m.data(), sizeof(float), m.size(), f) != m.size()) { fclose(f); return false; }
+    }
+    // optional v2 config trailer
+    uint32_t tmagic;
+    if (fread(&tmagic, 4, 1, f) == 1 && tmagic == 0x544C4E53) {
+        if (fread(&cfg.skip_first,   4, 1, f) != 1 ||
+            fread(&cfg.xpos,         4, 1, f) != 1 ||
+            fread(&cfg.target_layer, 4, 1, f) != 1 ||
+            fread(&cfg.n_tokens,     4, 1, f) != 1 ||
+            fread(&cfg.next_chunk,   8, 1, f) != 1) { fclose(f); return false; }
+        cfg.has_trailer = true;
     }
     fclose(f);
     return true;
@@ -243,6 +277,9 @@ int main(int argc, char ** argv) {
     if (target_layer < n_layer - 1)
         fprintf(stderr, "jlens-fit: VJP target = block %d output (layers > %d receive no gradient)\n",
                 target_layer, target_layer);
+    // the fd validation paths compare against the final block output
+    if (fd_layer >= 0 && target_layer != n_layer - 1) die("--fd-check requires the default (final) target layer");
+    if (fd_block >= 1 && target_layer != n_layer - 1) die("--fd-block requires the default (final) target layer");
 
     jlens_forward fwd_plain;
     jlens_lrp_forward fwd_lrp;
@@ -250,7 +287,8 @@ int main(int argc, char ** argv) {
     if (lrp) {
         if (!jlens_build_forward_lrp(model, n_tokens, fwd_lrp)) die("lrp graph build failed");
     } else {
-        if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/true, fwd_plain, fd_layer)) die("graph build failed");
+        if (!jlens_build_forward(model, n_tokens, /*with_grad_flags=*/true, fwd_plain, fd_layer,
+                                 /*use_flash_attn=*/false, /*with_head=*/false)) die("graph build failed");
     }
     if (!fwd.zero_pad) die("graph missing zero_pad param leaf");
     if (fd_layer >= 0 && !fwd.perturb) die("graph missing perturb input");
@@ -657,13 +695,39 @@ int main(int argc, char ** argv) {
     std::vector<float> p_host; // staging for one [n_embd, n_embd] product download
     uint64_t acc_probes = 0, acc_positions = 0;
     const bool fitting = !out_path.empty();
+    acc_config acfg;
+    acfg.skip_first   = skip_first;
+    acfg.xpos         = xpos ? 1 : 0;
+    acfg.target_layer = target_layer;
+    acfg.n_tokens     = n_tokens;
+    acfg.next_chunk   = (uint64_t) start_chunk;
     if (fitting) {
         p_host.resize((size_t) n_embd * n_embd);
         if (!in_path.empty()) {
-            if (!acc_load(in_path.c_str(), M, n_embd, n_layer, acc_probes, acc_positions))
+            acc_config prev;
+            if (!acc_load(in_path.c_str(), M, n_embd, n_layer, acc_probes, acc_positions, prev))
                 die("failed to load --in accumulator");
             fprintf(stderr, "jlens-fit: continuing from %s (%llu probes, %llu positions)\n",
                     in_path.c_str(), (unsigned long long) acc_probes, (unsigned long long) acc_positions);
+            if (prev.has_trailer) {
+                // refuse to mix incompatible estimators / windows
+                if (prev.skip_first   != skip_first)     die("--in was fit with a different --skip-first");
+                if (prev.xpos         != (xpos ? 1 : 0)) die("--in was fit with a different --xpos setting");
+                if (prev.target_layer != target_layer)   die("--in was fit with a different --target-layer");
+                if (prev.n_tokens     != n_tokens)       die("--in was fit with a different --chunk-len");
+                // auto-resume: with no explicit --start-chunk, continue where the
+                // checkpoint left off; an explicit value must match exactly
+                if (start_chunk == 0 && prev.next_chunk > 0) {
+                    start_chunk = (int) prev.next_chunk;
+                    fprintf(stderr, "jlens-fit: auto-resuming at chunk %d from checkpoint\n", start_chunk);
+                } else if ((uint64_t) start_chunk != prev.next_chunk) {
+                    die("--start-chunk does not match checkpoint progress (would double-count or skip chunks)");
+                }
+                acfg.next_chunk = (uint64_t) start_chunk;
+            } else {
+                fprintf(stderr, "jlens-fit: WARNING: --in file predates config trailers; "
+                                "estimator config and --start-chunk cannot be validated\n");
+            }
         } else {
             M.assign(n_layer, std::vector<float>((size_t) n_embd * n_embd, 0.0f));
         }
@@ -693,9 +757,10 @@ int main(int argc, char ** argv) {
             // so E[M] = sum_{t,t'} A_{t',t} includes the attention-mediated
             // cross-position Jacobian blocks (with iid-per-position probes they
             // cancel in expectation and only the diagonal t'=t blocks survive)
-            for (int64_t d = 0; d < n_embd; ++d) v_host[d] = gauss(rng);
+            std::vector<float> probe(n_embd);
+            for (auto & x : probe) x = gauss(rng);
             for (int t = skip_first; t < n_tokens - 1; ++t)
-                memcpy(v_host.data() + (size_t) t * n_embd, v_host.data(), n_embd * sizeof(float));
+                memcpy(v_host.data() + (size_t) t * n_embd, probe.data(), n_embd * sizeof(float));
         } else {
             for (int t = skip_first; t < n_tokens - 1; ++t)
                 for (int64_t d = 0; d < n_embd; ++d)
@@ -725,7 +790,7 @@ int main(int argc, char ** argv) {
                 ref.resize((size_t) n_embd * n_tokens);
             }
             double worst_rel = 0.0;
-            for (int il = 0; il < n_layer; ++il) {
+            for (int il = 0; il <= target_layer; ++il) { // u_t is only filled up to the target
                 ggml_backend_tensor_get(u_t[il], u_host.data(), 0, u_host.size() * sizeof(float));
                 if (!dump_path.empty()) {
                     fwrite(u_host.data(), sizeof(float), u_host.size(), f);
@@ -781,8 +846,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "chunk %d/%d probe %d/%d: compute %.1f ms, accumulate %.1f ms\n",
                 chunk + 1, n_chunks, probe + 1, n_probes, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
     }
+        acfg.next_chunk = (uint64_t) (chunk + 1);
         if (fitting && save_every > 0 && (chunk + 1) % save_every == 0) {
-            if (!acc_save(out_path.c_str(), M, n_embd, acc_probes, acc_positions))
+            if (!acc_save(out_path.c_str(), M, n_embd, acc_probes, acc_positions, acfg))
                 die("failed to checkpoint accumulators");
             fprintf(stderr, "jlens-fit: checkpoint at chunk %d (%llu probes, %llu positions)\n",
                     chunk + 1, (unsigned long long) acc_probes, (unsigned long long) acc_positions);
@@ -790,7 +856,7 @@ int main(int argc, char ** argv) {
     }
 
     if (fitting) {
-        if (!acc_save(out_path.c_str(), M, n_embd, acc_probes, acc_positions)) die("failed to save accumulators");
+        if (!acc_save(out_path.c_str(), M, n_embd, acc_probes, acc_positions, acfg)) die("failed to save accumulators");
         printf("saved accumulators (%llu probes, %llu positions) to %s\n",
                (unsigned long long) acc_probes, (unsigned long long) acc_positions, out_path.c_str());
     }
