@@ -162,6 +162,7 @@ int main(int argc, char ** argv) {
     int start_chunk = 0; // --start-chunk: resume a chunked run after a crash (with --in)
     int save_every = 50; // checkpoint accumulators every N chunks (0 = only at end)
     bool lrp = false; // --lrp: fit the R-lens (LRP backward rules) instead of the J-lens
+    bool extend = false; // --extend: add a different chunk region to a loaded accumulator
     bool xpos = false; // --xpos: same probe at every valid position (cross-position Jacobian terms)
     int skip_first = 16; // --skip-first: positions excluded from seed + source mean (last position always excluded)
     int target_layer = -1; // --target-layer: VJP seed location (default: final block output)
@@ -174,6 +175,7 @@ int main(int argc, char ** argv) {
         else if (a == "--chunk-len")   chunk_len = atoi(argv[++i]);
         else if (a == "--n-chunks")    n_chunks  = atoi(argv[++i]);
         else if (a == "--start-chunk") start_chunk = atoi(argv[++i]);
+        else if (a == "--extend")      extend = true;
         else if (a == "--stride")      stride    = atoi(argv[++i]);
         else if (a == "--save-every")  save_every = atoi(argv[++i]);
         else if (a == "--backend")  backend_name = argv[++i];
@@ -197,7 +199,10 @@ int main(int argc, char ** argv) {
     if (model_path.empty() || (tokens_str.empty() && tokens_file.empty())) {
         fprintf(stderr, "usage: jlens-fit -m model.gguf (--tokens \"1,2,3\" | --tokens-file ids.bin "
                         "[--chunk-len N] [--n-chunks N] [--stride N]) [--backend cuda|cpu] "
-                        "[--n-probes N] [--out jlens.bin] [--dump-grads f | --compare f]\n");
+                        "[--n-probes N] [--out jlens.bin] [--dump-grads f | --compare f]\n"
+                        "       --in acc.jlns resumes (auto-continues from the checkpointed chunk);\n"
+                        "       --in acc.jlns --extend --start-chunk C --n-chunks D adds a different\n"
+                        "       chunk region [C, D) of the stream to the loaded accumulators\n");
         return 1;
     }
 
@@ -343,23 +348,19 @@ int main(int argc, char ** argv) {
     // leaf (offset 0), corrupting token ids mid-compute — params not being
     // registered as leafs (ggml.c:7281) was one instance; rather than chase every
     // lifetime-analysis edge case in this ggml version, bypass it for inputs.
-    ggml_init_params inparams = { (8 + 7 * n_layer) * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params inparams = { (8 + 2) * ggml_tensor_overhead(), nullptr, true };
     ggml_context * inctx = ggml_init(inparams);
     ggml_tensor * t_tokens  = ggml_dup_tensor(inctx, fwd.tokens);
     ggml_tensor * t_pos     = ggml_dup_tensor(inctx, fwd.pos);
     ggml_tensor * t_mask    = ggml_dup_tensor(inctx, fwd.mask);
     ggml_tensor * t_zero    = ggml_dup_tensor(inctx, fwd.zero_pad);
     ggml_tensor * t_perturb = fwd.perturb ? ggml_dup_tensor(inctx, fwd.perturb) : nullptr;
-    std::vector<ggml_tensor *> t_leaves; // lrp detach-leaf storage
-    if (lrp) {
-        for (int il = 0; il < n_layer; ++il) {
-            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
-            for (int k = 0; k < 4; ++k) t_leaves.push_back(ggml_dup_tensor(inctx, lv.rms_inv[k]));
-            t_leaves.push_back(ggml_dup_tensor(inctx, lv.sig_gate));
-            t_leaves.push_back(ggml_dup_tensor(inctx, lv.silu_gate));
-            t_leaves.push_back(ggml_dup_tensor(inctx, lv.up));
-        }
-    }
+    // lrp: constant leaves for the dt graph's in-graph transforms; the LRP
+    // leaf inputs themselves alias the dt graph's pinned outputs (wired below
+    // after dt galloc) instead of holding their own device copies.
+    // dt_one must be [1, n_tokens]: ggml_div keeps the numerator's shape
+    ggml_tensor * t_dt_one = lrp ? ggml_new_tensor_2d(inctx, GGML_TYPE_F32, 1, n_tokens) : nullptr;
+    ggml_tensor * t_dt_eps = lrp ? ggml_new_tensor_1d(inctx, GGML_TYPE_F32, 1) : nullptr;
     if (!ggml_backend_alloc_ctx_tensors_from_buft(inctx, buft)) die("input buffer alloc failed");
     auto wire = [](ggml_tensor * dst, const ggml_tensor * src) {
         dst->data   = src->data;
@@ -370,15 +371,54 @@ int main(int argc, char ** argv) {
     wire(fwd.mask, t_mask);
     wire(fwd.zero_pad, t_zero);
     if (fwd.perturb) wire(fwd.perturb, t_perturb);
+
+    // dt graph (lrp): build + alloc BEFORE the main galloc so the leaf wiring
+    // below lands before gallocr decides what it owns
+    jlens_forward dt;
+    ggml_gallocr_t dt_galloc = nullptr;
+    std::vector<ggml_tensor *> dt_rmsinv; // [n_layer * 4]
+    std::vector<ggml_tensor *> dt_sig;    // [n_layer]
+    std::vector<ggml_tensor *> dt_silu;   // [n_layer]
+    std::vector<ggml_tensor *> dt_up;     // [n_layer]
     if (lrp) {
-        int li = 0;
+        if (!jlens_build_forward_dt(model, n_tokens, dt, t_dt_one, t_dt_eps)) die("dt graph build failed");
+        // shares token/pos/mask storage with the main graph
+        wire(dt.tokens, t_tokens);
+        wire(dt.pos,    t_pos);
+        wire(dt.mask,   t_mask);
+        dt_galloc = ggml_gallocr_new(buft);
+        if (!ggml_gallocr_alloc_graph(dt_galloc, dt.gf)) die("dt galloc failed");
+        fprintf(stderr, "jlens-fit: dt compute buffer %.2f GiB\n",
+                ggml_gallocr_get_buffer_size(dt_galloc, 0) / (1024.0 * 1024.0 * 1024.0));
         for (int il = 0; il < n_layer; ++il) {
-            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
-            for (int k = 0; k < 4; ++k) wire(lv.rms_inv[k], t_leaves[li++]);
-            wire(lv.sig_gate,  t_leaves[li++]);
-            wire(lv.silu_gate, t_leaves[li++]);
-            wire(lv.up,        t_leaves[li++]);
+            jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
+            char name[64];
+            for (int k = 0; k < 4; ++k) {
+                snprintf(name, sizeof(name), "jlens_dt_%d_rmsinv_%d", il, k);
+                ggml_tensor * t = ggml_graph_get_tensor(dt.gf, name);
+                if (!t) die("dt rmsinv output missing");
+                dt_rmsinv.push_back(t);
+                wire(lv.rms_inv[k], t); // leaf aliases the dt output storage
+            }
+            snprintf(name, sizeof(name), "jlens_dt_%d_sig", il);
+            ggml_tensor * sg = ggml_graph_get_tensor(dt.gf, name);
+            snprintf(name, sizeof(name), "jlens_dt_%d_silu", il);
+            ggml_tensor * sl = ggml_graph_get_tensor(dt.gf, name);
+            snprintf(name, sizeof(name), "jlens_dt_%d_up", il);
+            ggml_tensor * u  = ggml_graph_get_tensor(dt.gf, name);
+            if (!sg || !sl || !u) die("dt sig/silu/up output missing");
+            dt_sig.push_back(sg);
+            dt_silu.push_back(sl);
+            dt_up.push_back(u);
+            wire(lv.sig_gate,  sg);
+            wire(lv.silu_gate, sl);
+            wire(lv.up,        u);
         }
+        // constants
+        std::vector<float> ones(n_tokens, 1.0f);
+        const float eps = model.hparams.norm_eps;
+        ggml_backend_tensor_set(t_dt_one, ones.data(), 0, n_tokens * sizeof(float));
+        ggml_backend_tensor_set(t_dt_eps, &eps, 0, sizeof(float));
     }
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
@@ -402,75 +442,11 @@ int main(int argc, char ** argv) {
     }
 
     // ---- R-lens phase 1: detach-value harvest (per chunk, amortized over probes) ----
-    jlens_forward dt;
-    ggml_gallocr_t dt_galloc = nullptr;
-    std::vector<ggml_tensor *> dt_rms;  // [n_layer * 4] norm inputs
-    std::vector<ggml_tensor *> dt_gate; // [n_layer]
-    std::vector<ggml_tensor *> dt_up;   // [n_layer]
-    std::vector<float> h_rms((size_t) n_embd * n_tokens);
-    std::vector<float> h_gate, h_up, h_sig, h_silu;
-    std::vector<float> h_rms_inv;
-    if (lrp) {
-        if (!jlens_build_forward_dt(model, n_tokens, dt)) die("dt graph build failed");
-        // shares token/pos/mask storage with the main graph
-        wire(dt.tokens, t_tokens);
-        wire(dt.pos,    t_pos);
-        wire(dt.mask,   t_mask);
-        dt_galloc = ggml_gallocr_new(buft);
-        if (!ggml_gallocr_alloc_graph(dt_galloc, dt.gf)) die("dt galloc failed");
-        fprintf(stderr, "jlens-fit: dt compute buffer %.2f GiB\n",
-                ggml_gallocr_get_buffer_size(dt_galloc, 0) / (1024.0 * 1024.0 * 1024.0));
-        for (int il = 0; il < n_layer; ++il) {
-            char name[64];
-            for (int k = 0; k < 4; ++k) {
-                snprintf(name, sizeof(name), "jlens_dt_%d_rms_%d", il, k);
-                ggml_tensor * t = ggml_graph_get_tensor(dt.gf, name);
-                if (!t) die("dt rms source missing");
-                dt_rms.push_back(t);
-            }
-            snprintf(name, sizeof(name), "jlens_dt_%d_gate", il);
-            ggml_tensor * g = ggml_graph_get_tensor(dt.gf, name);
-            snprintf(name, sizeof(name), "jlens_dt_%d_up", il);
-            ggml_tensor * u = ggml_graph_get_tensor(dt.gf, name);
-            if (!g || !u) die("dt gate/up source missing");
-            dt_gate.push_back(g);
-            dt_up.push_back(u);
-        }
-        const int64_t n_ff = model.hparams.n_ff;
-        h_gate.resize((size_t) n_ff * n_tokens);
-        h_up.resize((size_t) n_ff * n_tokens);
-        h_sig.resize((size_t) n_ff * n_tokens);
-        h_silu.resize((size_t) n_ff * n_tokens);
-        h_rms_inv.resize(n_tokens);
-    }
+    // the dt graph (built above, before the main galloc) computes the final
+    // detached leaf values in-graph; the LRP leaves alias its pinned outputs,
+    // so harvesting is just a forward compute of dt.gf
     auto harvest = [&]() {
-        const int64_t n_ff = model.hparams.n_ff;
-        const float eps = model.hparams.norm_eps;
         if (ggml_backend_graph_compute(backend, dt.gf) != GGML_STATUS_SUCCESS) die("dt compute failed");
-        for (int il = 0; il < n_layer; ++il) {
-            const jlens_lrp_leaves & lv = fwd_lrp.leaves[il];
-            for (int k = 0; k < 4; ++k) {
-                ggml_backend_tensor_get(dt_rms[il * 4 + k], h_rms.data(), 0, h_rms.size() * sizeof(float));
-                // rms_inv[j] = 1/sqrt(mean_i x[i,j]^2 + eps); layout [n_embd, n_tokens]
-                for (int j = 0; j < n_tokens; ++j) {
-                    const float * x = h_rms.data() + (size_t) j * n_embd;
-                    double ss = 0;
-                    for (int64_t i = 0; i < n_embd; ++i) ss += (double) x[i] * x[i];
-                    h_rms_inv[j] = (float) (1.0 / sqrt(ss / n_embd + eps));
-                }
-                ggml_backend_tensor_set(lv.rms_inv[k], h_rms_inv.data(), 0, n_tokens * sizeof(float));
-            }
-            ggml_backend_tensor_get(dt_gate[il], h_gate.data(), 0, h_gate.size() * sizeof(float));
-            ggml_backend_tensor_get(dt_up[il],   h_up.data(),   0, h_up.size()   * sizeof(float));
-            for (size_t i = 0; i < h_gate.size(); ++i) {
-                const float sg = 1.0f / (1.0f + expf(-h_gate[i]));
-                h_sig[i]  = sg;
-                h_silu[i] = h_gate[i] * sg;
-            }
-            ggml_backend_tensor_set(lv.sig_gate,  h_sig.data(),  0, h_sig.size()  * sizeof(float));
-            ggml_backend_tensor_set(lv.silu_gate, h_silu.data(), 0, h_silu.size() * sizeof(float));
-            ggml_backend_tensor_set(lv.up,        h_up.data(),   0, h_up.size()   * sizeof(float));
-        }
     };
 
     // outer-product graph for the rank-n_tokens accumulator updates:
@@ -717,7 +693,18 @@ int main(int argc, char ** argv) {
                 if (prev.n_tokens     != n_tokens)       die("--in was fit with a different --chunk-len");
                 // auto-resume: with no explicit --start-chunk, continue where the
                 // checkpoint left off; an explicit value must match exactly
-                if (start_chunk == 0 && prev.next_chunk > 0) {
+                if (extend) {
+                    // --extend: intentionally add samples from a DIFFERENT region of
+                    // the stream (e.g. a multilingual tail) to an existing
+                    // accumulator. Not a double-count — the chunks differ — but the
+                    // continuity invariant does not hold, so require an explicit
+                    // range and skip the check.
+                    if (start_chunk == 0) {
+                        die("--extend requires an explicit --start-chunk (region to add)");
+                    }
+                    fprintf(stderr, "jlens-fit: --extend: adding chunks %d..%d to the loaded accumulators\n",
+                            start_chunk, n_chunks - 1);
+                } else if (start_chunk == 0 && prev.next_chunk > 0) {
                     start_chunk = (int) prev.next_chunk;
                     fprintf(stderr, "jlens-fit: auto-resuming at chunk %d from checkpoint\n", start_chunk);
                 } else if ((uint64_t) start_chunk != prev.next_chunk) {
@@ -736,6 +723,7 @@ int main(int argc, char ** argv) {
     }
 
     // dump-grads reference loading happens after probe 0 compute
+    bool dt_checked = false; // lrp: one-time in-graph detach-transform self-check
 
     for (int chunk = start_chunk; chunk < n_chunks; ++chunk) {
         if (!tokens_file.empty()) {
@@ -747,6 +735,26 @@ int main(int argc, char ** argv) {
             harvest();
             fprintf(stderr, "chunk %d/%d: harvest %.1f ms\n",
                     chunk + 1, n_chunks, (ggml_time_us() - th0) / 1000.0);
+            if (!dt_checked) {
+                // one-time self-check of the in-graph detach transform:
+                // rmsinv(layer 1, site 0) must equal 1/rms(l_out[0]) computed on CPU
+                dt_checked = true;
+                ggml_tensor * l0 = ggml_graph_get_tensor(dt.gf, "jlens_l_out_0");
+                std::vector<float> h_l0((size_t) n_embd * n_tokens), h_ri(n_tokens);
+                ggml_backend_tensor_get(l0, h_l0.data(), 0, h_l0.size() * sizeof(float));
+                ggml_backend_tensor_get(dt_rmsinv[4], h_ri.data(), 0, n_tokens * sizeof(float));
+                const float eps = model.hparams.norm_eps;
+                double max_rel = 0;
+                for (int j = 0; j < n_tokens; ++j) {
+                    const float * x = h_l0.data() + (size_t) j * n_embd;
+                    double ss = 0;
+                    for (int64_t i = 0; i < n_embd; ++i) ss += (double) x[i] * x[i];
+                    const float cpu = (float) (1.0 / sqrt(ss / n_embd + eps));
+                    max_rel = std::max(max_rel, (double) fabsf(h_ri[j] - cpu) / cpu);
+                }
+                fprintf(stderr, "jlens-fit: dt rmsinv self-check, max rel err %.3e\n", max_rel);
+                if (max_rel > 1e-3) die("in-graph dt rmsinv mismatch");
+            }
         }
     for (int probe = 0; probe < n_probes; ++probe) {
         // fill the seed at valid TARGET positions only ([skip_first, n_tokens-1)),

@@ -636,6 +636,15 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // slot skipped by a split MUL_MAT_ID (ggml_mul_mat_id_set_split): write zeros
+    if (ncols_dst == 1 && ids && (int32_t) channel_x < 0) {
+        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block &&
+                (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -907,6 +916,14 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
+    // slot skipped by a split MUL_MAT_ID (ggml_mul_mat_id_set_split): write zeros
+    if ((int32_t) channel_x < 0) {
+        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
@@ -992,6 +1009,202 @@ static __global__ void mul_mat_vec_q_moe(
         GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
     } else if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(x_scale, gate_scale);
+    }
+}
+
+// Persistent mat-vec for IQ2_S and IQ3_XXS with ncols_dst == 1.
+// The grid table stays in shared memory and each thread keeps its part of y in registers for all rows.
+// Signs use dot(g*s, u) = dot(g ^ m, u) - dot(m, u) with m = 0xFF where s = -1, this avoids __vcmpne4/__vsub4.
+
+#define MMVQ_PERS_NWARPS 4
+
+// byte j of result = 0xFF if the msb of byte j of x is set, else 0
+static __device__ __forceinline__ int mmvq_pers_sign_extend(const uint32_t x) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    int r;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(r) : "r"(x));
+    return r;
+#else
+    return __vcmpne4(x & 0x80808080, 0);
+#endif
+}
+
+// rep = 8 sign bits replicated in all 4 bytes, m0 gets bits 0-3, m1 gets bits 4-7
+static __device__ __forceinline__ void mmvq_pers_sign_masks(const uint32_t rep, int & m0, int & m1) {
+    m0 = mmvq_pers_sign_extend((rep & 0x08040201) + 0x7F7F7F7F);
+    m1 = mmvq_pers_sign_extend((rep & 0x80402010) + 0x7F7F7F7F);
+}
+
+static __device__ __forceinline__ float mmvq_pers_vec_dot_iq2_s(
+        const block_iq2_s * bq2, const int * yq, const float yd, const uint2 * grid, const int ib) {
+    const uint32_t qs = get_int_b2(bq2->qs, ib);
+    const uint32_t sg = get_int_b2(bq2->qs, QK_K/32 + ib);
+    const uint32_t qh = bq2->qh[ib];
+    const int      sc = bq2->scales[ib];
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+    int summ0 = 0;
+    int summ1 = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint2 g = grid[__byte_perm(qs, 0, 0x4440 + l) | ((qh << (8 - 2*l)) & 0x300)];
+        int m0;
+        int m1;
+        mmvq_pers_sign_masks(__byte_perm(sg, 0, 0x1111*l), m0, m1);
+        if (l < 2) {
+            sumi0 = ggml_cuda_dp4a(g.x ^ m0, yq[2*l + 0], sumi0);
+            sumi0 = ggml_cuda_dp4a(g.y ^ m1, yq[2*l + 1], sumi0);
+            summ0 = ggml_cuda_dp4a(m0,       yq[2*l + 0], summ0);
+            summ0 = ggml_cuda_dp4a(m1,       yq[2*l + 1], summ0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(g.x ^ m0, yq[2*l + 0], sumi1);
+            sumi1 = ggml_cuda_dp4a(g.y ^ m1, yq[2*l + 1], sumi1);
+            summ1 = ggml_cuda_dp4a(m0,       yq[2*l + 0], summ1);
+            summ1 = ggml_cuda_dp4a(m1,       yq[2*l + 1], summ1);
+        }
+    }
+    sumi0 -= summ0;
+    sumi1 -= summ1;
+    const int sumi = (sumi0*(sc & 0x0F) + sumi1*(sc >> 4) + (sumi0 + sumi1)/2)/4;
+
+    const float d = __half2float(bq2->d) * yd;
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float mmvq_pers_vec_dot_iq3_xxs(
+        const block_iq3_xxs * bq3, const int * yq, const float yd, const uint32_t * grid, const int ib) {
+    const uint32_t q3a   = get_int_b2(bq3->qs, 2*ib + 0);
+    const uint32_t q3b   = get_int_b2(bq3->qs, 2*ib + 1);
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + ib);
+
+    int sumi = 0;
+    int summ = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t q  = l < 2 ? q3a : q3b;
+        const int      g0 = grid[__byte_perm(q, 0, 0x4440 + 2*(l % 2) + 0)];
+        const int      g1 = grid[__byte_perm(q, 0, 0x4440 + 2*(l % 2) + 1)];
+        int m0;
+        int m1;
+        mmvq_pers_sign_masks(unpack_ksigns(aux32 >> (7*l)), m0, m1);
+        sumi = ggml_cuda_dp4a(g0 ^ m0, yq[2*l + 0], sumi);
+        sumi = ggml_cuda_dp4a(g1 ^ m1, yq[2*l + 1], sumi);
+        summ = ggml_cuda_dp4a(m0,      yq[2*l + 0], summ);
+        summ = ggml_cuda_dp4a(m1,      yq[2*l + 1], summ);
+    }
+    sumi -= summ;
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
+    const float d = __half2float(bq3->d) * yd;
+    return d * sumi;
+}
+
+// Each block loops over groups of rows_per_iter rows, all threads of the block work on each row.
+template <ggml_type type, int rows_per_iter, int units_per_thread>
+__launch_bounds__(MMVQ_PERS_NWARPS*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q_pers(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, float * __restrict__ dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x) {
+    static_assert(type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS, "unsupported type");
+    constexpr int nwarps   = MMVQ_PERS_NWARPS;
+    constexpr int nthreads = nwarps*WARP_SIZE;
+    using block_t = std::conditional_t<type == GGML_TYPE_IQ2_S, block_iq2_s, block_iq3_xxs>;
+    using grid_t  = std::conditional_t<type == GGML_TYPE_IQ2_S, uint2, uint32_t>;
+    constexpr int grid_n = type == GGML_TYPE_IQ2_S ? 1024 : 256;
+
+    __shared__ grid_t grid[grid_n];
+    __shared__ float  tmp_shared[2][nwarps][rows_per_iter];
+
+    const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const grid_t * grid_global = type == GGML_TYPE_IQ2_S ? (const grid_t *) iq2s_grid : (const grid_t *) iq3xxs_grid;
+    for (int i = tid; i < grid_n; i += nthreads) {
+        grid[i] = grid_global[i];
+    }
+
+    const int nunits = ncols_x / QK8_1;
+    int   yq[units_per_thread][8];
+    float yd[units_per_thread];
+#pragma unroll
+    for (int t = 0; t < units_per_thread; ++t) {
+        const int u = tid + t*nthreads;
+        if (u < nunits) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                yq[t][j] = get_int_b4(y[u].qs, j);
+            }
+            yd[t] = __low2float(y[u].ds);
+        }
+    }
+    __syncthreads();
+
+    const int ngroups = nrows_x / rows_per_iter;
+    for (int g = blockIdx.x, it = 0; g < ngroups; g += gridDim.x, ++it) {
+        float tmp[rows_per_iter] = {0.0f};
+#pragma unroll
+        for (int t = 0; t < units_per_thread; ++t) {
+            const int u = tid + t*nthreads;
+            if (u < nunits) {
+#pragma unroll
+                for (int i = 0; i < rows_per_iter; ++i) {
+                    const block_t * bx = (const block_t *) vx + (int64_t) (g*rows_per_iter + i)*stride_row_x + u/(QK_K/QK8_1);
+                    if constexpr (type == GGML_TYPE_IQ2_S) {
+                        tmp[i] += mmvq_pers_vec_dot_iq2_s(bx, yq[t], yd[t], grid, u % (QK_K/QK8_1));
+                    } else {
+                        tmp[i] += mmvq_pers_vec_dot_iq3_xxs(bx, yq[t], yd[t], grid, u % (QK_K/QK8_1));
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < rows_per_iter; ++i) {
+            tmp[i] = warp_reduce_sum<WARP_SIZE>(tmp[i]);
+            if (threadIdx.x == 0) {
+                tmp_shared[it % 2][threadIdx.y][i] = tmp[i];
+            }
+        }
+        __syncthreads();
+        if (tid < rows_per_iter) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < nwarps; ++w) {
+                sum += tmp_shared[it % 2][w][tid];
+            }
+            dst[g*rows_per_iter + tid] = sum;
+        }
+    }
+}
+
+template <ggml_type type, int rows_per_iter, int units_per_thread>
+static void mul_mat_vec_q_pers_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+    const auto kernel = mul_mat_vec_q_pers<type, rows_per_iter, units_per_thread>;
+    static int nblocks_max[GGML_CUDA_MAX_DEVICES] = {0};
+    const int device = ggml_cuda_get_device();
+    if (nblocks_max[device] == 0) {
+        int occupancy = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, MMVQ_PERS_NWARPS*WARP_SIZE, 0));
+        nblocks_max[device] = std::max(occupancy, 1) * ggml_cuda_info().devices[device].nsm;
+    }
+    const int nblocks = std::min(nblocks_max[device], nrows_x / rows_per_iter);
+    kernel<<<nblocks, dim3(WARP_SIZE, MMVQ_PERS_NWARPS), 0, stream>>>(vx, (const block_q8_1 *) vy, dst, ncols_x, nrows_x, stride_row_x);
+}
+
+// returns false if the shape is not supported
+template <ggml_type type>
+static bool mul_mat_vec_q_pers_switch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+    const int units_per_thread = (ncols_x/QK8_1 + MMVQ_PERS_NWARPS*WARP_SIZE - 1) / (MMVQ_PERS_NWARPS*WARP_SIZE);
+    if (nrows_x % 2 != 0) {
+        return false;
+    }
+    switch (units_per_thread) {
+        case 1: mul_mat_vec_q_pers_launch<type, 2, 1>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream); return true;
+        case 2: mul_mat_vec_q_pers_launch<type, 2, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream); return true;
+        case 3: mul_mat_vec_q_pers_launch<type, 2, 3>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream); return true;
+        case 4: mul_mat_vec_q_pers_launch<type, 2, 4>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream); return true;
+        default: return false;
     }
 }
 
@@ -1161,6 +1374,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         return idle * 8 <= iters_wide * 2;
     };
+
+    if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS) {
+        static const bool pers_enabled = getenv("GGML_CUDA_MMVQ_PERS") == nullptr || atoi(getenv("GGML_CUDA_MMVQ_PERS")) != 0;
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (pers_enabled && ncols_dst == 1 && !has_ids && !has_fusion && nchannels_dst == 1 && nsamples_dst == 1 &&
+                GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) {
+            if (mul_mat_vec_q_pers_switch<type>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream)) {
+                return;
+            }
+        }
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel

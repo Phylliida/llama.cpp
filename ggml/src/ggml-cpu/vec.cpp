@@ -377,6 +377,45 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
     *s = sumf;
 }
 
+#if !(defined(__AVX512F__) && defined(__AVX512DQ__)) && defined(__AVX2__) && defined(__FMA__)
+// tanh(x) = 1 - 2/(exp(2x) + 1), |x| clamped to 10 where tanh is 1 in float
+inline static __m256 ggml_v_tanh_situ(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 two = _mm256_set1_ps(2.0f);
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-10.0f)), _mm256_set1_ps(10.0f));
+    const __m256 e = ggml_v_expf(_mm256_mul_ps(x, two));
+    return _mm256_sub_ps(one, _mm256_div_ps(two, _mm256_add_ps(e, one)));
+}
+#endif
+
+void ggml_vec_situ_f32(const int n, float * y, const float * g, const float * u, const float beta, const float lb) {
+    const float inv_beta = 1.0f/beta;
+    const float inv_lb   = lb > 0.0f ? 1.0f/lb : 0.0f;
+    int k = 0;
+#if !(defined(__AVX512F__) && defined(__AVX512DQ__)) && defined(__AVX2__) && defined(__FMA__)
+    const __m256 one  = _mm256_set1_ps(1.0f);
+    const __m256 vb   = _mm256_set1_ps(beta);
+    const __m256 vib  = _mm256_set1_ps(inv_beta);
+    const __m256 vlb  = _mm256_set1_ps(lb);
+    const __m256 vilb = _mm256_set1_ps(inv_lb);
+    for (; k + 8 <= n; k += 8) {
+        const __m256 gv  = _mm256_loadu_ps(g + k);
+        const __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, ggml_v_expf(_mm256_sub_ps(_mm256_setzero_ps(), gv))));
+        const __m256 a   = _mm256_mul_ps(_mm256_mul_ps(ggml_v_tanh_situ(_mm256_mul_ps(gv, vib)), vb), sig);
+        __m256 v = _mm256_loadu_ps(u + k);
+        if (lb > 0.0f) {
+            v = _mm256_mul_ps(ggml_v_tanh_situ(_mm256_mul_ps(v, vilb)), vlb);
+        }
+        _mm256_storeu_ps(y + k, _mm256_mul_ps(a, v));
+    }
+#endif
+    for (; k < n; k++) {
+        const float a = (tanhf(g[k]*inv_beta)*beta) * (1.f/(1.f + expf(-g[k])));
+        const float v = lb > 0.0f ? tanhf(u[k]*inv_lb)*lb : u[k];
+        y[k] = a*v;
+    }
+}
+
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     int i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)

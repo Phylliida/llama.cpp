@@ -174,13 +174,7 @@ std::unique_ptr<llm_graph_context> llama_model_kimi_k3::build_arch_graph(const l
 // linear_beta <= 0 disables the transform on the up branch
 static ggml_tensor * kimi_k3_situ(ggml_context * ctx0, ggml_tensor * gate, ggml_tensor * up,
                                   float beta, float linear_beta) {
-    ggml_tensor * a = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, gate, 1.0f/beta)), beta);
-    a = ggml_mul(ctx0, a, ggml_sigmoid(ctx0, gate));
-
-    if (linear_beta > 0.0f) {
-        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/linear_beta)), linear_beta);
-    }
-    return ggml_mul(ctx0, a, up);
+    return ggml_situ_split(ctx0, gate, up, beta, linear_beta);
 }
 
 //
@@ -201,35 +195,22 @@ ggml_tensor * llama_model_kimi_k3::graph::res_mix(ggml_tensor * cur, ggml_tensor
         return cur; // layer 0: nothing banked yet
     }
 
-    const int   n_ckpt = (int) resi_stack->ne[1];
-    const float eps    = hparams.f_norm_rms_eps;
+    const float eps = hparams.f_norm_rms_eps;
 
-    ggml_tensor * src = resi_stack;   // [n_embd, n_ckpt, n_tokens]
-
-    // one rms_norm scores all checkpoints at once
+    // score the banked checkpoints and the current stream together: [n_embd, n_ckpt + 1, n_tokens]
     // note: the scores use the normalized values, but the sum below uses the raw ones
-    ggml_tensor * sc_src = ggml_rms_norm(ctx0, src, eps);
-    sc_src = ggml_mul(ctx0, sc_src, score_w);
-    sc_src = ggml_sum_rows(ctx0, sc_src);                          // [1, n_ckpt, n_tokens]
-    sc_src = ggml_reshape_2d(ctx0, sc_src, n_ckpt, n_tokens);
+    ggml_tensor * src = ggml_concat(ctx0, resi_stack, ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_tokens), 1);
+    const int n_src = (int) src->ne[1];
 
-    // the current residual stream is scored apart, so the stack stays append-only
-    ggml_tensor * sc_cur = ggml_rms_norm(ctx0, cur, eps);
-    sc_cur = ggml_mul(ctx0, sc_cur, score_w);
-    sc_cur = ggml_sum_rows(ctx0, sc_cur);                          // [1, n_tokens]
+    ggml_tensor * scores = ggml_rms_norm(ctx0, src, eps);
+    scores = ggml_mul(ctx0, scores, score_w);
+    scores = ggml_sum_rows(ctx0, scores);                          // [1, n_src, n_tokens]
+    scores = ggml_reshape_2d(ctx0, scores, n_src, n_tokens);
 
-    ggml_tensor * scores = ggml_concat(ctx0, sc_src, sc_cur, 0);   // [n_ckpt+1, n_tokens]
-    ggml_tensor * probs  = ggml_soft_max(ctx0, scores);            // over ne0 = n_ckpt+1
+    ggml_tensor * probs = ggml_soft_max(ctx0, scores);            // over ne0 = n_src
     cb(probs, "res_probs", il);
 
-    // split the sum: hc_pre handles the stack, a broadcast-multiply the current stream
-    ggml_tensor * p_src = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, n_ckpt, n_tokens, probs->nb[1], 0));
-    ggml_tensor * p_cur = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_tokens, probs->nb[1],
-                                                       probs->nb[0] * n_ckpt));
-
-    ggml_tensor * out = ggml_dsv4_hc_pre(ctx0, src, p_src);
-    out = ggml_add(ctx0, out, ggml_mul(ctx0, cur, p_cur));
-
+    ggml_tensor * out = ggml_dsv4_hc_pre(ctx0, src, probs);
     return out;
 }
 
@@ -284,6 +265,10 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         cur = use_attn_res ? res_mix(prefix_sum, layer.attn_res_score, n_tokens, il)
                            : prefix_sum;
 
+        // the stream as this layer's attention reads it (pre-norm mixture), which is
+        // what draft models (DFlash) are trained on as "the output of layer il-1"
+        res->t_layer_inp[il] = cur;
+
         bool banked = false;
         if (use_attn_res && (uint32_t) il % res_bs == 0) {
             res_push(prefix_sum, n_embd, n_tokens);  // banks the RAW layer input, not `cur`
@@ -335,6 +320,7 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
     if (use_attn_res) {
         cur = res_mix(cur, model.output_res_score, n_tokens, -1);
     }
+    res->t_layer_inp[n_layer] = cur;
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
@@ -572,6 +558,21 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
 
     ggml_tensor * identity = cur;
 
+    // the shared expert only needs the layer input: build it first and let it run on the GPU
+    // while the CPU computes the routed experts (see GGML_TENSOR_FLAG_DEFER)
+    ggml_tensor * sh = nullptr;
+    if (layer.ffn_gate_shexp) {
+        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
+        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
+        ggml_tensor * a = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
+        sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, a);
+        cb(sh, "ffn_shexp", il);
+        for (ggml_tensor * t : {g, u, a, sh}) {
+            t->flags |= GGML_TENSOR_FLAG_DEFER;
+        }
+        moe_defer = sh;
+    }
+
     ggml_tensor * routed_in = layer.ffn_routed_down
         ? ggml_mul_mat(ctx0, layer.ffn_routed_down, cur)
         : cur;
@@ -580,6 +581,18 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     // so the logits are computed here and passed to build_moe_ffn
     ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, identity);
     cb(logits, "ffn_moe_logits", il);
+
+    // keep the latent projection before the deferred shared expert, so that split is followed by the experts
+    ggml_build_forward_expand(gf, routed_in);
+
+    // optional GPU share of the routed experts: LLAMA_MOE_GPU_FRAC = fraction of expert ids (from 0) the GPU may take,
+    // LLAMA_MOE_GPU_K = max experts per token on the GPU (needs HMM for the host-resident expert weights)
+    static const float gpu_frac = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
+    static const int   gpu_k    = getenv("LLAMA_MOE_GPU_K")    ? atoi(getenv("LLAMA_MOE_GPU_K"))    : 3;
+    if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
+        moe_gpu_k  = gpu_k;
+        moe_gpu_e1 = (int) (gpu_frac * hparams.n_expert);
+    }
 
     ggml_tensor * moe_out = build_moe_ffn(routed_in,
         nullptr, // gate_inp unused: the logits above are passed instead
@@ -604,12 +617,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     }
     GGML_UNUSED(n_embd_latent);
 
-    if (layer.ffn_gate_shexp) {
-        ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
-        ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
-        ggml_tensor * sh = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
-        sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, sh);
-        cb(sh, "ffn_shexp", il);
+    if (sh) {
         moe_out = ggml_add(ctx0, moe_out, sh);
     }
 

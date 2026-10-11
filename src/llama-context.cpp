@@ -477,9 +477,43 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // GPU share of the routed experts: the first GPU reads expert ids [0, frac*n_expert) from host memory in place.
+    // Mapping them into its page tables on first touch is slow, so do it ahead in a helper thread.
+    const char * moe_gpu_frac = getenv("LLAMA_MOE_GPU_FRAC");
+    if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && !model.devices.empty()) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.devices[0].dev);
+        using prefetch_fn_t = bool (*)(const void *, size_t, int);
+        auto * prefetch_fn = (prefetch_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_prefetch_host");
+        if (prefetch_fn) {
+            const double frac = atof(moe_gpu_frac);
+            moe_prefetch_thread = std::thread([this, prefetch_fn, frac]() {
+                const int64_t t0 = ggml_time_us();
+                size_t total = 0;
+                bool ok = true;
+                for (const auto & [name, t] : this->model.tensors_by_name) {
+                    if (name.find("_exps.weight") == std::string::npos || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                        continue;
+                    }
+                    const size_t size = std::min(ggml_nbytes(t), (size_t) (frac * t->ne[2]) * t->nb[2]);
+                    ok = ok && prefetch_fn(t->data, size, 0);
+                    total += size;
+                }
+                LLAMA_LOG_INFO("%s: mapped %.1f GiB of expert weights for the GPU in %.1f s%s\n", "moe_gpu_prefetch",
+                    total/1073741824.0, (ggml_time_us() - t0)/1e6, ok ? "" : " (some prefetches failed)");
+            });
+            if (getenv("LLAMA_MOE_GPU_PREFETCH_WAIT")) {
+                moe_prefetch_thread.join();
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
+    if (moe_prefetch_thread.joinable()) {
+        moe_prefetch_thread.join();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 

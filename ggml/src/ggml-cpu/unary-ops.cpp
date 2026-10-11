@@ -118,7 +118,21 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT( nb0 == sizeof(dst_t));
     GGML_ASSERT(nb00 == sizeof(src0_t));
 
-    const auto [ir0, ir1] = get_thread_range(params, src0);
+    // fewer rows than threads (batch-1 decode): split the columns instead, otherwise
+    // thread 0 does the whole op while the others wait at the barrier
+    const int64_t nth = params->nth;
+    const int64_t ith = params->ith;
+    const bool split_cols = ggml_nrows(src0) < nth;
+
+    auto [ir0, ir1] = get_thread_range(params, src0);
+    int64_t ic0 = 0, ic1 = ne0;
+    if (split_cols) {
+        const int64_t dc = ((ne0 + 15)/16 + nth - 1)/nth*16;
+        ir0 = 0;
+        ir1 = ggml_nrows(src0);
+        ic0 = MIN(dc*ith, ne0);
+        ic1 = MIN(ic0 + dc, ne0);
+    }
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i03 = ir/(ne02*ne01);
@@ -128,7 +142,7 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
         dst_t        * dst_ptr  = (dst_t  *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
 
-        vec_unary_op<op>(ne0, dst_ptr, src0_ptr);
+        vec_unary_op<op>(ic1 - ic0, dst_ptr + ic0, src0_ptr + ic0);
     }
 }
 

@@ -719,3 +719,47 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// situ (Kimi-K3): beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
+
+static __global__ void situ_kernel(const float * g, const float * u, float * dst, const int64_t k, const int64_t n,
+                                   const int64_t o0, const int64_t o1, const float beta, const float lb) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = (i / n) * o1 + (i % n);
+
+    const float gi = g[j0];
+    const float ui = u[j1];
+    const float a  = (tanhf(gi*(1.0f/beta))*beta) * (1.0f/(1.0f + expf(-gi)));
+    const float v  = lb > 0.0f ? tanhf(ui*(1.0f/lb))*lb : ui;
+    dst[i] = a*v;
+}
+
+void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nc = src0->ne[0];
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src1 != nullptr);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous_1(src1) && src1->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->ne[0] == nc && dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
+
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    situ_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data, k, nc,
+        src0->nb[1] / sizeof(float), src1->nb[1] / sizeof(float), beta, lb);
+}

@@ -2250,6 +2250,59 @@ struct test_glu_split : public test_case {
     }
 };
 
+// GGML_OP_GLU (SITU, Kimi-K3)
+struct test_situ : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    int v; // view (1 : non-contiguous a, b)
+    float beta;
+    float lb;
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne_a, v, beta, lb);
+    }
+
+    test_situ(std::array<int64_t, 4> ne_a = {128, 2, 2, 2}, int v = 0, float beta = 1.0f, float lb = 0.0f)
+        : ne_a(ne_a), v(v), beta(beta), lb(lb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        ggml_tensor * b;
+        if (v & 1) {
+            auto ne = ne_a; ne[0] *= 3;
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+            a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+
+            b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_param(b);
+            ggml_set_name(b, "b");
+            b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
+            ggml_set_name(b, "view_of_b");
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+            ggml_set_param(a);
+            ggml_set_name(a, "a");
+
+            b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+            ggml_set_param(b);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * out = ggml_situ_split(ctx, a, b, beta, lb);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -20.f, 20.f);
+        }
+    }
+};
+
 struct test_swiglu_oai : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -5289,6 +5342,64 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A8";
+    }
+};
+
+// selected experts split between two nodes (ggml_mul_mat_id_set_split)
+struct test_mul_mat_id_split : public test_mul_mat_id {
+    const int mode;
+    test_mul_mat_id_split(ggml_type type_a, int mode, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode) {}
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",mode=" + std::to_string(mode);
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_mul_mat_id_set_split(out, mode, 3, 0, n_mats/2);
+        return out;
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SPLIT";
+    }
+};
+
+// gate/up MUL_MAT_ID + SITU (the CPU backend fuses this at decode)
+struct test_mul_mat_id_situ : public test_case {
+    const ggml_type type_a;
+    const int n_mats, n_used;
+    const int64_t m, n, k;
+    const int split_mode;
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, m, n, k, split_mode);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SITU";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    test_mul_mat_id_situ(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_mode)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_mode(split_mode) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ag  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * au  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_tensor * g = ggml_mul_mat_id(ctx, ag, b, ids);
+        ggml_tensor * u = ggml_mul_mat_id(ctx, au, b, ids);
+        if (split_mode) {
+            ggml_mul_mat_id_set_split(g, split_mode, 3, 0, n_mats/2);
+            ggml_mul_mat_id_set_split(u, split_mode, 3, 0, n_mats/2);
+        }
+        ggml_tensor * out = ggml_situ_split(ctx, g, u, 2.5f, 3.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
     }
 };
 
@@ -9188,7 +9299,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
                     continue;
                 }
 
@@ -9207,6 +9318,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (float alpha : {.5f, 1.702f}) {
             for (float limit : {2.0f, 7.0f}) {
                 test_cases.emplace_back(new test_swiglu_oai(GGML_TYPE_F32, { 128, 2, 2, 2 }, v, alpha, limit));
+            }
+        }
+    }
+
+    for (int v : {0, 1}) {
+        for (float beta : {1.0f, 2.5f}) {
+            for (float lb : {0.0f, 3.0f}) {
+                test_cases.emplace_back(new test_situ({ 128, 2, 2, 2 }, v, beta, lb));
+                test_cases.emplace_back(new test_situ({ 3072, 16, 1, 1 }, v, beta, lb));
             }
         }
     }
@@ -10063,6 +10183,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {
+        for (int mode : {1, 2}) {
+            for (int n : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256));
+            }
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {
+        for (int mode : {0, 2}) {
+            for (int n : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 64, 16, 384, n, 512, mode));
+            }
+        }
+    }
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -11437,6 +11572,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // TEMP K3 router top-k
+    test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {896, 1, 1, 1}, GGML_SORT_ORDER_DESC));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {896, 1, 1, 1}, 16));
+
+    // TEMP K3 dense mat-vec shapes
+    for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{12288, 7168}, {6144, 7168}, {3584, 7168}, {7168, 3584}, {7168, 12288}, {7168, 6144}}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
         }
     }
 

@@ -2813,15 +2813,14 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
     };
     const __m256i bit_helper = _mm256_loadu_si256((const __m256i*)k_bit_helper);
-    const __m256i m511 = _mm256_set1_epi16(511);
     const __m128i m4 = _mm_set1_epi8(0xf);
     const __m128i m1 = _mm_set1_epi8(1);
 
-    uint64_t aux64;
+    // even scales to the low lane, odd scales to the high lane (int16), so each 32-quant
+    // chunk needs one in-lane shuffle instead of a shuffle plus a sign-extension
+    const __m128i scale_even_odd = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
 
-    // somewhat hacky, but gives a significant boost in performance
-    __m256i aux_gindex;
-    const uint16_t * gindex = (const uint16_t *)&aux_gindex;
+    uint64_t aux64;
 
     __m256 accumf = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
@@ -2833,13 +2832,13 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         __m128i stmp = _mm_set1_epi64x(aux64);
         stmp = _mm_unpacklo_epi8(_mm_and_si128(stmp, m4), _mm_and_si128(_mm_srli_epi16(stmp, 4), m4));
         const __m128i scales = _mm_add_epi8(_mm_slli_epi16(stmp, 1), m1);
+        const __m256i scales_eo = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_even_odd));
 
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
 
-            const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2);  q2 += 16;
-            aux_gindex = _mm256_and_si256(q2_data, m511);
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2);
 
             const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
             const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
@@ -2853,14 +2852,17 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_4 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
 
-            const __m256i q2_1 = _mm256_set_epi64x(iq2xs_grid[gindex[ 3]], iq2xs_grid[gindex[ 2]],
-                                                   iq2xs_grid[gindex[ 1]], iq2xs_grid[gindex[ 0]]);
-            const __m256i q2_2 = _mm256_set_epi64x(iq2xs_grid[gindex[ 7]], iq2xs_grid[gindex[ 6]],
-                                                   iq2xs_grid[gindex[ 5]], iq2xs_grid[gindex[ 4]]);
-            const __m256i q2_3 = _mm256_set_epi64x(iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]],
-                                                   iq2xs_grid[gindex[ 9]], iq2xs_grid[gindex[ 8]]);
-            const __m256i q2_4 = _mm256_set_epi64x(iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]],
-                                                   iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
+            const __m256i q2_1 = _mm256_set_epi64x(iq2xs_grid[q2[ 3] & 511], iq2xs_grid[q2[ 2] & 511],
+                                                   iq2xs_grid[q2[ 1] & 511], iq2xs_grid[q2[ 0] & 511]);
+            const __m256i q2_2 = _mm256_set_epi64x(iq2xs_grid[q2[ 7] & 511], iq2xs_grid[q2[ 6] & 511],
+                                                   iq2xs_grid[q2[ 5] & 511], iq2xs_grid[q2[ 4] & 511]);
+            const __m256i q2_3 = _mm256_set_epi64x(iq2xs_grid[q2[11] & 511], iq2xs_grid[q2[10] & 511],
+                                                   iq2xs_grid[q2[ 9] & 511], iq2xs_grid[q2[ 8] & 511]);
+            const __m256i q2_4 = _mm256_set_epi64x(iq2xs_grid[q2[15] & 511], iq2xs_grid[q2[14] & 511],
+                                                   iq2xs_grid[q2[13] & 511], iq2xs_grid[q2[12] & 511]);
+            // indices are read straight from memory: the old store/reload of a masked
+            // vector stalls on store-to-load forwarding (1.58x slower on Zen2)
+            q2 += 16;
 
             const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
             const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
@@ -2889,10 +2891,10 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m256i dot3  = _mm256_maddubs_epi16(q2_3, q8s_3);
             const __m256i dot4  = _mm256_maddubs_epi16(q2_4, q8s_4);
 
-            const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+0)));
-            const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+1)));
-            const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+2)));
-            const __m256i sc4 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+3)));
+            const __m256i sc1 = _mm256_shuffle_epi8(scales_eo, get_scale_shuffle_k4(ib32+0));
+            const __m256i sc2 = _mm256_shuffle_epi8(scales_eo, get_scale_shuffle_k4(ib32+1));
+            const __m256i sc3 = _mm256_shuffle_epi8(scales_eo, get_scale_shuffle_k4(ib32+2));
+            const __m256i sc4 = _mm256_shuffle_epi8(scales_eo, get_scale_shuffle_k4(ib32+3));
 
             sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
             sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));

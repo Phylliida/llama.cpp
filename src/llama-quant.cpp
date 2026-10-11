@@ -301,9 +301,15 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 
     quantize &= params->quantize_output_tensor || name != "output.weight";
 
-    // do not quantize expert gating tensors
+    // do not quantize expert gating tensors, unless a --tensor-type override names them
     // NOTE: can't use LLM_TN here because the layer number is not known
-    quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
+    if (name.find("ffn_gate_inp.weight") != std::string::npos) {
+        bool overridden = false;
+        for (const auto * p = params->tt_overrides; p && p->pattern != nullptr; p++) {
+            overridden |= strstr(p->pattern, "ffn_gate_inp") != nullptr;
+        }
+        quantize &= overridden;
+    }
 
     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;

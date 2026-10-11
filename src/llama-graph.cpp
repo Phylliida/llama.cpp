@@ -2115,8 +2115,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        if (arch == LLM_ARCH_KIMI_K3) {
+            // the order of the selected experts does not matter here, and top_k is cheaper than a full argsort
+            selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -2163,7 +2168,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    if (moe_defer) {
+        ggml_build_forward_expand(gf, moe_defer);
+        moe_defer = nullptr;
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // GPU share of the routed experts (see moe_gpu_k): built and expanded before the CPU experts, flagged
+    // GGML_TENSOR_FLAG_DEFER so it runs on the GPU while the CPU computes the other experts
+    const int gpu_k  = moe_gpu_k;
+    const int gpu_e1 = moe_gpu_e1;
+    moe_gpu_k = 0;
+    ggml_backend_t backend_gpu = sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
+    const bool gpu_share = gpu_k > 0 && n_tokens == 1 && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn &&
+        backend_gpu && backend_gpu != backend_cpu;
+    ggml_tensor * experts_gpu = nullptr;
+    if (gpu_share) {
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, up_exps,   cur, selected_experts);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_exps, cur, selected_experts);
+        ggml_tensor * act_g  = ggml_situ_split(ctx0, gate_g, up_g, hparams.situ_beta, hparams.situ_linear_beta);
+        experts_gpu = ggml_mul_mat_id(ctx0, down_exps, act_g, selected_experts);
+        for (ggml_tensor * t : {up_g, gate_g, experts_gpu}) {
+            ggml_mul_mat_id_set_split(t, 1, gpu_k, 0, gpu_e1);
+            t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+        }
+        for (ggml_tensor * t : {up_g, gate_g, act_g, experts_gpu}) {
+            t->flags |= GGML_TENSOR_FLAG_DEFER;
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_gpu);
+        }
+        cb(experts_gpu, "ffn_moe_down_gpu", il);
+        ggml_build_forward_expand(gf, experts_gpu);
+    }
+    // the CPU nodes skip the slots taken by the GPU
+    auto set_cpu_part = [&](ggml_tensor * t) {
+        if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {
+            ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, gpu_e1);
+        }
+    };
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2198,6 +2241,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
+        set_cpu_part(up);
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2211,6 +2255,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+            set_cpu_part(cur);
         } else {
             cur = up;
         }
@@ -2265,12 +2310,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
 
-                ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                if (lb > 0.0f) {
-                    up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                }
-                cur = ggml_mul(ctx0, act, up);
+                // one fused op: on the CPU the 9-node chain cost a 32-thread barrier per node
+                cur = ggml_situ_split(ctx0, cur, up, beta, lb);
                 cb(cur, "ffn_moe_situ", il);
             } break;
         case LLM_FFN_GELU:
@@ -2311,6 +2352,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    set_cpu_part(experts);
+    if (experts_gpu) {
+        experts = ggml_add(ctx0, experts, experts_gpu);
+    }
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);

@@ -639,6 +639,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -665,6 +666,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_DEFER   = 32, // ...sched: run in an own split that may start after the next split on another backend has copied its inputs
+        GGML_TENSOR_FLAG_HOST_SRC = 64, // ...sched: the node's backend reads host-resident weight sources in place (no copy)
     };
 
     enum ggml_tri_type {
@@ -1385,6 +1388,14 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 limit);
 
+    // Kimi-K3 SiTU: beta*tanh(a/beta)*sigmoid(a) * (linear_beta > 0 ? linear_beta*tanh(b/linear_beta) : b)
+    GGML_API struct ggml_tensor * ggml_situ_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 linear_beta);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1502,6 +1513,11 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // split the selected experts of a MUL_MAT_ID between two nodes (e.g. one per backend):
+    // per token, the first k slots whose expert id is in [e0, e1) are "taken"
+    // mode 1 computes only the taken slots, mode 2 all other slots, skipped slots are written as zeros
+    GGML_API void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -2057,22 +2057,26 @@ static void ggml_compute_forward_concat_f32(
 
     const float * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
+    // split over all rows (i1, i2, i3), not just i2: at batch 1 ne2 is often 1
+    const int64_t nr  = ne1*ne2*ne3;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = MIN(dr*ith, nr);
+    const int64_t ir1 = MIN(ir0 + dr, nr);
 
-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne1*ne2);
+        const int64_t i2 = (ir - i3*ne1*ne2)/ne1;
+        const int64_t i1 = ir - i3*ne1*ne2 - i2*ne1;
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
+            } else {
+                x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
             }
+
+            float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+
+            *y = *x;
         }
     }
 }
@@ -3317,6 +3321,69 @@ static void ggml_compute_forward_swiglu(
 }
 
 // ggml_compute_forward_swiglu_oai
+
+// ggml_compute_forward_situ
+
+// one op instead of the 9-node scale/tanh/scale/sigmoid/mul/scale/tanh/scale/mul chain; the
+// per-element arithmetic is the chain's, in its order, so the result is bit-identical.
+// Work is split over elements, not rows: at decode the routed-expert input is [n_ff, n_used]
+// with n_used < n_threads.
+static void ggml_compute_forward_situ_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src1 != nullptr);
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(src1));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nrows(src0);
+
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t n  = nr*nc;
+    const int64_t dn = (n + params->nth - 1)/params->nth;
+    const int64_t e0 = MIN(dn*params->ith, n);
+    const int64_t e1 = MIN(e0 + dn, n);
+
+    for (int64_t e = e0; e < e1; ) {
+        const int64_t i1 = e/nc;
+        const int64_t k0 = e - i1*nc;
+        const int64_t k1 = MIN(nc, k0 + (e1 - e));
+
+        const float * g = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
+        const float * u = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+        float       * y = (float       *) ((char       *) dst->data  + i1*dst->nb[1]);
+
+        ggml_vec_situ_f32((int) (k1 - k0), y + k0, g + k0, u + k0, beta, lb);
+        e += k1 - k0;
+    }
+}
+
+static void ggml_compute_forward_situ(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_situ_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
 
 static void ggml_compute_forward_swiglu_oai_f32(
         const ggml_compute_params * params,
@@ -5122,12 +5189,21 @@ static void ggml_compute_forward_get_rows_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // fewer rows than threads (e.g. a recurrent state gather at batch 1): split the
+    // columns instead, otherwise a single multi-MB row is copied by thread 0 alone
+    const bool split_cols = nr < nth;
+
     // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    const int dr = split_cols ? nr : (nr + nth - 1)/nth;
 
     // row range for this thread
-    const int ir0 = dr*ith;
+    const int ir0 = split_cols ? 0 : dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
+
+    // column range for this thread, in 16-float (cache line) units
+    const int64_t dc  = split_cols ? ((nc + 15)/16 + nth - 1)/nth*16 : nc;
+    const int64_t ic0 = split_cols ? MIN(dc*ith, nc) : 0;
+    const int64_t ic1 = MIN(ic0 + dc, nc);
 
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
@@ -5137,9 +5213,9 @@ static void ggml_compute_forward_get_rows_f32(
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        ggml_vec_cpy_f32(ic1 - ic0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + ic0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
     }
 }
 
@@ -10272,6 +10348,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {
                 ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         default:
             {

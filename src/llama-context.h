@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <thread>
 #include <map>
 #include <vector>
 
@@ -357,6 +358,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // maps the expert weights the GPU may read in place into the GPU page tables (LLAMA_MOE_GPU_FRAC)
+    std::thread moe_prefetch_thread;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -98,14 +98,14 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
 
 // R-lens (LRP backward): two-phase variant of the above.
 //
-// jlens_build_forward_dt builds the ordinary forward but additionally names and
-// marks as outputs the tensors the LRP rules need detached values of (4 rms-norm
-// inputs + gate/up per block):
-//   jlens_dt_<il>_rms_<k>  [n_embd, n_tokens]  k = 0 attn, 1 post_attn, 2 ffn, 3 post_ffw
-//   jlens_dt_<il>_gate     [n_ff, n_tokens]
-//   jlens_dt_<il>_up       [n_ff, n_tokens]
-// The caller computes the detach values from these (rms_inv, sigmoid(gate),
-// silu(gate), up) and hands them to the phase-2 graph via jlens_lrp_leaves.
+// jlens_build_forward_dt builds the ordinary forward but additionally computes
+// the LRP detach values IN-GRAPH and marks them as outputs, so the phase-2
+// graph's leaf inputs can alias them directly (no separate leaf buffers):
+//   jlens_dt_<il>_rmsinv_<k>  [1, n_tokens]  k = 0 attn, 1 post_attn, 2 ffn, 3 post_ffw
+//   jlens_dt_<il>_sig         [n_ff, n_tokens]  sigmoid(gate)
+//   jlens_dt_<il>_silu        [n_ff, n_tokens]  silu(gate)
+//   jlens_dt_<il>_up          [n_ff, n_tokens]
+// dt_one/dt_eps: [1] f32 constant leaves (1.0, norm_eps) owned by the caller.
 //
 // jlens_build_forward_lrp builds the same network with the LRP rules baked in as
 // detached-leaf structure, so ordinary autodiff over it yields the LRP backward:
@@ -124,7 +124,8 @@ struct jlens_lrp_forward : jlens_forward {
     std::vector<jlens_lrp_leaves> leaves; // [n_layer], graph inputs to be wired by caller
 };
 
-bool jlens_build_forward_dt (const jlens_weights & m, int n_tokens, jlens_forward & out);
+bool jlens_build_forward_dt (const jlens_weights & m, int n_tokens, jlens_forward & out,
+                             ggml_tensor * dt_one, ggml_tensor * dt_eps);
 bool jlens_build_forward_lrp(const jlens_weights & m, int n_tokens, jlens_lrp_forward & out);
 
 // single-block graph for local validation: h_in leaf -> (+zero_pad param) -> block -> h_out (loss)

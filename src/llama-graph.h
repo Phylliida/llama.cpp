@@ -1041,6 +1041,15 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // if set, build_moe_ffn expands this right after the router and before the experts, then clears it
+    // (used to place GPU work flagged GGML_TENSOR_FLAG_DEFER next to the CPU expert split)
+    mutable ggml_tensor * moe_defer = nullptr;
+
+    // at batch size 1, build_moe_ffn lets the first backend (GPU) compute up to moe_gpu_k of the selected experts
+    // with id < moe_gpu_e1, reading their host weights in place while the CPU computes the others (then clears it)
+    mutable int moe_gpu_k  = 0;
+    mutable int moe_gpu_e1 = 0;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

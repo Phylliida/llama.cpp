@@ -59,6 +59,7 @@ struct server_jlens_state {
     int64_t n_embd  = 0;
     int64_t n_layer = 0;
     std::vector<std::vector<float>> J;
+    std::vector<char>             fitted; // per layer: matrix is nonzero
 
     ggml_backend_t backend = nullptr; // on the CUDA device holding the weights
     int            device  = -1;
@@ -87,6 +88,7 @@ server_jlens_state g_jlens;
 void server_jlens_deinit_locked() {
     g_jlens.weights.reset(); // drop raw tensor pointers before the model dies
     g_jlens.J.clear();
+    g_jlens.fitted.clear();
     g_jlens.n_embd  = 0;
     g_jlens.n_layer = 0;
     if (g_jlens.hgalloc) { ggml_gallocr_free(g_jlens.hgalloc);      g_jlens.hgalloc = nullptr; }
@@ -197,6 +199,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         return false;
     }
     g_jlens.J.resize(n_layer);
+    g_jlens.fitted.clear();
     // J = M / n_positions: each probe contributes n_valid rank-1 samples (valid
     // source positions), so the positions counter already spans all probes
     const double scale = 1.0 / (double) n_positions;
@@ -205,6 +208,7 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         if (fread(g_jlens.J[il].data(), sizeof(float), g_jlens.J[il].size(), f) != g_jlens.J[il].size()) {
             fclose(f);
             g_jlens.J.clear();
+    g_jlens.fitted.clear();
             err = "short jlens file";
             return false;
         }
@@ -213,8 +217,9 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
         }
         double norm2 = 0;
         for (const auto & x : g_jlens.J[il]) norm2 += (double) x * x;
+        g_jlens.fitted.push_back(norm2 > 0);
         if (norm2 == 0) {
-            fprintf(stderr, "srv jlens: WARNING: layer %lld is all zeros (not fitted; above the fitter's --target-layer?)\n",
+            fprintf(stderr, "srv jlens: layer %lld is all zeros (not fitted; above the fitter's --target-layer?) - excluding\n",
                     (long long) il);
         }
     }
@@ -309,6 +314,15 @@ bool server_jlens_compute(
             layers.push_back((int) g_jlens.n_layer - 1);
         }
     }
+    // drop unfitted layers (all-zero matrices, e.g. above a penultimate-target fit)
+    // so clients that request every layer don't decode garbage rows
+    layers.erase(std::remove_if(layers.begin(), layers.end(),
+        [](int il) { return il >= 0 && il < (int) g_jlens.fitted.size() && !g_jlens.fitted[il]; }),
+        layers.end());
+    if (layers.empty()) {
+        err = "jlens: no fitted layers in the requested set";
+        return false;
+    }
     for (int il : layers) {
         if (il < 0 || il >= (int) g_jlens.n_layer) {
             err = "jlens: layer out of range [0, " + std::to_string(g_jlens.n_layer) + ")";
@@ -363,6 +377,16 @@ bool server_jlens_compute(
     const int64_t n_vocab = g_jlens.weights->hparams.n_vocab;
     const int     n_real  = llama_vocab_n_tokens(vocab); // logits may be padded
 
+    // display text for a token id: detokenize (inverts the byte->unicode display
+    // mapping, so multi-byte UTF-8 tokens like 巴黎 render correctly) with a
+    // fallback to the raw piece for tokens that don't decode standalone
+    auto piece_of = [&](int id) {
+        char buf[256];
+        const llama_token t = (llama_token) id;
+        const int nb = llama_detokenize(vocab, &t, 1, buf, (int32_t) sizeof(buf), false, false);
+        return nb > 0 ? std::string(buf, nb) : std::string(llama_vocab_get_text(vocab, id));
+    };
+
     auto topk_of = [&](const std::vector<float> & logits) {
         std::vector<int> idx(logits.size());
         for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
@@ -371,7 +395,7 @@ bool server_jlens_compute(
                           [&](int a, int b) { return logits[a] > logits[b]; });
         std::vector<std::pair<std::string, float>> out;
         for (int i = 0; i < n && idx[i] < n_real; ++i) {
-            out.emplace_back(llama_vocab_get_text(vocab, idx[i]), logits[idx[i]]);
+            out.emplace_back(piece_of(idx[i]), logits[idx[i]]);
         }
         return out;
     };
@@ -495,7 +519,7 @@ bool server_jlens_compute(
                                                   [&](int a2, int b2) { return col[a2] > col[b2]; });
                                 auto & dst = lr.positions[p0 + q];
                                 for (int i = 0; i < k && idx[i] < n_real; ++i) {
-                                    dst.emplace_back(llama_vocab_get_text(vocab, idx[i]), col[idx[i]]);
+                                    dst.emplace_back(piece_of(idx[i]), col[idx[i]]);
                                 }
                             }
                         });

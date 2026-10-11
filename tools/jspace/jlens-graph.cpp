@@ -16,12 +16,18 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x, ggml_tens
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
 }
 
-// one GLM-4 dense block: post-norm attention + swiglu MLP with residuals
+// one GLM-4 dense block: post-norm attention + swiglu MLP with residuals.
+// dt_src mode: instead of the raw detach sources, emits the FINAL detached leaf
+// values computed in-graph (rms_inv = 1/sqrt(mean(x^2)+eps), sigmoid(gate),
+// silu(gate), up) so the LRP graph's leaf inputs can alias them directly —
+// no separate leaf buffers, no host roundtrip. dt_one/dt_eps are [1] f32
+// constant leaves (1.0, norm_eps) supplied by the caller.
 static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int il, int n_tokens,
                                ggml_tensor * inpL, ggml_tensor * pos, ggml_tensor * mask,
                                bool use_flash_attn,
                                jlens_lrp_leaves * lrp = nullptr,
-                               std::vector<ggml_tensor *> * dt_src = nullptr) {
+                               std::vector<ggml_tensor *> * dt_src = nullptr,
+                               ggml_tensor * dt_one = nullptr, ggml_tensor * dt_eps = nullptr) {
     const auto & hp = m.hparams;
     const int64_t n_embd      = hp.n_embd;
     const int64_t n_head      = hp.n_head;
@@ -33,15 +39,17 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
     ggml_tensor * inpSA = inpL;
 
     // rms-norm site k. LRP mode applies the LN-rule (detached denominator) by
-    // construction; dt_src mode records the norm input for harvesting.
+    // construction; dt_src mode emits the detached rms_inv for harvesting.
     int n_norm_site = 0;
     auto norm_site = [&](ggml_tensor * x, ggml_tensor * w) {
         if (dt_src) {
+            ggml_tensor * ri = ggml_div(ctx, dt_one,
+                ggml_sqrt(ctx, ggml_add(ctx, ggml_mean(ctx, ggml_sqr(ctx, x)), dt_eps)));
             char name[64];
-            snprintf(name, sizeof(name), "jlens_dt_%d_rms_%d", il, n_norm_site);
-            ggml_set_name(x, name);
-            ggml_set_output(x);
-            dt_src->push_back(x);
+            snprintf(name, sizeof(name), "jlens_dt_%d_rmsinv_%d", il, n_norm_site);
+            ggml_set_name(ri, name);
+            ggml_set_output(ri);
+            dt_src->push_back(ri);
         }
         ggml_tensor * y;
         if (lrp) {
@@ -134,8 +142,12 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
                                     up_out->nb[1], n_ff * up_out->nb[0]));
     if (dt_src) {
         char name[64];
-        snprintf(name, sizeof(name), "jlens_dt_%d_gate", il);
-        ggml_set_name(gate, name); ggml_set_output(gate); dt_src->push_back(gate);
+        snprintf(name, sizeof(name), "jlens_dt_%d_sig", il);
+        ggml_tensor * sg = ggml_sigmoid(ctx, gate);
+        ggml_set_name(sg, name); ggml_set_output(sg); dt_src->push_back(sg);
+        snprintf(name, sizeof(name), "jlens_dt_%d_silu", il);
+        ggml_tensor * sl = ggml_silu(ctx, gate);
+        ggml_set_name(sl, name); ggml_set_output(sl); dt_src->push_back(sl);
         snprintf(name, sizeof(name), "jlens_dt_%d_up", il);
         ggml_set_name(up, name);   ggml_set_output(up);   dt_src->push_back(up);
     }
@@ -306,12 +318,16 @@ ggml_cgraph * jlens_build_head(const jlens_weights & m, ggml_context * gctx, ggm
     return gf;
 }
 
-// phase 1: ordinary forward with detach sources named + marked as outputs
-bool jlens_build_forward_dt(const jlens_weights & m, int n_tokens, jlens_forward & out) {
+// phase 1: ordinary forward with in-graph detach transforms named + marked as
+// outputs: jlens_dt_<il>_rmsinv_<k> [1, n_tokens], jlens_dt_<il>_sig /
+// jlens_dt_<il>_silu / jlens_dt_<il>_up [n_ff, n_tokens].
+// dt_one/dt_eps: [1] f32 constant leaves (1.0, norm_eps) owned by the caller.
+bool jlens_build_forward_dt(const jlens_weights & m, int n_tokens, jlens_forward & out,
+                            ggml_tensor * dt_one, ggml_tensor * dt_eps) {
     const auto & hp = m.hparams;
 
-    const int    gsize    = hp.n_layer * 64;
-    const int    n_tensors= hp.n_layer * 72;
+    const int    gsize    = hp.n_layer * 96;   // in-graph transforms add ~22 nodes/layer
+    const int    n_tensors= hp.n_layer * 96;
     const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, false);
     struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
     out.gctx = ggml_init(iparams);
@@ -338,12 +354,20 @@ bool jlens_build_forward_dt(const jlens_weights & m, int n_tokens, jlens_forward
     out.l_out.resize(hp.n_layer, nullptr);
 
     for (int il = 0; il < hp.n_layer; ++il) {
+        const size_t dt_before = dt_src.size();
         ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask,
-                                      /*use_flash_attn=*/false, /*lrp=*/nullptr, &dt_src);
+                                      /*use_flash_attn=*/false, /*lrp=*/nullptr, &dt_src,
+                                      dt_one, dt_eps);
+        // dt outputs are side branches (not ancestors of the forward), so they
+        // must be explicitly expanded into the graph
+        for (size_t i = dt_before; i < dt_src.size(); ++i) {
+            ggml_build_forward_expand(out.gf, dt_src[i]);
+        }
         char name[64];
         snprintf(name, sizeof(name), "jlens_l_out_%d", il);
         ggml_set_name(cur, name);
         ggml_build_forward_expand(out.gf, cur);
+        if (il == 0) ggml_set_output(cur); // pinned for the fitter's dt self-check
         out.l_out[il] = cur;
         inpL = cur;
     }
