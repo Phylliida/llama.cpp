@@ -1899,8 +1899,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // a deferred split is launched after the next split (on another backend) has copied its inputs,
         // so it can run while that split computes. Nothing may run on its backend in between.
+        // its own inputs are copied in order: the next split may reuse their (host) memory
         if (defer_enabled && !sched->callback_eval && split->deferred && deferred_id < 0 && split_id + 1 < sched->n_splits &&
                 splits[split_id + 1].backend_id != split->backend_id) {
+            copy_inputs(split_id);
             deferred_id = split_id;
             continue;
         }
@@ -1910,7 +1912,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (deferred_id >= 0) {
             const int cur_prev = prev_backend_id;
             prev_backend_id = splits[deferred_id].backend_id;
-            copy_inputs(deferred_id);
             enum ggml_status ec = compute(deferred_id);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
