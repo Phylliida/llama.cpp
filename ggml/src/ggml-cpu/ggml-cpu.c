@@ -1474,6 +1474,24 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// one weight row against up to 4 src1 columns, decoding the row once (MUL_MAT_ID experts with several tokens,
+// e.g. speculative verify). GGML_MMID_MULTI=0 disables
+typedef void (*ggml_vec_dot_multi_t)(int n, float * s, const void * x, const void * const * y, int ny);
+
+static ggml_vec_dot_multi_t ggml_get_vec_dot_multi(enum ggml_type type) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_MMID_MULTI") == NULL || atoi(getenv("GGML_MMID_MULTI")) != 0;
+    }
+#ifdef GGML_VEC_DOT_IQ2_XS_MULTI
+    if (enabled && type == GGML_TYPE_IQ2_XS) {
+        return ggml_vec_dot_iq2_xs_q8_K_multi;
+    }
+#endif
+    GGML_UNUSED(type);
+    return NULL;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1496,6 +1514,33 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    // several tokens on this expert: decode each weight row once for up to 4 of them
+    ggml_vec_dot_multi_t const vec_dot_multi = ggml_get_vec_dot_multi(type);
+    if (vec_dot_multi && ir1_end - ir1_start >= 2) {
+        for (int64_t g0 = ir1_start; g0 < ir1_end; g0 += 4) {
+            const int ny = (int) MIN(4, ir1_end - g0);
+            const void * cols[4];
+            float * dcols[4];
+            for (int t = 0; t < ny; ++t) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, g0 + t);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[t]  = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dcols[t] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float s[4];
+                vec_dot_multi(ne00, s, src0_cur + ir0*nb01, cols, ny);
+                for (int t = 0; t < ny; ++t) {
+                    dcols[t][ir0] = s[t];
+                }
+            }
+        }
+        return;
+    }
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -3411,6 +3456,7 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+    ggml_vec_dot_multi_t const vec_dot_multi = ggml_get_vec_dot_multi(type);
 
     const int  n_ids     = ids->ne[0];
     const int  n_as      = ne02;
@@ -3513,6 +3559,44 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
         const int64_t ir1   = MIN(ir0 + CHUNK_ROWS, ne01);
         const char * g0 = (const char *) src0g->data + cur_a*src0g->nb[2];
         const char * u0 = (const char *) src0u->data + cur_a*src0u->nb[2];
+
+        // several tokens on this expert: decode each gate/up row once for up to 4 of them
+        const int64_t cnt = matrix_row_counts[cur_a];
+        if (vec_dot_multi && cnt >= 2) {
+            for (int64_t r0 = 0; r0 < cnt; r0 += 4) {
+                const int ny = (int) MIN(4, cnt - r0);
+                const void * cols[4];
+                float * dcols[4];
+                for (int t = 0; t < ny; ++t) {
+                    const struct mmid_row_mapping m = MMID_MATRIX_ROW(cur_a, r0 + t);
+                    const int64_t i11 = m.i1 % ne11;
+                    const int64_t i12 = m.i2;
+                    cols[t]  = wdata + (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                    dcols[t] = (float *) ((char *) dst->data + m.i1*dst->nb[1] + i12*dst->nb[2]);
+                }
+                for (int64_t iir0 = ir0; iir0 < ir1; iir0 += 16) {
+                    const int n = (int) MIN(16, ir1 - iir0);
+                    float tg[4][16];
+                    float tu[4][16];
+                    for (int k = 0; k < n; ++k) {
+                        float sg[4];
+                        float su[4];
+                        vec_dot_multi(ne00, sg, g0 + (iir0 + k)*src0g->nb[1], cols, ny);
+                        vec_dot_multi(ne00, su, u0 + (iir0 + k)*src0u->nb[1], cols, ny);
+                        for (int t = 0; t < ny; ++t) {
+                            tg[t][k] = sg[t];
+                            tu[t][k] = su[t];
+                        }
+                    }
+                    for (int t = 0; t < ny; ++t) {
+                        ggml_vec_situ_f32(n, dcols[t] + iir0, tg[t], tu[t], beta, lb);
+                    }
+                }
+            }
+            continue;
+        }
 
         for (int64_t r = 0; r < matrix_row_counts[cur_a]; ++r) {
             const struct mmid_row_mapping m = MMID_MATRIX_ROW(cur_a, r);

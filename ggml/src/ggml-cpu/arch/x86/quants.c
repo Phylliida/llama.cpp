@@ -3074,6 +3074,100 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+#if defined(__AVX2__)
+// the grid lookup, sign mask and scale shuffles are shared by the ny vectors; per vector each 32 quants cost
+// psignb + maddubs + madd + add. Integer sums are exact and the float order matches the one-vector kernel.
+static inline __attribute__((always_inline)) void ggml_vec_dot_iq2_xs_q8_K_ny(int n, float * GGML_RESTRICT s,
+        const block_iq2_xs * GGML_RESTRICT x, const block_q8_K * const * y, const int ny) {
+    static const char block_sign_shuffle_mask_1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    };
+    static const char block_sign_shuffle_mask_2[32] = {
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+    };
+    static const uint8_t bit_selector_mask_bytes[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    static const uint8_t k_bit_helper[32] = {
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+    };
+    const __m256i mone                 = _mm256_set1_epi8(1);
+    const __m256i bit_selector_mask    = _mm256_loadu_si256((const __m256i*)bit_selector_mask_bytes);
+    const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_1);
+    const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_2);
+    const __m256i bit_helper           = _mm256_loadu_si256((const __m256i*)k_bit_helper);
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m128i m1 = _mm_set1_epi8(1);
+    const __m128i scale_even_odd = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+
+    const int nb = n / QK_K;
+
+    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+    for (int i = 0; i < nb; ++i) {
+        uint64_t aux64;
+        memcpy(&aux64, x[i].scales, 8);
+        __m128i stmp = _mm_set1_epi64x(aux64);
+        stmp = _mm_unpacklo_epi8(_mm_and_si128(stmp, m4), _mm_and_si128(_mm_srli_epi16(stmp, 4), m4));
+        const __m128i scales = _mm_add_epi8(_mm_slli_epi16(stmp, 1), m1);
+        const __m256i scales_eo = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_even_odd));
+
+        __m256i sumi[4] = { _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256() };
+        const uint16_t * GGML_RESTRICT q2 = x[i].qs;
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2);
+            const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
+            const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
+            const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
+            const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
+            const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
+            const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
+            const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
+            const __m256i full_signs[2] = { MM256_SET_M128I(full_signs_l, full_signs_l), MM256_SET_M128I(full_signs_h, full_signs_h) };
+
+            for (int k = 0; k < 4; ++k) {
+                const uint16_t * GGML_RESTRICT q = q2 + 4*k;
+                const __m256i grid = _mm256_set_epi64x(iq2xs_grid[q[3] & 511], iq2xs_grid[q[2] & 511],
+                                                       iq2xs_grid[q[1] & 511], iq2xs_grid[q[0] & 511]);
+                __m256i signs = _mm256_shuffle_epi8(full_signs[k >> 1], (k & 1) ? block_sign_shuffle_2 : block_sign_shuffle_1);
+                signs = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask), mone);
+                const __m256i sc = _mm256_shuffle_epi8(scales_eo, get_scale_shuffle_k4(ib32 + k));
+                for (int t = 0; t < ny; ++t) {
+                    const __m256i q8  = _mm256_loadu_si256((const __m256i *) (y[t][i].qs + 32*(ib32 + k)));
+                    const __m256i dot = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8, signs));
+                    sumi[t] = _mm256_add_epi32(sumi[t], _mm256_madd_epi16(dot, sc));
+                }
+            }
+            q2 += 16;
+        }
+
+        const float dx = GGML_CPU_FP16_TO_FP32(x[i].d);
+        for (int t = 0; t < ny; ++t) {
+            acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+        }
+    }
+    for (int t = 0; t < ny; ++t) {
+        s[t] = 0.125f * hsum_float_8(acc[t]);
+    }
+}
+
+void ggml_vec_dot_iq2_xs_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+    assert(n % QK_K == 0);
+    const block_iq2_xs * GGML_RESTRICT x = vx;
+    const block_q8_K * const * y = (const block_q8_K * const *) vy;
+    switch (ny) {
+        case 1:  ggml_vec_dot_iq2_xs_q8_K(n, s, 0, vx, 0, vy[0], 0, 1); break;
+        case 2:  ggml_vec_dot_iq2_xs_q8_K_ny(n, s, x, y, 2); break;
+        case 3:  ggml_vec_dot_iq2_xs_q8_K_ny(n, s, x, y, 3); break;
+        case 4:  ggml_vec_dot_iq2_xs_q8_K_ny(n, s, x, y, 4); break;
+        default: GGML_ABORT("ny must be 1..4");
+    }
+}
+#endif
+
 void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);

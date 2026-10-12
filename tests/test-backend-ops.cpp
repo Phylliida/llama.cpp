@@ -10238,6 +10238,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 64, 16, 384, n, 512, mode, true));
             }
         }
+        // few experts, 3-4 tokens: most experts serve several tokens (multi-token CPU kernel)
+        for (int n : {3, 4}) {
+            test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 8, 4, 384, n, 512, 0));
+            test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 8, 4, 384, n, 512, 0, true));
+        }
+    }
+    // pooled decode MUL_MAT_ID with experts shared by 2-4 tokens
+    for (int n : {2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 8, 4, false, 512, n, 256));
     }
 
 #if 0
