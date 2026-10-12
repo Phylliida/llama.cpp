@@ -2164,11 +2164,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (the experts are then not read at all), LLAMA_MOE_SKIP_RENORM=0 keeps the remaining weights as they are
     static const float skip_tau    = getenv("LLAMA_MOE_SKIP") ? (float) atof(getenv("LLAMA_MOE_SKIP")) : 0.0f;
     static const bool  skip_renorm = !getenv("LLAMA_MOE_SKIP_RENORM") || atoi(getenv("LLAMA_MOE_SKIP_RENORM")) != 0;
+    // LLAMA_MOE_SKIP_UNION=1: in a batch (e.g. speculative verify) an expert another token also selected is read
+    // anyway, so only skip the low-weight experts no other token of the batch needs
+    static const bool  skip_union  = getenv("LLAMA_MOE_SKIP_UNION") && atoi(getenv("LLAMA_MOE_SKIP_UNION")) != 0;
     ggml_tensor * skip_w = nullptr;
     if (skip_tau > 0.0f && norm_w && !weight_before_ffn) {
         ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
         ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -skip_tau));
+        if (skip_union && n_tokens > 1) {
+            // tokens per expert: scatter a one-hot selection mask [1, n_expert, n_tokens] and sum over tokens
+            ggml_tensor * ones = ggml_fill(ctx0, weights, 1.0f);                                  // [1, n_used, n_tokens]
+            ggml_tensor * sel  = ggml_fill(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), 0.0f);
+            sel = ggml_set_rows(ctx0, sel, ones, selected_experts);
+            ggml_tensor * cnt = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0,
+                                    ggml_reshape_2d(ctx0, sel, n_expert, n_tokens))));             // [1, n_expert]
+            cnt = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cnt, 1, n_expert),
+                    ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens));  // [1, n_used*n_tokens]
+            ggml_tensor * shared = ggml_step(ctx0, ggml_scale_bias(ctx0, cnt, 1.0f, -1.5f));
+            keep = ggml_clamp(ctx0, ggml_add(ctx0, keep, ggml_reshape_2d(ctx0, shared, n_expert_used, n_tokens)), 0.0f, 1.0f);
+            cb(keep, "ffn_moe_keep_union", il);
+        }
         w2 = ggml_mul(ctx0, w2, keep);
         if (skip_renorm) {
             ggml_tensor * w_sum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2), 6.103515625e-5, INFINITY);

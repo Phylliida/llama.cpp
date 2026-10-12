@@ -1590,6 +1590,8 @@ static inline bool ggml_mmid_slot_skipped(const struct ggml_tensor * w, int id, 
 // TEMP: routed slots seen / skipped by the down projections (printed with GGML_CPU_OP_PROFILE)
 static int64_t g_mmid_slots_total;
 static int64_t g_mmid_slots_skipped;
+static int64_t g_mmid_calls;     // down projections seen, and the experts they read (batch union)
+static int64_t g_mmid_experts;
 
 // GGML_MMID_DYN=0 disables the pooled decode path in mul_mat_id (A/B testing)
 static bool ggml_mmid_dynamic_enabled(void) {
@@ -1966,6 +1968,12 @@ static void ggml_compute_forward_mul_mat_id(
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+        if (count_slots) {
+            g_mmid_calls++;
+            for (int a = 0; a < n_as; ++a) {
+                g_mmid_experts += matrix_row_counts[a] > 0;
             }
         }
     }
@@ -3693,6 +3701,8 @@ static void ggml_cpu_prof_print(void) {
         fprintf(stderr, "cpu-prof: moe down slots %lld, skipped %lld (%.1f%%, %.2f of 16 kept)\n",
                 (long long) g_mmid_slots_total, (long long) g_mmid_slots_skipped,
                 100.0*g_mmid_slots_skipped/g_mmid_slots_total, 16.0*(1.0 - (double) g_mmid_slots_skipped/g_mmid_slots_total));
+        fprintf(stderr, "cpu-prof: moe down calls %lld, experts read per call %.2f\n",
+                (long long) g_mmid_calls, g_mmid_calls ? (double) g_mmid_experts/g_mmid_calls : 0.0);
     }
     for (int i = 0; i < GGML_OP_COUNT + 2; ++i) {
         if (g_cpu_prof_n[i] == 0) continue;
