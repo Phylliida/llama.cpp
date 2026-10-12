@@ -125,6 +125,14 @@ extern "C" {
 
     GGML_BACKEND_API void ggml_cpu_init(void);
 
+    // MoE decode prefetch: reads the rows of the given experts of the expert tensors as[0..n_as) into the caches
+    // of the thread group (L3 domain) that will compute them. The next pooled MUL_MAT_IDs on these tensors run
+    // those experts first, each row chunk on the group that read it. Call from a custom op on all threads.
+    // Groups are GGML_CPU_L3_GROUPS (default 8) runs of consecutive ith, so threads must be pinned in order
+    // (e.g. OMP_PLACES=cores OMP_PROC_BIND=close)
+    GGML_BACKEND_API void ggml_cpu_moe_prefetch(const struct ggml_tensor * const * as, int n_as,
+                                                const int32_t * experts, int n_experts, int ith, int nth);
+
     //
     // CPU backend
     //

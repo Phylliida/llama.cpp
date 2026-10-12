@@ -182,6 +182,78 @@ static ggml_tensor * kimi_k3_situ(ggml_context * ctx0, ggml_tensor * gate, ggml_
     return ggml_situ_split(ctx0, gate, up, beta, linear_beta);
 }
 
+// TEMP experiment: LLAMA_K3_PRED_DUMP=<file> appends router selection scores (sigmoid(logits) + bias) from a
+// CPU custom op: int32 tag, layer, n_expert, n_tokens, then n_tokens x n_expert floats. tag 0 = actual,
+// 1 = predicted from the pre-attention stream through the ffn-side mix, 2 = from the attention input
+static const char * k3_pred_dump_path() {
+    static const char * path = getenv("LLAMA_K3_PRED_DUMP");
+    return path;
+}
+
+static void k3_pred_dump_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    static FILE * f = fopen(k3_pred_dump_path(), "ab");
+    const int32_t hdr[4] = { (int32_t) ((intptr_t) ud / 1000), (int32_t) ((intptr_t) ud % 1000),
+                             (int32_t) a->ne[0], (int32_t) a->ne[1] };
+    fwrite(hdr, sizeof(hdr), 1, f);
+    for (int64_t t = 0; t < a->ne[1]; ++t) {
+        fwrite((const char *) a->data + t*a->nb[1], sizeof(float), a->ne[0], f);
+    }
+    fflush(f);
+}
+
+static void k3_pred_dump(ggml_context * ctx0, ggml_cgraph * gf, ggml_tensor * logits, ggml_tensor * probs_b,
+                         int tag, int il) {
+    ggml_tensor * s = ggml_add(ctx0, ggml_sigmoid(ctx0, logits), probs_b);
+    ggml_build_forward_expand(gf, ggml_map_custom1(ctx0, s, k3_pred_dump_op, 1, (void *) (intptr_t) (tag*1000 + il)));
+}
+
+// expert prefetch during attention (decode, LLAMA_MOE_PREFETCH=<n experts>): the layer's router is run on the
+// pre-attention stream on the GPU, attention is deferred, and a CPU op reads the predicted experts into the L3
+// of the cores that will compute them while the GPU runs attention (see ggml_cpu_moe_prefetch)
+struct k3_moe_pf_cfg {
+    int n;      // experts to prefetch per layer
+    int banked; // also on the layers that restart the residual stream (poorly predicted)
+    int gpu_k;  // the GPU share takes the first gpu_k predicted ids < gpu_e1: not prefetched
+    int gpu_e1;
+};
+
+static const k3_moe_pf_cfg & k3_moe_pf(int n_expert) {
+    static k3_moe_pf_cfg cfg = [n_expert] {
+        k3_moe_pf_cfg c;
+        const float frac = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
+        c.n      = getenv("LLAMA_MOE_PREFETCH") ? atoi(getenv("LLAMA_MOE_PREFETCH")) : 0;
+        c.banked = getenv("LLAMA_MOE_PREFETCH_BANKED") ? atoi(getenv("LLAMA_MOE_PREFETCH_BANKED")) : 0;
+        c.gpu_k  = frac > 0.0f ? (getenv("LLAMA_MOE_GPU_K") ? atoi(getenv("LLAMA_MOE_GPU_K")) : 3) : 0;
+        c.gpu_e1 = (int) (frac * n_expert);
+        return c;
+    }();
+    return cfg;
+}
+
+static void k3_moe_prefetch_op(ggml_tensor * dst, int ith, int nth, void * ud) {
+    const k3_moe_pf_cfg * cfg = (const k3_moe_pf_cfg *) ud;
+    const ggml_tensor * ids = dst->src[0]; // predicted top-k, descending
+
+    int32_t sel[32];
+    int n_sel = 0;
+    int n_gpu = 0;
+    for (int64_t i = 0; i < ids->ne[0] && n_sel < std::min(cfg->n, 32); ++i) {
+        const int32_t e = ((const int32_t *) ids->data)[i];
+        if (n_gpu < cfg->gpu_k && e < cfg->gpu_e1) {
+            n_gpu++;
+            continue;
+        }
+        sel[n_sel++] = e;
+    }
+    const ggml_tensor * as[3] = { dst->src[1], dst->src[2], dst->src[3] };
+    ggml_cpu_moe_prefetch(as, 3, sel, n_sel, ith, nth);
+}
+
 //
 // cross-layer residual attention
 //
@@ -274,6 +346,30 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         // what draft models (DFlash) are trained on as "the output of layer il-1"
         res->t_layer_inp[il] = cur;
 
+        if (k3_pred_dump_path() && use_attn_res && layer.ffn_gate_inp) {
+            for (int tag : {1, 2}) {
+                ggml_tensor * x = tag == 1 ? res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il) : cur;
+                x = build_norm(x, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+                k3_pred_dump(ctx0, gf, ggml_mul_mat(ctx0, layer.ffn_gate_inp, x), layer.ffn_exp_probs_b, tag, il);
+            }
+        }
+
+        // expert prefetch: predicted ids before attention (the stack is still the one the ffn-side mix will see)
+        const k3_moe_pf_cfg & pf_cfg = k3_moe_pf(hparams.n_expert);
+        ggml_tensor * pf_ids = nullptr;
+        if (pf_cfg.n > 0 && n_tokens == 1 && use_attn_res && layer.ffn_gate_inp && layer.ffn_up_exps &&
+                layer.ffn_gate_exps && layer.ffn_down_exps && layer.ffn_up_exps->buffer &&
+                ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer) &&
+                (pf_cfg.banked || (uint32_t) il % res_bs != 0)) {
+            ggml_tensor * x = res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il);
+            x = build_norm(x, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+            x = ggml_add(ctx0, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.ffn_gate_inp, x)), layer.ffn_exp_probs_b);
+            pf_ids = ggml_top_k(ctx0, x, hparams.n_expert_used());
+            cb(pf_ids, "ffn_moe_pf_ids", il);
+            ggml_build_forward_expand(gf, pf_ids);
+        }
+        const int pf_node0 = ggml_graph_n_nodes(gf);
+
         bool banked = false;
         if (use_attn_res && (uint32_t) il % res_bs == 0) {
             res_push(prefix_sum, n_embd, n_tokens);  // banks the RAW layer input, not `cur`
@@ -291,6 +387,19 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
             cur = build_mla_layer(cur, layer, inp_attn_k, inp_attn_kv,
                                   n_embd_head_k_mla, n_embd_head_v_mla, kv_lora_rank,
                                   n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
+        }
+
+        // defer the attention split so that it runs on the GPU while the CPU split below prefetches
+        if (pf_ids) {
+            ggml_build_forward_expand(gf, cur);
+            for (int i = pf_node0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_graph_node(gf, i)->flags |= GGML_TENSOR_FLAG_DEFER;
+            }
+            ggml_tensor * args[4] = { pf_ids, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            ggml_tensor * pf = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, args, 4, k3_moe_prefetch_op,
+                                              GGML_N_TASKS_MAX, const_cast<k3_moe_pf_cfg *>(&pf_cfg));
+            cb(pf, "ffn_moe_prefetch", il);
+            ggml_build_forward_expand(gf, pf);
         }
 
         prefix_sum = banked ? cur : ggml_add(ctx0, prefix_sum, cur);
@@ -643,6 +752,9 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     // so the logits are computed here and passed to build_moe_ffn
     ggml_tensor * logits = ggml_mul_mat(ctx0, layer.ffn_gate_inp, identity);
     cb(logits, "ffn_moe_logits", il);
+    if (k3_pred_dump_path()) {
+        k3_pred_dump(ctx0, gf, logits, layer.ffn_exp_probs_b, 0, il);
+    }
 
     // keep the latent projection before the deferred shared expert, so that split is followed by the experts
     ggml_build_forward_expand(gf, routed_in);

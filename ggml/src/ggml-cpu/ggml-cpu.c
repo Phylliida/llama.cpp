@@ -1567,6 +1567,174 @@ static int ggml_mmid_chunk_rows(void) {
     return rows;
 }
 
+// MoE decode prefetch (ggml_cpu_moe_prefetch): row chunk j of expert e belongs to thread group (j + e) % n_groups,
+// both when it is prefetched and when the pooled MUL_MAT_ID computes it
+enum { GGML_MOE_PF_MAX = 32, GGML_MOE_PF_GROUPS_MAX = 16, GGML_MOE_PF_ITEMS = 2048 };
+
+static int ggml_moe_pf_groups(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char * env = getenv("GGML_CPU_L3_GROUPS");
+        n = env ? atoi(env) : 8;
+        n = MAX(1, MIN(n, GGML_MOE_PF_GROUPS_MAX));
+    }
+    return n;
+}
+
+// experts read by the last prefetch, and the expert tensors they belong to
+static struct {
+    const void * data[3];
+    int32_t      experts[GGML_MOE_PF_MAX];
+    int          n;
+} g_moe_pf;
+
+static atomic_uint_fast64_t g_moe_pf_sink;
+
+void ggml_cpu_moe_prefetch(const struct ggml_tensor * const * as, int n_as, const int32_t * experts, int n_experts,
+                           int ith, int nth) {
+    const int n_groups = ggml_moe_pf_groups();
+    n_experts = MIN(n_experts, GGML_MOE_PF_MAX);
+    n_as      = MIN(n_as, 3);
+
+    // read only by later ops (after a barrier)
+    if (ith == 0) {
+        for (int k = 0; k < 3; ++k) {
+            g_moe_pf.data[k] = k < n_as ? as[k]->data : NULL;
+        }
+        memcpy(g_moe_pf.experts, experts, n_experts*sizeof(int32_t));
+        g_moe_pf.n = nth % n_groups == 0 ? n_experts : 0;
+    }
+    static int do_read = -1;
+    if (do_read < 0) {
+        do_read = getenv("GGML_MOE_PF_READ") == NULL || atoi(getenv("GGML_MOE_PF_READ")) != 0;
+    }
+    if (nth % n_groups != 0 || !do_read) {
+        return;
+    }
+
+    const int     gsize = nth / n_groups;
+    const int     grp   = ith / gsize;
+    const int     lane  = ith % gsize;
+    const int64_t CR    = ggml_mmid_chunk_rows();
+
+    // one load per cache line brings it into this core's L2, from where it is evicted into the group's L3
+    uint64_t acc = 0;
+    for (int i = 0; i < n_experts; ++i) {
+        const int e = experts[i];
+        for (int k = 0; k < n_as; ++k) {
+            const struct ggml_tensor * t = as[k];
+            const int nch = (int) ((t->ne[1] + CR - 1) / CR);
+            for (int j = ((grp - e) % n_groups + n_groups) % n_groups; j < nch; j += n_groups) {
+                const char * p     = (const char *) t->data + e*t->nb[2] + j*CR*t->nb[1];
+                const size_t bytes = MIN(CR, t->ne[1] - j*CR) * t->nb[1];
+                const size_t per   = ((bytes + gsize - 1)/gsize + 63) & ~(size_t) 63;
+                const size_t b1    = MIN(bytes, (lane + 1)*per);
+                for (size_t o = MIN(bytes, lane*per); o < b1; o += 64) {
+                    uint64_t v;
+                    memcpy(&v, p + o, sizeof(v));
+                    acc ^= v;
+                }
+            }
+        }
+    }
+    atomic_fetch_xor_explicit(&g_moe_pf_sink, acc, memory_order_relaxed);
+}
+
+// pooled decode MUL_MAT_ID after a prefetch: items (expert*nchunk0 + chunk) of the prefetched experts are taken
+// first by the group that read them, then the other experts from a shared pool, then other groups' leftovers.
+// counters: ctr[0] = shared pool, ctr[1 + g] = group g, all starting at nth
+typedef struct {
+    int32_t pf[GGML_MOE_PF_ITEMS];
+    int     off[GGML_MOE_PF_GROUPS_MAX + 1];
+    int32_t np[256];
+    int     n_np;
+    int     nchunk0, n_groups, grp, nth;
+    int     phase, g;
+} ggml_mmid_pf_iter;
+
+static bool ggml_mmid_pf_init(ggml_mmid_pf_iter * it, const struct ggml_tensor * src0, const int32_t * active,
+                              int n_active, int nchunk0, int ith, int nth) {
+    const int n_groups = ggml_moe_pf_groups();
+    if (g_moe_pf.n == 0 || nth % n_groups != 0 || n_active > 256 || src0->data == NULL ||
+            (src0->data != g_moe_pf.data[0] && src0->data != g_moe_pf.data[1] && src0->data != g_moe_pf.data[2])) {
+        return false;
+    }
+
+    int cnt[GGML_MOE_PF_GROUPS_MAX] = { 0 };
+    int n_pf = 0;
+    it->n_np = 0;
+    for (int i = 0; i < n_active; ++i) {
+        bool pf = false;
+        for (int k = 0; k < g_moe_pf.n; ++k) {
+            pf = pf || g_moe_pf.experts[k] == active[i];
+        }
+        if (!pf) {
+            it->np[it->n_np++] = active[i];
+            continue;
+        }
+        for (int j = 0; j < nchunk0; ++j) {
+            cnt[(j + active[i]) % n_groups]++;
+        }
+        n_pf += nchunk0;
+    }
+    if (n_pf > GGML_MOE_PF_ITEMS) {
+        return false;
+    }
+
+    it->off[0] = 0;
+    for (int g = 0; g < n_groups; ++g) {
+        it->off[g + 1] = it->off[g] + cnt[g];
+        cnt[g] = it->off[g];
+    }
+    for (int i = 0; i < n_active; ++i) {
+        for (int k = 0; k < g_moe_pf.n; ++k) {
+            if (g_moe_pf.experts[k] == active[i]) {
+                for (int j = 0; j < nchunk0; ++j) {
+                    it->pf[cnt[(j + active[i]) % n_groups]++] = active[i]*nchunk0 + j;
+                }
+                break;
+            }
+        }
+    }
+
+    it->nchunk0  = nchunk0;
+    it->n_groups = n_groups;
+    it->grp      = ith / (nth / n_groups);
+    it->nth      = nth;
+    it->phase    = 0;
+    it->g        = it->grp;
+    return true;
+}
+
+static bool ggml_mmid_pf_next(ggml_mmid_pf_iter * it, char (*ctr)[CACHE_LINE_SIZE], int * item) {
+    for (;;) {
+        if (it->phase == 1) {
+            const int k = atomic_fetch_add_explicit((atomic_int *) ctr[0], 1, memory_order_relaxed) - it->nth;
+            if (k < it->n_np*it->nchunk0) {
+                *item = it->np[k / it->nchunk0]*it->nchunk0 + k % it->nchunk0;
+                return true;
+            }
+            it->phase = 2;
+            it->g     = (it->grp + 1) % it->n_groups;
+            continue;
+        }
+        if (it->phase == 2 && it->g == it->grp) {
+            return false;
+        }
+        const int g = it->g;
+        const int k = atomic_fetch_add_explicit((atomic_int *) ctr[1 + g], 1, memory_order_relaxed) - it->nth;
+        if (k < it->off[g + 1] - it->off[g]) {
+            *item = it->pf[it->off[g] + k];
+            return true;
+        }
+        if (it->phase == 0) {
+            it->phase = 1;
+        } else {
+            it->g = (g + 1) % it->n_groups;
+        }
+    }
+}
+
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
     void * ptr = *p;
@@ -1783,6 +1951,22 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t row_size  = ggml_row_size(vec_dot_type, ne10);
         const int    nchunk0   = (int) ((ne01 + CHUNK_ROWS - 1) / CHUNK_ROWS);
         const int    n_items   = n_active * nchunk0;
+        // after ggml_cpu_moe_prefetch: counters 0..n_groups were set to nth above as well
+        ggml_mmid_pf_iter pf_it;
+        if (n_as > GGML_MOE_PF_GROUPS_MAX && ggml_mmid_pf_init(&pf_it, src0, active, n_active, nchunk0, ith, nth)) {
+            int item;
+            while (ggml_mmid_pf_next(&pf_it, atomic_current_chunk, &item)) {
+                const int     cur_a     = item / nchunk0;
+                const int64_t ir0_start = (int64_t) (item % nchunk0) * CHUNK_ROWS;
+                const int64_t ir0_end   = MIN(ir0_start + CHUNK_ROWS, ne01);
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, cur_a,
+                    ir0_start, ir0_end, 0, matrix_row_counts[cur_a],
+                    (const char *) src0->data + cur_a * nb02, matrix_rows, row_size, src1_cont, wdata);
+            }
+            return;
+        }
+
         // reuse expert 0's counter: it was set to nth above and the per-expert path is skipped
         atomic_int * ctr = (atomic_int *) (atomic_current_chunk + 0);
 
@@ -3291,7 +3475,10 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                 matrix_row_counts[i02] += 1;
             }
         }
-        atomic_store_explicit((atomic_int *) (atomic_current_chunk + 0), nth, memory_order_relaxed);
+        // 0: shared pool, 1..: prefetch groups (ggml_mmid_pf_iter)
+        for (int c = 0; c <= GGML_MOE_PF_GROUPS_MAX && c < n_as; ++c) {
+            atomic_store_explicit((atomic_int *) (atomic_current_chunk + c), nth, memory_order_relaxed);
+        }
     }
 
     ggml_barrier(params->threadpool);
@@ -3313,8 +3500,15 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     const float  lb       = ggml_get_op_params_f32(dst, 3);
     atomic_int * ctr      = (atomic_int *) (atomic_current_chunk + 0);
 
-    for (int item = ith; item < n_items; item = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed)) {
-        const int     cur_a = active[item / nchunk0];
+    // after ggml_cpu_moe_prefetch, items come from ggml_mmid_pf_next and encode the expert id itself
+    ggml_mmid_pf_iter pf_it;
+    const bool use_pf = n_as > GGML_MOE_PF_GROUPS_MAX && ggml_mmid_pf_init(&pf_it, src0g, active, n_active, nchunk0, ith, nth);
+
+    for (int item = ith; ; item = use_pf ? item : atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed)) {
+        if (use_pf ? !ggml_mmid_pf_next(&pf_it, atomic_current_chunk, &item) : item >= n_items) {
+            break;
+        }
+        const int     cur_a = use_pf ? item / nchunk0 : active[item / nchunk0];
         const int64_t ir0   = (int64_t) (item % nchunk0) * CHUNK_ROWS;
         const int64_t ir1   = MIN(ir0 + CHUNK_ROWS, ne01);
         const char * g0 = (const char *) src0g->data + cur_a*src0g->nb[2];
