@@ -2160,7 +2160,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
-    if (w_scale != 0.0f && w_scale != 1.0f) {
+    // adaptive expert count: LLAMA_MOE_SKIP=tau drops the selected experts whose normalized weight is <= tau
+    // (the experts are then not read at all), LLAMA_MOE_SKIP_RENORM=0 keeps the remaining weights as they are
+    static const float skip_tau    = getenv("LLAMA_MOE_SKIP") ? (float) atof(getenv("LLAMA_MOE_SKIP")) : 0.0f;
+    static const bool  skip_renorm = !getenv("LLAMA_MOE_SKIP_RENORM") || atoi(getenv("LLAMA_MOE_SKIP_RENORM")) != 0;
+    ggml_tensor * skip_w = nullptr;
+    if (skip_tau > 0.0f && norm_w && !weight_before_ffn) {
+        ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
+        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -skip_tau));
+        w2 = ggml_mul(ctx0, w2, keep);
+        if (skip_renorm) {
+            ggml_tensor * w_sum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2), 6.103515625e-5, INFINITY);
+            w2 = ggml_div(ctx0, w2, w_sum);
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            w2 = ggml_scale(ctx0, w2, w_scale);
+        }
+        cb(w2, "ffn_moe_weights_skip", il);
+        skip_w  = w2;
+        weights = ggml_reshape_3d(ctx0, w2, 1, n_expert_used, n_tokens);
+    } else if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
@@ -2192,6 +2212,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts_gpu = ggml_mul_mat_id(ctx0, down_exps, act_g, selected_experts);
         for (ggml_tensor * t : {up_g, gate_g, experts_gpu}) {
             ggml_mul_mat_id_set_split(t, 1, gpu_k, 0, gpu_e1);
+            if (skip_w) {
+                ggml_mul_mat_id_set_skip(t, skip_w);
+            }
             t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
         }
         for (ggml_tensor * t : {up_g, gate_g, act_g, experts_gpu}) {
@@ -2205,6 +2228,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     auto set_cpu_part = [&](ggml_tensor * t) {
         if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {
             ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, gpu_e1);
+        }
+        if (skip_w && t->op == GGML_OP_MUL_MAT_ID) {
+            ggml_mul_mat_id_set_skip(t, skip_w);
         }
     };
 

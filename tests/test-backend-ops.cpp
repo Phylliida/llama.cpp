@@ -5346,17 +5346,45 @@ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
 };
 
 // selected experts split between two nodes (ggml_mul_mat_id_set_split)
+// skip weights for ggml_mul_mat_id_set_skip: about a third of the slots are exactly 0
+static ggml_tensor * new_mmid_skip_w(ggml_context * ctx, int n_used, int64_t n) {
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n);
+    ggml_set_name(w, "skip_w");
+    return w;
+}
+static void init_mmid_skip_w(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (strcmp(t->name, "skip_w") == 0) {
+            std::vector<float> v(ggml_nelements(t));
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = (i*7 + i/t->ne[0]) % 3 == 0 ? 0.0f : 0.1f + 0.01f*(i % 50);
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+        }
+    }
+}
+
 struct test_mul_mat_id_split : public test_mul_mat_id {
     const int mode;
-    test_mul_mat_id_split(ggml_type type_a, int mode, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
-        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode) {}
+    const bool skip;
+    test_mul_mat_id_split(ggml_type type_a, int mode, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool skip = false)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode), skip(skip) {}
     std::string vars() override {
-        return test_mul_mat_id::vars() + ",mode=" + std::to_string(mode);
+        return test_mul_mat_id::vars() + ",mode=" + std::to_string(mode) + ",skip=" + std::to_string(skip);
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
-        ggml_mul_mat_id_set_split(out, mode, 3, 0, n_mats/2);
+        if (mode != 0) {
+            ggml_mul_mat_id_set_split(out, mode, 3, 0, n_mats/2);
+        }
+        if (skip) {
+            ggml_mul_mat_id_set_skip(out, new_mmid_skip_w(ctx, n_used, n));
+        }
         return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        init_mmid_skip_w(ctx);
     }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5370,8 +5398,9 @@ struct test_mul_mat_id_situ : public test_case {
     const int n_mats, n_used;
     const int64_t m, n, k;
     const int split_mode;
+    const bool skip;
     std::string vars() override {
-        return VARS_TO_STR7(type_a, n_mats, n_used, m, n, k, split_mode);
+        return VARS_TO_STR8(type_a, n_mats, n_used, m, n, k, split_mode, skip);
     }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5379,8 +5408,8 @@ struct test_mul_mat_id_situ : public test_case {
     }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
-    test_mul_mat_id_situ(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_mode)
-        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_mode(split_mode) {}
+    test_mul_mat_id_situ(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_mode, bool skip = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_mode(split_mode), skip(skip) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * ag  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_tensor * au  = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
@@ -5394,12 +5423,18 @@ struct test_mul_mat_id_situ : public test_case {
             ggml_mul_mat_id_set_split(g, split_mode, 3, 0, n_mats/2);
             ggml_mul_mat_id_set_split(u, split_mode, 3, 0, n_mats/2);
         }
+        if (skip) {
+            ggml_tensor * w = new_mmid_skip_w(ctx, n_used, n);
+            ggml_mul_mat_id_set_skip(g, w);
+            ggml_mul_mat_id_set_skip(u, w);
+        }
         ggml_tensor * out = ggml_situ_split(ctx, g, u, 2.5f, 3.0f);
         ggml_set_name(out, "out");
         return out;
     }
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+        init_mmid_skip_w(ctx);
     }
 };
 
@@ -10190,11 +10225,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256));
             }
         }
+        for (int mode : {0, 1, 2}) {
+            for (int n : {1, 3}) {
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, true));
+            }
+        }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {
         for (int mode : {0, 2}) {
             for (int n : {1, 2}) {
                 test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 64, 16, 384, n, 512, mode));
+                test_cases.emplace_back(new test_mul_mat_id_situ(type_a, 64, 16, 384, n, 512, mode, true));
             }
         }
     }

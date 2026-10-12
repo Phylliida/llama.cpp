@@ -1904,7 +1904,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
 // per token: mark the slots a split MUL_MAT_ID does not compute with -1 (see ggml_mul_mat_id_set_split)
 static __global__ void mul_mat_id_split_ids(const char * ids, int32_t * ids_out, const int n_ids, const int n_tokens,
-        const size_t nb0, const size_t nb1, const int mode, const int k, const int e0, const int e1) {
+        const size_t nb0, const size_t nb1, const int mode, const int k, const int e0, const int e1,
+        const char * skip_w, const size_t wnb0, const size_t wnb1) {
     const int t = blockIdx.x*blockDim.x + threadIdx.x;
     if (t >= n_tokens) {
         return;
@@ -1912,6 +1913,11 @@ static __global__ void mul_mat_id_split_ids(const char * ids, int32_t * ids_out,
     int n_taken = 0;
     for (int j = 0; j < n_ids; ++j) {
         const int32_t id = *(const int32_t *) (ids + t*nb1 + j*nb0);
+        // skipped slots (ggml_mul_mat_id_set_skip) belong to neither part
+        if (skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f) {
+            ids_out[t*n_ids + j] = -1;
+            continue;
+        }
         const bool taken = n_taken < k && id >= e0 && id < e1;
         n_taken += taken;
         ids_out[t*n_ids + j] = taken == (mode == 1) ? id : -1;
@@ -1964,16 +1970,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // split mode: only mmvq handles the -1 ids (it writes zeros for them)
-    if (ggml_get_op_params_i32(dst, 0) != 0) {
+    // skipped slots without a split: "mode 2 with k = 0" computes every slot that is not skipped
+    int split_mode = ggml_get_op_params_i32(dst, 0);
+    int split_k    = ggml_get_op_params_i32(dst, 1);
+    if (split_mode == 0 && dst->src[3] && ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+        split_mode = 2;
+        split_k    = 0;
+    }
+    if (split_mode != 0) {
         GGML_ASSERT(ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc));
         const int n_ids    = ids->ne[0];
         const int n_tokens = ids->ne[1];
-        const int mode     = ggml_get_op_params_i32(dst, 0);
-        const int k        = ggml_get_op_params_i32(dst, 1);
+        const int mode     = split_mode;
+        const int k        = split_k;
 
         // the GPU part of a split reading host weights: gather the taken experts into VRAM first
         static const bool gather = getenv("GGML_CUDA_MMID_GATHER") != nullptr && atoi(getenv("GGML_CUDA_MMID_GATHER")) != 0;
-        if (gather && mode == 1 && n_tokens == 1 && k > 0 && src0->buffer && ggml_backend_buffer_is_host(src0->buffer) &&
+        if (gather && mode == 1 && n_tokens == 1 && k > 0 && !dst->src[3] && src0->buffer && ggml_backend_buffer_is_host(src0->buffer) &&
                 ggml_is_contiguous(src0) && nb02 % 16 == 0 && (uintptr_t) src0->data % 16 == 0) {
             ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids + k);
             int32_t * experts = ids_split.get() + n_ids;
@@ -2001,8 +2014,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids*n_tokens);
         mul_mat_id_split_ids<<<(n_tokens + 127)/128, 128, 0, ctx.stream()>>>((const char *) ids->data, ids_split.get(),
-            n_ids, n_tokens, ids->nb[0], ids->nb[1], ggml_get_op_params_i32(dst, 0), ggml_get_op_params_i32(dst, 1),
-            ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3));
+            n_ids, n_tokens, ids->nb[0], ids->nb[1], mode, k,
+            ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
+            dst->src[3] ? (const char *) dst->src[3]->data : nullptr,
+            dst->src[3] ? dst->src[3]->nb[0] : 0, dst->src[3] ? dst->src[3]->nb[1] : 0);
         ggml_tensor ids_t = *ids;
         ids_t.data  = ids_split.get();
         ids_t.nb[0] = sizeof(int32_t);

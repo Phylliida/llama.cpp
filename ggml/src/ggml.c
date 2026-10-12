@@ -3411,6 +3411,13 @@ void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, 
     ggml_set_op_params(a, params, sizeof(params));
 }
 
+void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == a->src[2]->ne[0] && w->ne[1] == a->src[2]->ne[1]);
+    a->src[3] = w;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

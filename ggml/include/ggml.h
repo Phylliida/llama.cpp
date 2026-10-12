@@ -1519,6 +1519,11 @@ extern "C" {
     // mode 1 computes only the taken slots, mode 2 all other slots, skipped slots are written as zeros
     GGML_API void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1);
 
+    // skip the slots whose weight in w ([n_expert_used, n_tokens] F32, same layout as ids) is exactly 0:
+    // they are written as zeros and do not count towards a split's k. backends may also compute them,
+    // so w must be the weights the expert outputs are multiplied with
+    GGML_API void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

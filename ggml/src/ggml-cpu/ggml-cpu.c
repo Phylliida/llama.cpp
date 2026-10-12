@@ -1537,6 +1537,15 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     }
 }
 
+// ggml_mul_mat_id_set_skip: slot (id, token) is skipped if its weight is exactly 0
+static inline bool ggml_mmid_slot_skipped(const struct ggml_tensor * w, int id, int64_t t) {
+    return w != NULL && *(const float *) ((const char *) w->data + id*w->nb[0] + t*w->nb[1]) == 0.0f;
+}
+
+// TEMP: routed slots seen / skipped by the down projections (printed with GGML_CPU_OP_PROFILE)
+static int64_t g_mmid_slots_total;
+static int64_t g_mmid_slots_skipped;
+
 // GGML_MMID_DYN=0 disables the pooled decode path in mul_mat_id (A/B testing)
 static bool ggml_mmid_dynamic_enabled(void) {
     static int enabled = -1;
@@ -1691,6 +1700,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int32_t split_e0   = ggml_get_op_params_i32(dst, 2);
         const int32_t split_e1   = ggml_get_op_params_i32(dst, 3);
 
+        const struct ggml_tensor * skip_w = dst->src[3];
+        const bool count_slots = strncmp(dst->name, "ffn_moe_down", 12) == 0;
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             int n_taken = 0;
@@ -1698,6 +1710,17 @@ static void ggml_compute_forward_mul_mat_id(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (count_slots) {
+                    g_mmid_slots_total++;
+                }
+                if (ggml_mmid_slot_skipped(skip_w, id, iid1)) {
+                    if (count_slots) {
+                        g_mmid_slots_skipped++;
+                    }
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 if (split_mode != 0) {
                     const bool taken = n_taken < split_k && i02 >= split_e0 && i02 < split_e1;
@@ -3232,6 +3255,10 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
                 assert(i02 >= 0 && i02 < n_as);
+                if (ggml_mmid_slot_skipped(gate->src[3], id, iid1)) {
+                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                    continue;
+                }
                 if (split_mode != 0) {
                     const bool taken = n_taken < split_k && i02 >= split_e0 && i02 < split_e1;
                     n_taken += taken;
@@ -3319,7 +3346,8 @@ static int ggml_cpu_try_fuse_ops(
         if (n1->op == GGML_OP_MUL_MAT_ID && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SITU &&
                 (n1->flags & GGML_TENSOR_FLAG_COMPUTE) && (glu->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                 ((glu->src[0] == node && glu->src[1] == n1) || (glu->src[0] == n1 && glu->src[1] == node)) &&
-                node->src[1] == n1->src[1] && node->src[2] == n1->src[2] && node->src[1]->type == GGML_TYPE_F32 &&
+                node->src[1] == n1->src[1] && node->src[2] == n1->src[2] && node->src[3] == n1->src[3] &&
+                node->src[1]->type == GGML_TYPE_F32 &&
                 node->src[0]->type == n1->src[0]->type && ggml_are_same_shape(node->src[0], n1->src[0]) &&
                 memcmp(node->op_params, n1->op_params, 4*sizeof(int32_t)) == 0 &&
                 ggml_node_has_n_uses(cgraph, node_n, 1) && ggml_node_has_n_uses(cgraph, node_n + 1, 1) &&
@@ -3355,14 +3383,19 @@ static int ggml_cpu_try_fuse_ops(
 // TEMP per-op wall time on thread 0, including the barrier after each node (GGML_CPU_OP_PROFILE=1)
 static int ggml_cpu_prof_enabled(void) {
     static int e = -1;
-    if (e < 0) { e = getenv("GGML_CPU_OP_PROFILE") != NULL; }
-    return e;
+    if (e < 0) { const char * v = getenv("GGML_CPU_OP_PROFILE"); e = v ? (atoi(v) > 1 ? atoi(v) : 93*48) : 0; }
+    return e; // print period in graphs
 }
 static double g_cpu_prof_t[GGML_OP_COUNT + 2];
 static long   g_cpu_prof_n[GGML_OP_COUNT + 2];
 static long   g_cpu_prof_graphs;
 static void ggml_cpu_prof_print(void) {
     fprintf(stderr, "cpu-prof: %ld graphs\n", g_cpu_prof_graphs);
+    if (g_mmid_slots_total > 0) {
+        fprintf(stderr, "cpu-prof: moe down slots %lld, skipped %lld (%.1f%%, %.2f of 16 kept)\n",
+                (long long) g_mmid_slots_total, (long long) g_mmid_slots_skipped,
+                100.0*g_mmid_slots_skipped/g_mmid_slots_total, 16.0*(1.0 - (double) g_mmid_slots_skipped/g_mmid_slots_total));
+    }
     for (int i = 0; i < GGML_OP_COUNT + 2; ++i) {
         if (g_cpu_prof_n[i] == 0) continue;
         const char * name = i < GGML_OP_COUNT ? ggml_op_name((enum ggml_op) i) : (i == GGML_OP_COUNT ? "[thread0 total]" : "[graph_compute total]");
@@ -3743,7 +3776,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     if (ggml_cpu_prof_enabled()) {
         g_cpu_prof_t[GGML_OP_COUNT + 1] += ggml_time_us() - t_prof0;
         g_cpu_prof_n[GGML_OP_COUNT + 1] += 1;
-        if (++g_cpu_prof_graphs % (93*48) == 0) {
+        if (++g_cpu_prof_graphs % ggml_cpu_prof_enabled() == 0) {
             ggml_cpu_prof_print();
         }
     }
