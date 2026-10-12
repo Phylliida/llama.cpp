@@ -1,7 +1,12 @@
 #include "models.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <vector>
 #include "llama-memory-recurrent.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "gguf.h"
 
 //
 // Kimi-K3 text model: hybrid KDA (linear) + MLA (full) attention, as in kimi-linear.
@@ -553,6 +558,55 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
 // shared experts stay at n_embd and read the un-projected input.
 //
 
+// TEMP experiment: LLAMA_K3_XPROJ=<gguf> projects the routed experts' latent input onto a per-layer
+// subspace, x -> P (P^T x), with blk.N.xproj = P^T [3584 -> r] and blk.N.xprojt = P [r -> 3584].
+// equivalent to storing the gate/up experts as W P (rank-r inputs); used to measure the quality cost
+struct k3_xproj_store {
+    std::vector<ggml_tensor *> p;
+    std::vector<ggml_tensor *> pt;
+};
+
+static const k3_xproj_store & k3_xproj() {
+    static k3_xproj_store s;
+    static bool init = false;
+    if (init) {
+        return s;
+    }
+    init = true;
+    const char * path = getenv("LLAMA_K3_XPROJ");
+    if (!path) {
+        return s;
+    }
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context * g = gguf_init_from_file(path, gp);
+    GGML_ASSERT(g && "LLAMA_K3_XPROJ: cannot read file");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(meta, ggml_backend_cpu_buffer_type());
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    FILE * f = fopen(path, "rb");
+    GGML_ASSERT(f);
+    const size_t data_off = gguf_get_data_offset(g);
+    s.p.assign(LLAMA_MAX_LAYERS, nullptr);
+    s.pt.assign(LLAMA_MAX_LAYERS, nullptr);
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
+        const char * name = gguf_get_tensor_name(g, i);
+        ggml_tensor * t = ggml_get_tensor(meta, name);
+        GGML_ASSERT(fseek(f, (long) (data_off + gguf_get_tensor_offset(g, i)), SEEK_SET) == 0);
+        GGML_ASSERT(fread(t->data, 1, ggml_nbytes(t), f) == ggml_nbytes(t));
+        int il = -1;
+        char kind[16] = {0};
+        if (sscanf(name, "blk.%d.%15s", &il, kind) == 2 && il >= 0 && il < LLAMA_MAX_LAYERS) {
+            if (strcmp(kind, "xproj") == 0)  { s.p[il]  = t; }
+            if (strcmp(kind, "xprojt") == 0) { s.pt[il] = t; }
+        }
+    }
+    const int64_t n_loaded = gguf_get_n_tensors(g);
+    fclose(f);
+    gguf_free(g);
+    LLAMA_LOG_INFO("%s: loaded %lld tensors from %s\n", __func__, (long long) n_loaded, path);
+    return s;
+}
+
 ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
         ggml_tensor * cur, const llama_layer & layer, int64_t n_embd_latent, int il) {
 
@@ -576,6 +630,14 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     ggml_tensor * routed_in = layer.ffn_routed_down
         ? ggml_mul_mat(ctx0, layer.ffn_routed_down, cur)
         : cur;
+
+    {
+        const k3_xproj_store & xp = k3_xproj();
+        if (!xp.p.empty() && xp.p[il] && xp.pt[il]) {
+            routed_in = ggml_mul_mat(ctx0, xp.pt[il], ggml_mul_mat(ctx0, xp.p[il], routed_in));
+            cb(routed_in, "ffn_routed_in_proj", il);
+        }
+    }
 
     // the router scores the full-width input while the experts take the latent one,
     // so the logits are computed here and passed to build_moe_ffn

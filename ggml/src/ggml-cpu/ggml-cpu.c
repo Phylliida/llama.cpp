@@ -1691,6 +1691,26 @@ static void ggml_compute_forward_mul_mat_id(
             fflush(mmid_dump);
         }
 
+        // TEMP: GGML_MMID_DUMP_X=<file> appends the expert inputs (src1 of each ffn_moe_gate node):
+        // int32 layer, int32 n_tokens, int32 n_embd, then n_tokens x n_embd floats
+        static FILE * x_dump = NULL;
+        static int    x_dump_init = 0;
+        if (!x_dump_init) {
+            x_dump_init = 1;
+            const char * path = getenv("GGML_MMID_DUMP_X");
+            if (path) {
+                x_dump = fopen(path, "ab");
+            }
+        }
+        if (x_dump && strncmp(dst->name, "ffn_moe_gate-", 13) == 0 && src1->type == GGML_TYPE_F32 && ne11 == 1) {
+            const int32_t hdr[3] = { atoi(dst->name + 13), (int32_t) ne12, (int32_t) ne10 };
+            fwrite(hdr, sizeof(hdr), 1, x_dump);
+            for (int64_t t = 0; t < ne12; ++t) {
+                fwrite((const char *) src1->data + t*nb12, sizeof(float), ne10, x_dump);
+            }
+            fflush(x_dump);
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
