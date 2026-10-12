@@ -2217,7 +2217,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int gpu_e1 = moe_gpu_e1;
     moe_gpu_k = 0;
     ggml_backend_t backend_gpu = sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
-    const bool gpu_share = gpu_k > 0 && n_tokens == 1 && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
+    const bool gpu_share = gpu_k > 0 && n_tokens <= 4 && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn &&
         backend_gpu && backend_gpu != backend_cpu;
     ggml_tensor * experts_gpu = nullptr;

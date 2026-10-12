@@ -1045,8 +1045,9 @@ struct llm_graph_context {
     // (used to place GPU work flagged GGML_TENSOR_FLAG_DEFER next to the CPU expert split)
     mutable ggml_tensor * moe_defer = nullptr;
 
-    // at batch size 1, build_moe_ffn lets the first backend (GPU) compute up to moe_gpu_k of the selected experts
-    // with id < moe_gpu_e1, reading their host weights in place while the CPU computes the others (then clears it)
+    // at batch sizes <= 4, build_moe_ffn lets the first backend (GPU) compute up to moe_gpu_k of the selected experts
+    // with id < moe_gpu_e1 (the ones most tokens of the batch share, see ggml_mul_mat_id_set_split), reading their host
+    // weights in place while the CPU computes the others (then clears it)
     mutable int moe_gpu_k  = 0;
     mutable int moe_gpu_e1 = 0;
 

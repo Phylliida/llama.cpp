@@ -1012,6 +1012,85 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// Expert-major MoE mat-vec (ggml_cuda_mul_mat_vec_q_moe_xm): a warp computes rows_per_warp rows of one expert for
+// all ntok tokens that selected it, so the weights are loaded once per row block.
+template <ggml_type type, int rows_per_warp, int ntok>
+static __device__ __forceinline__ void mul_mat_vec_q_moe_xm_rows(
+        const void * GGML_CUDA_RESTRICT vx, const block_q8_1 * const * y, float * const * dst,
+        const int kbx_offset, const int blocks_per_row_x, const uint32_t stride_row_x, const int row0) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    float tmp[ntok][rows_per_warp] = {{0.0f}};
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rows_per_warp; ++i) {
+#pragma unroll
+            for (int t = 0; t < ntok; ++t) {
+                tmp[t][i] += vec_dot_q_cuda(vx, &y[t][kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < ntok; ++t) {
+#pragma unroll
+        for (int i = 0; i < rows_per_warp; ++i) {
+            tmp[t][i] = warp_reduce_sum<warp_size>(tmp[t][i]);
+        }
+    }
+    if (threadIdx.x < rows_per_warp) {
+#pragma unroll
+        for (int t = 0; t < ntok; ++t) {
+            dst[t][row0 + threadIdx.x] = tmp[t][threadIdx.x];
+        }
+    }
+}
+
+// Grid: (nrows_x / (nwarps*rows_per_warp), n_experts), block: (warp_size, nwarps).
+template <ggml_type type, int rows_per_warp, int max_tok>
+static __global__ void mul_mat_vec_q_moe_xm(
+        const void * GGML_CUDA_RESTRICT vx, const void * GGML_CUDA_RESTRICT vy,
+        const int32_t * GGML_CUDA_RESTRICT experts, const int32_t * GGML_CUDA_RESTRICT slots, float * GGML_CUDA_RESTRICT dst,
+        const uint32_t ncols_x, const int n_tokens, const uint32_t nchannels_y,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+
+    const int     r = blockIdx.y;
+    const int32_t e = experts[r];
+    if (e < 0) {
+        return;
+    }
+    const block_q8_1 * y[max_tok];
+    float            * d[max_tok];
+    int n = 0;
+    for (int t = 0; t < n_tokens; ++t) {
+        const int32_t s = slots[r*n_tokens + t];
+        if (s >= 0) {
+            y[n] = (const block_q8_1 *) vy + t*stride_col_y + (s % nchannels_y)*stride_channel_y;
+            d[n] = dst + s*stride_channel_dst + t*stride_col_dst;
+            n++;
+        }
+    }
+    const int row0       = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp;
+    const int kbx_offset = e*stride_channel_x + row0*stride_row_x;
+    const int bpr        = ncols_x / qk;
+    static_assert(max_tok == 4, "max_tok");
+    switch (n) {
+        case 1: mul_mat_vec_q_moe_xm_rows<type, rows_per_warp, 1>(vx, y, d, kbx_offset, bpr, stride_row_x, row0); break;
+        case 2: mul_mat_vec_q_moe_xm_rows<type, rows_per_warp, 2>(vx, y, d, kbx_offset, bpr, stride_row_x, row0); break;
+        case 3: mul_mat_vec_q_moe_xm_rows<type, rows_per_warp, 3>(vx, y, d, kbx_offset, bpr, stride_row_x, row0); break;
+        case 4: mul_mat_vec_q_moe_xm_rows<type, rows_per_warp, 4>(vx, y, d, kbx_offset, bpr, stride_row_x, row0); break;
+        default: break;
+    }
+}
+
 // Persistent mat-vec for IQ2_S and IQ3_XXS with ncols_dst == 1.
 // The grid table stays in shared memory and each thread keeps its part of y in registers for all rows.
 // Signs use dot(g*s, u) = dot(g ^ m, u) - dot(m, u) with m = 0xFF where s = -1, this avoids __vcmpne4/__vsub4.
@@ -1758,6 +1837,75 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+static constexpr int MMVQ_XM_ROWS_PER_WARP = 2;
+static constexpr int MMVQ_XM_NWARPS        = 4;
+static constexpr int MMVQ_XM_MAX_TOK       = 4;
+
+bool ggml_cuda_mul_mat_vec_q_moe_xm_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+            break;
+        default:
+            return false;
+    }
+    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) && src0->ne[3] == 1 &&
+        dst->ne[2] <= MMVQ_XM_MAX_TOK && src0->ne[1] % (MMVQ_XM_ROWS_PER_WARP*MMVQ_XM_NWARPS) == 0;
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_moe_xm_launch(const void * vx, const void * vy, const int32_t * experts, const int32_t * slots,
+        float * dst, const int n_experts, const int ncols_x, const int nrows_x, const int n_tokens, const int nchannels_y,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const dim3 block_nums(nrows_x / (MMVQ_XM_ROWS_PER_WARP*MMVQ_XM_NWARPS), n_experts);
+    const dim3 block_dims(warp_size, MMVQ_XM_NWARPS);
+    mul_mat_vec_q_moe_xm<type, MMVQ_XM_ROWS_PER_WARP, MMVQ_XM_MAX_TOK><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, experts, slots, dst, ncols_x, n_tokens, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst);
+}
+
+void ggml_cuda_mul_mat_vec_q_moe_xm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const int32_t * experts, const int32_t * slots, const int n_experts, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst));
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), src0->type, ne10,
+        nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float), ne10_padded, ne11, ne12, ne13, stream);
+
+    const int ts_src0          = ggml_type_size(src0->type);
+    const int stride_row_x     = nb01 / ts_src0;
+    const int stride_channel_x = nb02 / ts_src0;
+    const int stride_channel_y = ne10_padded / QK8_1;    // one src1 row per slot (or one shared, ne11 == 1)
+    const int stride_col_y     = ne11*stride_channel_y; // per token
+    const int stride_channel_dst = nb1 / sizeof(float);
+    const int stride_col_dst     = nb2 / sizeof(float);
+
+#define XM_CASE(T) case T: mul_mat_vec_q_moe_xm_launch<T>(src0->data, src1_q8_1.get(), experts, slots, (float *) dst->data, \
+        n_experts, ne00, ne01, ne12, ne11, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, \
+        stride_channel_dst, stream); break;
+    switch (src0->type) {
+        XM_CASE(GGML_TYPE_Q4_0)
+        XM_CASE(GGML_TYPE_Q8_0)
+        XM_CASE(GGML_TYPE_Q4_K)
+        XM_CASE(GGML_TYPE_IQ2_XS)
+        XM_CASE(GGML_TYPE_IQ2_S)
+        XM_CASE(GGML_TYPE_IQ3_XXS)
+        default: GGML_ABORT("unsupported type");
+    }
+#undef XM_CASE
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

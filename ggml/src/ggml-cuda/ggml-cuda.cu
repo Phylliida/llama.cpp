@@ -1902,25 +1902,75 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
-// per token: mark the slots a split MUL_MAT_ID does not compute with -1 (see ggml_mul_mat_id_set_split)
-static __global__ void mul_mat_id_split_ids(const char * ids, int32_t * ids_out, const int n_ids, const int n_tokens,
-        const size_t nb0, const size_t nb1, const int mode, const int k, const int e0, const int e1,
-        const char * skip_w, const size_t wnb0, const size_t wnb1) {
-    const int t = blockIdx.x*blockDim.x + threadIdx.x;
-    if (t >= n_tokens) {
-        return;
+// split MUL_MAT_ID (ggml_mul_mat_id_set_split), one block with a thread per slot: rank the eligible experts of the batch
+// (tokens selecting them, then first occurrence) and take the first k. Outputs (each optional):
+// ids_out: ids with -1 for the slots this part does not compute (skipped slots belong to neither part)
+// experts, slots (mode 1): the taken experts by rank (-1 past the last), slots[r*n_tokens + t] = slot of token t for
+// expert r or -1
+static __global__ void mul_mat_id_split_take(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
+        const int n_tokens, const int mode, const int k, const int e0, const int e1,
+        const char * skip_w, const size_t wnb0, const size_t wnb1, int32_t * ids_out, int32_t * experts, int32_t * slots) {
+    __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
+    __shared__ int32_t s_cnt[1024];  // at an expert's first slot: tokens selecting it, else 0
+    __shared__ int32_t s_rank[1024]; // at an expert's first slot: its rank
+    const int n = n_ids*n_tokens;
+    const int i = threadIdx.x;
+    const int t = i / n_ids;
+    const int j = i % n_ids;
+
+    int32_t id      = -1;
+    bool    skipped = true;
+    if (i < n) {
+        id      = *(const int32_t *) (ids + t*nb1 + j*nb0);
+        skipped = skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f;
+        s_e[i]  = !skipped && id >= e0 && id < e1 ? id : -1;
     }
-    int n_taken = 0;
-    for (int j = 0; j < n_ids; ++j) {
-        const int32_t id = *(const int32_t *) (ids + t*nb1 + j*nb0);
-        // skipped slots (ggml_mul_mat_id_set_skip) belong to neither part
-        if (skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f) {
-            ids_out[t*n_ids + j] = -1;
-            continue;
+    if (experts) {
+        for (int c = i; c < k; c += blockDim.x) {
+            experts[c] = -1;
         }
-        const bool taken = n_taken < k && id >= e0 && id < e1;
-        n_taken += taken;
-        ids_out[t*n_ids + j] = taken == (mode == 1) ? id : -1;
+        for (int c = i; c < k*n_tokens; c += blockDim.x) {
+            slots[c] = -1;
+        }
+    }
+    __syncthreads();
+
+    int first = -1;
+    if (i < n) {
+        int cnt = 0;
+        if (s_e[i] >= 0) {
+            for (int i2 = 0; i2 < n; ++i2) {
+                if (s_e[i2] == s_e[i]) {
+                    first = first < 0 ? i2 : first;
+                    cnt++;
+                }
+            }
+        }
+        s_cnt[i] = first == i ? cnt : 0;
+    }
+    __syncthreads();
+
+    if (i < n && first == i) {
+        int rank = 0;
+        for (int i2 = 0; i2 < n; ++i2) {
+            rank += s_cnt[i2] > s_cnt[i] || (s_cnt[i2] == s_cnt[i] && i2 < i);
+        }
+        s_rank[i] = rank;
+    }
+    __syncthreads();
+
+    if (i < n) {
+        const int  rank  = first >= 0 ? s_rank[first] : -1;
+        const bool taken = rank >= 0 && rank < k;
+        if (ids_out) {
+            ids_out[t*n_ids + j] = !skipped && taken == (mode == 1) ? id : -1;
+        }
+        if (experts && taken) {
+            if (first == i) {
+                experts[rank] = id;
+            }
+            slots[rank*n_tokens + t] = j;
+        }
     }
 }
 
@@ -2012,12 +2062,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
+        GGML_ASSERT(n_ids*n_tokens <= 1024);
+        const int n_thr = GGML_PAD(n_ids*n_tokens, WARP_SIZE);
+        const char * skip_d  = dst->src[3] ? (const char *) dst->src[3]->data : nullptr;
+        const size_t skip_nb0 = dst->src[3] ? dst->src[3]->nb[0] : 0;
+        const size_t skip_nb1 = dst->src[3] ? dst->src[3]->nb[1] : 0;
+
+        // the GPU part at a few tokens: expert-major, each taken expert is read once for all its tokens
+        if (mode == 1 && n_tokens > 1 && k > 0 && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst)) {
+            ggml_cuda_pool_alloc<int32_t> take(ctx.pool(), k + k*n_tokens);
+            int32_t * experts = take.get();
+            int32_t * slots   = take.get() + k;
+            mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
+                skip_d, skip_nb0, skip_nb1, nullptr, experts, slots);
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            ggml_cuda_mul_mat_vec_q_moe_xm(ctx, src0, src1, experts, slots, k, dst);
+            return;
+        }
+
         ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids*n_tokens);
-        mul_mat_id_split_ids<<<(n_tokens + 127)/128, 128, 0, ctx.stream()>>>((const char *) ids->data, ids_split.get(),
-            n_ids, n_tokens, ids->nb[0], ids->nb[1], mode, k,
-            ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
-            dst->src[3] ? (const char *) dst->src[3]->data : nullptr,
-            dst->src[3] ? dst->src[3]->nb[0] : 0, dst->src[3] ? dst->src[3]->nb[1] : 0);
+        mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+            n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
+            skip_d, skip_nb0, skip_nb1, ids_split.get(), nullptr, nullptr);
         ggml_tensor ids_t = *ids;
         ids_t.data  = ids_split.get();
         ids_t.nb[0] = sizeof(int32_t);

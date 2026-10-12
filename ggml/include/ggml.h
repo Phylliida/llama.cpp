@@ -1515,7 +1515,9 @@ extern "C" {
             struct ggml_tensor  * ids);
 
     // split the selected experts of a MUL_MAT_ID between two nodes (e.g. one per backend):
-    // per token, the first k slots whose expert id is in [e0, e1) are "taken"
+    // over the whole batch, the eligible experts (id in [e0, e1), slot not skipped) are ranked by the number of tokens
+    // selecting them (descending), then by first occurrence (token-major); the slots of the first k are "taken"
+    // (at one token: the first k eligible slots). at most 1024 slots (n_expert_used*n_tokens)
     // mode 1 computes only the taken slots, mode 2 all other slots, skipped slots are written as zeros
     GGML_API void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1);
 

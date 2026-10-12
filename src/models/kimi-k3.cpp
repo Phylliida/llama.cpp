@@ -760,11 +760,13 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     ggml_build_forward_expand(gf, routed_in);
 
     // optional GPU share of the routed experts: LLAMA_MOE_GPU_FRAC = fraction of expert ids (from 0) the GPU may take,
-    // LLAMA_MOE_GPU_K = max experts per token on the GPU (needs HMM for the host-resident expert weights)
+    // LLAMA_MOE_GPU_K = max experts on the GPU at one token, LLAMA_MOE_GPU_KB at 2-4 tokens (speculative verify;
+    // default K). Needs HMM for the host-resident expert weights
     static const float gpu_frac = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
     static const int   gpu_k    = getenv("LLAMA_MOE_GPU_K")    ? atoi(getenv("LLAMA_MOE_GPU_K"))    : 3;
+    static const int   gpu_kb   = getenv("LLAMA_MOE_GPU_KB")   ? atoi(getenv("LLAMA_MOE_GPU_KB"))   : gpu_k;
     if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
-        moe_gpu_k  = gpu_k;
+        moe_gpu_k  = n_tokens == 1 ? gpu_k : gpu_kb;
         moe_gpu_e1 = (int) (gpu_frac * hparams.n_expert);
     }
 

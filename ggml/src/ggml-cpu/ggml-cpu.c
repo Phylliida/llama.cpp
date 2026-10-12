@@ -1587,6 +1587,57 @@ static inline bool ggml_mmid_slot_skipped(const struct ggml_tensor * w, int id, 
     return w != NULL && *(const float *) ((const char *) w->data + id*w->nb[0] + t*w->nb[1]) == 0.0f;
 }
 
+// experts taken by a split MUL_MAT_ID (ggml_mul_mat_id_set_split) over the batch, returns their number (<= k)
+static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct ggml_tensor * skip_w, int k, int e0, int e1,
+        int32_t * taken) {
+    enum { MAX_SLOTS = 1024 };
+    const int n_ids = ids->ne[0];
+    GGML_ASSERT(n_ids*ids->ne[1] <= MAX_SLOTS);
+    // eligible experts in order of first occurrence, with their token counts
+    int32_t ue[MAX_SLOTS];
+    int32_t uc[MAX_SLOTS];
+    int     nu = 0;
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int j = 0; j < n_ids; ++j) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            if (e < e0 || e >= e1 || ggml_mmid_slot_skipped(skip_w, j, t)) {
+                continue;
+            }
+            int u = 0;
+            while (u < nu && ue[u] != e) {
+                u++;
+            }
+            if (u == nu) {
+                ue[nu]   = e;
+                uc[nu++] = 0;
+            }
+            uc[u]++;
+        }
+    }
+    // the first k by count (descending), ties by first occurrence
+    int n = 0;
+    for (; n < k && n < nu; ++n) {
+        int best = -1;
+        for (int u = 0; u < nu; ++u) {
+            if (uc[u] > 0 && (best < 0 || uc[u] > uc[best])) {
+                best = u;
+            }
+        }
+        taken[n] = ue[best];
+        uc[best] = 0;
+    }
+    return n;
+}
+
+static inline bool ggml_mmid_is_taken(const int32_t * taken, int n_taken, int32_t e) {
+    for (int i = 0; i < n_taken; ++i) {
+        if (taken[i] == e) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // TEMP: routed slots seen / skipped by the down projections (printed with GGML_CPU_OP_PROFILE)
 static int64_t g_mmid_slots_total;
 static int64_t g_mmid_slots_skipped;
@@ -1938,9 +1989,15 @@ static void ggml_compute_forward_mul_mat_id(
         const struct ggml_tensor * skip_w = dst->src[3];
         const bool count_slots = strncmp(dst->name, "ffn_moe_down", 12) == 0;
 
+        int32_t taken[64];
+        int     n_taken = 0;
+        if (split_mode != 0) {
+            GGML_ASSERT(split_k <= 64);
+            n_taken = ggml_mmid_split_taken(ids, skip_w, split_k, split_e0, split_e1, taken);
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            int n_taken = 0;
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
@@ -1958,9 +2015,7 @@ static void ggml_compute_forward_mul_mat_id(
                 }
 
                 if (split_mode != 0) {
-                    const bool taken = n_taken < split_k && i02 >= split_e0 && i02 < split_e1;
-                    n_taken += taken;
-                    if (taken != (split_mode == 1)) {
+                    if (ggml_mmid_is_taken(taken, n_taken, i02) != (split_mode == 1)) {
                         memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                         continue;
                     }
@@ -3508,8 +3563,14 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
         const int32_t split_e0   = ggml_get_op_params_i32(gate, 2);
         const int32_t split_e1   = ggml_get_op_params_i32(gate, 3);
 
+        int32_t taken[64];
+        int     n_taken = 0;
+        if (split_mode != 0) {
+            GGML_ASSERT(split_k <= 64);
+            n_taken = ggml_mmid_split_taken(ids, gate->src[3], split_k, split_e0, split_e1, taken);
+        }
+
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            int n_taken = 0;
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
                 assert(i02 >= 0 && i02 < n_as);
@@ -3518,9 +3579,7 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                     continue;
                 }
                 if (split_mode != 0) {
-                    const bool taken = n_taken < split_k && i02 >= split_e0 && i02 < split_e1;
-                    n_taken += taken;
-                    if (taken != (split_mode == 1)) {
+                    if (ggml_mmid_is_taken(taken, n_taken, i02) != (split_mode == 1)) {
                         memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
                         continue;
                     }
