@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -481,6 +482,66 @@ llama_context::llama_context(
     // GPU share of the routed experts: the first GPU reads expert ids [0, frac*n_expert) from host memory in place.
     // Mapping them into its page tables on first touch is slow, so do it ahead in a helper thread.
     const char * moe_gpu_frac = getenv("LLAMA_MOE_GPU_FRAC");
+
+    // VRAM expert cache of the share (ggml_mul_mat_id_set_cache): LLAMA_MOE_GPU_CACHE slots per layer on the layer's GPU,
+    // sized for the larger of LLAMA_MOE_GPU_K / LLAMA_MOE_GPU_KB (scratch slots)
+    const char * moe_gpu_cache = getenv("LLAMA_MOE_GPU_CACHE");
+    if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && moe_gpu_cache && atoi(moe_gpu_cache) > 0) {
+        const int n_slots = atoi(moe_gpu_cache);
+        const int gpu_k   = getenv("LLAMA_MOE_GPU_K")  ? atoi(getenv("LLAMA_MOE_GPU_K"))  : 3;
+        const int gpu_kb  = getenv("LLAMA_MOE_GPU_KB") ? atoi(getenv("LLAMA_MOE_GPU_KB")) : gpu_k;
+        const int k_max   = std::max(gpu_k, gpu_kb);
+        const int n_layer = (int) model.hparams.n_layer();
+
+        std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+        auto ctx_for = [&](ggml_backend_buffer_type_t buft) {
+            auto it = ctx_map.find(buft);
+            if (it != ctx_map.end()) {
+                return it->second;
+            }
+            ggml_init_params params = { (size_t) n_layer*9*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * c = ggml_init(params);
+            moe_cache_ctxs.emplace_back(c);
+            ctx_map[buft] = c;
+            return c;
+        };
+        moe_cache.resize(n_layer);
+        size_t total = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+            const ggml_tensor * w[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (!w[0] || !w[1] || !w[2] || !w[0]->buffer || !ggml_backend_buffer_is_host(w[0]->buffer) ||
+                    ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_context * cg = ctx_for(ggml_backend_dev_buffer_type(dev));
+            ggml_context * cc = ctx_for(ggml_backend_get_default_buffer_type(backend_cpu));
+            for (int x = 0; x < 3; ++x) {
+                moe_cache[il].cache[x]     = ggml_new_tensor_1d(cg, GGML_TYPE_I8, (int64_t) (n_slots + k_max)*w[x]->nb[2]);
+                moe_cache[il].state_gpu[x] = ggml_new_tensor_1d(cg, GGML_TYPE_I32, 2*n_slots + 1);
+                moe_cache[il].state_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, 2*n_slots + 1);
+                total += ggml_nbytes(moe_cache[il].cache[x]);
+            }
+        }
+        for (auto & [buft, c] : ctx_map) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
+            if (!buf) {
+                throw std::runtime_error("failed to allocate the MoE expert cache");
+            }
+            moe_cache_bufs.emplace_back(buf);
+        }
+        std::vector<int32_t> init(2*n_slots + 1, 0);
+        std::fill(init.begin(), init.begin() + n_slots, -1);
+        init[2*n_slots] = 1;
+        for (auto & mc : moe_cache) {
+            for (int x = 0; mc.cache[0] && x < 3; ++x) {
+                ggml_backend_tensor_set(mc.state_gpu[x], init.data(), 0, init.size()*sizeof(int32_t));
+                ggml_backend_tensor_set(mc.state_cpu[x], init.data(), 0, init.size()*sizeof(int32_t));
+            }
+        }
+        LLAMA_LOG_INFO("%s: %d slots per layer, %.2f GiB of VRAM\n", "moe_gpu_cache", n_slots, total/1073741824.0);
+    }
     if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && !model.devices.empty()) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.devices[0].dev);
         using prefetch_fn_t = bool (*)(const void *, size_t, int);
@@ -489,15 +550,41 @@ llama_context::llama_context(
             const double frac = atof(moe_gpu_frac);
             moe_prefetch_thread = std::thread([this, prefetch_fn, frac]() {
                 const int64_t t0 = ggml_time_us();
+                // ranges per GPU: the one that computes the layer's share (its device with a layer split)
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(this->model.devices[0].dev);
+                std::vector<std::vector<std::pair<const void *, size_t>>> ranges(ggml_backend_reg_dev_count(reg));
                 size_t total = 0;
-                bool ok = true;
                 for (const auto & [name, t] : this->model.tensors_by_name) {
-                    if (name.find("_exps.weight") == std::string::npos || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                    int il = -1;
+                    if (name.find("_exps.weight") == std::string::npos || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                        sscanf(name.c_str(), "blk.%d.", &il) != 1) {
                         continue;
                     }
-                    const size_t size = std::min(ggml_nbytes(t), (size_t) (frac * t->ne[2]) * t->nb[2]);
-                    ok = ok && prefetch_fn(t->data, size, 0);
-                    total += size;
+                    for (size_t i = 0; i < ranges.size(); ++i) {
+                        if (ggml_backend_reg_dev_get(reg, i) == this->model.dev_layer(il)) {
+                            const size_t size = std::min(ggml_nbytes(t), (size_t) (frac * t->ne[2]) * t->nb[2]);
+                            ranges[i].emplace_back(t->data, size);
+                            total += size;
+                        }
+                    }
+                }
+                // one thread per GPU
+                std::atomic<bool> ok{true};
+                std::vector<std::thread> workers;
+                for (size_t i = 0; i < ranges.size(); ++i) {
+                    if (ranges[i].empty()) {
+                        continue;
+                    }
+                    workers.emplace_back([&, i]() {
+                        for (const auto & [ptr, size] : ranges[i]) {
+                            if (!prefetch_fn(ptr, size, (int) i)) {
+                                ok = false;
+                            }
+                        }
+                    });
+                }
+                for (auto & w : workers) {
+                    w.join();
                 }
                 LLAMA_LOG_INFO("%s: mapped %.1f GiB of expert weights for the GPU in %.1f s%s\n", "moe_gpu_prefetch",
                     total/1073741824.0, (ggml_time_us() - t0)/1e6, ok ? "" : " (some prefetches failed)");
@@ -2598,6 +2685,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_cache   =*/ moe_cache.empty() ? nullptr : &moe_cache,
     };
 }
 

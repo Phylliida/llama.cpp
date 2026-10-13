@@ -3418,6 +3418,17 @@ void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w) {
     a->src[3] = w;
 }
 
+void ggml_mul_mat_id_set_cache(struct ggml_tensor * a, struct ggml_tensor * state, struct ggml_tensor * cache) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_is_contiguous(state) && ggml_nelements(state) % 2 == 1);
+    if (cache) {
+        const int n_slots = (int) (ggml_nelements(state) / 2);
+        GGML_ASSERT(ggml_nbytes(cache) >= (size_t) (n_slots + ggml_get_op_params_i32(a, 1)) * a->src[0]->nb[2]);
+    }
+    a->src[4] = state;
+    a->src[5] = cache;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

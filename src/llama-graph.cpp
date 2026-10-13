@@ -1496,6 +1496,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+        moe_cache = params.moe_cache;
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -2216,7 +2217,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int gpu_k  = moe_gpu_k;
     const int gpu_e1 = moe_gpu_e1;
     moe_gpu_k = 0;
-    ggml_backend_t backend_gpu = sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
+    ggml_backend_t backend_gpu = moe_gpu_backend ? moe_gpu_backend : sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
+    moe_gpu_backend = nullptr;
     const bool gpu_share = gpu_k > 0 && n_tokens <= 4 && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn &&
         backend_gpu && backend_gpu != backend_cpu;
@@ -2226,12 +2228,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_exps, cur, selected_experts);
         ggml_tensor * act_g  = ggml_situ_split(ctx0, gate_g, up_g, hparams.situ_beta, hparams.situ_linear_beta);
         experts_gpu = ggml_mul_mat_id(ctx0, down_exps, act_g, selected_experts);
+        const llm_graph_moe_cache_layer * mc = moe_cache && il >= 0 && il < (int) moe_cache->size() &&
+            (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
+        int x = 0;
         for (ggml_tensor * t : {up_g, gate_g, experts_gpu}) {
             ggml_mul_mat_id_set_split(t, 1, gpu_k, 0, gpu_e1);
             if (skip_w) {
                 ggml_mul_mat_id_set_skip(t, skip_w);
             }
+            if (mc) {
+                ggml_mul_mat_id_set_cache(t, mc->state_gpu[x], mc->cache[x]);
+            }
             t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+            x++;
         }
         for (ggml_tensor * t : {up_g, gate_g, act_g, experts_gpu}) {
             t->flags |= GGML_TENSOR_FLAG_DEFER;
@@ -2240,10 +2249,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts_gpu, "ffn_moe_down_gpu", il);
         ggml_build_forward_expand(gf, experts_gpu);
     }
-    // the CPU nodes skip the slots taken by the GPU
-    auto set_cpu_part = [&](ggml_tensor * t) {
+    // the CPU nodes skip the slots taken by the GPU (x = 0/1/2: up/gate/down, for the expert cache)
+    const llm_graph_moe_cache_layer * mc_cpu = gpu_share && moe_cache && il >= 0 && il < (int) moe_cache->size() &&
+        (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
+    auto set_cpu_part = [&](ggml_tensor * t, int x) {
         if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {
             ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, gpu_e1);
+            if (mc_cpu) {
+                ggml_mul_mat_id_set_cache(t, mc_cpu->state_cpu[x], nullptr);
+            }
         }
         if (skip_w && t->op == GGML_OP_MUL_MAT_ID) {
             ggml_mul_mat_id_set_skip(t, skip_w);
@@ -2283,7 +2297,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
-        set_cpu_part(up);
+        set_cpu_part(up, 0);
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
@@ -2297,7 +2311,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
-            set_cpu_part(cur);
+            set_cpu_part(cur, 1);
         } else {
             cur = up;
         }
@@ -2394,7 +2408,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
-    set_cpu_part(experts);
+    set_cpu_part(experts, 2);
     if (experts_gpu) {
         experts = ggml_add(ctx0, experts, experts_gpu);
     }

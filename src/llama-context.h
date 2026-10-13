@@ -362,6 +362,11 @@ private:
     // maps the expert weights the GPU may read in place into the GPU page tables (LLAMA_MOE_GPU_FRAC)
     std::thread moe_prefetch_thread;
 
+    // VRAM expert cache of that GPU share (LLAMA_MOE_GPU_CACHE = slots per layer), per layer
+    std::vector<llm_graph_moe_cache_layer> moe_cache;
+    std::vector<ggml_context_ptr>          moe_cache_ctxs;
+    std::vector<ggml_backend_buffer_ptr>   moe_cache_bufs;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

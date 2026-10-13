@@ -770,6 +770,14 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// VRAM expert cache of the GPU share (ggml_mul_mat_id_set_cache), per layer, index 0/1/2 = up/gate/down: expert weights
+// on the layer's GPU, and the cache state of the GPU nodes and of the CPU nodes (separate copies that stay equal)
+struct llm_graph_moe_cache_layer {
+    ggml_tensor * cache[3]     = {};
+    ggml_tensor * state_gpu[3] = {};
+    ggml_tensor * state_cpu[3] = {};
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -812,6 +820,9 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // GPU share expert cache per layer (null or empty: none)
+    const std::vector<llm_graph_moe_cache_layer> * moe_cache = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1050,6 +1061,10 @@ struct llm_graph_context {
     // weights in place while the CPU computes the others (then clears it)
     mutable int moe_gpu_k  = 0;
     mutable int moe_gpu_e1 = 0;
+    // GPU for that share (e.g. the layer's device with a layer split), null = the first backend
+    mutable ggml_backend_t moe_gpu_backend = nullptr;
+    // its expert cache per layer (llm_graph_params::moe_cache)
+    const std::vector<llm_graph_moe_cache_layer> * moe_cache = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

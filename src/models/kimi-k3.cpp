@@ -768,6 +768,14 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
         moe_gpu_k  = n_tokens == 1 ? gpu_k : gpu_kb;
         moe_gpu_e1 = (int) (gpu_frac * hparams.n_expert);
+        // the share runs on the layer's GPU (layer split over several GPUs)
+        for (int i = 0; sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(b) == model.dev_layer(il)) {
+                moe_gpu_backend = b;
+                break;
+            }
+        }
     }
 
     ggml_tensor * moe_out = build_moe_ffn(routed_in,

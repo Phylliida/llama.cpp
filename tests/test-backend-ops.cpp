@@ -5395,6 +5395,95 @@ struct test_mul_mat_id_split : public test_mul_mat_id {
     }
 };
 
+// expert cache of the GPU part of a split MUL_MAT_ID (ggml_mul_mat_id_set_cache): n_steps evaluations chained on one
+// cache state and memory (output = their sum), so a difference in the state update between backends changes later steps.
+// The cache starts with all slots but the last filled
+struct test_mul_mat_id_cache : public test_case {
+    const ggml_type type_a;
+    const int n_mats, n_used;
+    const int64_t m, n, k;
+    const int split_k, e1, n_slots, n_steps;
+    const bool skip;
+    std::string vars() override {
+        return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_CACHE";
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    test_mul_mat_id_cache(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_k, int e1,
+            int n_slots, int n_steps, bool skip)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_k(split_k), e1(e1), n_slots(n_slots),
+          n_steps(n_steps), skip(skip) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*n_slots + 1);
+        ggml_set_name(state, "cache_state");
+        ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (n_slots + split_k)*as->nb[2]);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * sw = skip ? new_mmid_skip_w(ctx, n_used, n) : nullptr;
+        ggml_tensor * sum = nullptr;
+        for (int s = 0; s < n_steps; ++s) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, "ids");
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_mul_mat_id_set_split(out, 1, split_k, 0, e1);
+            if (sw) {
+                ggml_mul_mat_id_set_skip(out, sw);
+            }
+            ggml_mul_mat_id_set_cache(out, state, cache);
+            sum = sum ? ggml_add(ctx, sum, out) : out;
+        }
+        ggml_set_name(sum, "out");
+        return sum;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        ggml_tensor * as = nullptr, * state = nullptr, * cache = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "as") == 0 || strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t);
+                as = strcmp(t->name, "as") == 0 ? t : as;
+            } else if (strcmp(t->name, "cache_state") == 0) {
+                state = t;
+            } else if (strcmp(t->name, "cache") == 0) {
+                cache = t;
+            } else if (strcmp(t->name, "ids") == 0) {
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r*t->nb[1], t->ne[0]*sizeof(int32_t));
+                }
+            }
+        }
+        init_mmid_skip_w(ctx);
+        // slots 0..n_slots-2 hold distinct eligible experts (5 is coprime to e1), with their weights in the cache memory
+        std::vector<uint8_t> w(ggml_nbytes(as));
+        ggml_backend_tensor_get(as, w.data(), 0, w.size());
+        std::vector<int32_t> st(2*n_slots + 1, 0);
+        for (int s = 0; s < n_slots; ++s) {
+            const bool empty = s == n_slots - 1;
+            st[s]           = empty ? -1 : (s*5 + 1) % e1;
+            st[n_slots + s] = empty ? 0 : s + 1;
+            if (!empty) {
+                ggml_backend_tensor_set(cache, w.data() + st[s]*as->nb[2], s*as->nb[2], as->nb[2]);
+            }
+        }
+        st[2*n_slots] = n_slots + 5;
+        ggml_backend_tensor_set(state, st.data(), 0, st.size()*sizeof(int32_t));
+    }
+};
+
 // gate/up MUL_MAT_ID + SITU (the CPU backend fuses this at decode)
 struct test_mul_mat_id_situ : public test_case {
     const ggml_type type_a;
@@ -10241,6 +10330,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, false, 3));
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 2));
             }
+        }
+        // expert cache: hits, admission, LRU eviction, scratch slots (more new experts than free slots)
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 8, 3, 4, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 8, 4, 64, n, 256, 3, 8, 1, 6, false));
         }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {

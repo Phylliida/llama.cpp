@@ -2007,6 +2007,131 @@ static __global__ void mul_mat_id_gather_experts(const int4 * src, int4 * dst, c
     }
 }
 
+// expert cache of a split MUL_MAT_ID (ggml_mul_mat_id_set_cache), mode 1, one block with a thread per slot. Same decisions
+// and state update as ggml_mmid_split_taken (ggml-cpu.c): the batch's cached experts, then the first k uncached eligible
+// ones (tokens selecting them, then first occurrence), which are admitted to the cache. Outputs: wslot[r] = weight slot in
+// the cache of the r-th taken expert (-1 past the last, r < n_out), slots[r*n_tokens + t] = slot of token t for it or -1,
+// fill_e[c]/fill_s[c] (c < k) = expert to copy from src0 into weight slot fill_s[c] (-1: none)
+static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
+        const int n_tokens, const int k, const int e0, const int e1, const char * skip_w, const size_t wnb0, const size_t wnb1,
+        int32_t * state, const int n_slots, const int n_out, int32_t * wslot, int32_t * slots, int32_t * fill_e, int32_t * fill_s) {
+    __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
+    __shared__ int32_t s_cnt[1024];  // at an uncached expert's first slot: tokens selecting it, else 0
+    __shared__ int32_t s_hit[1024];  // at an expert's first slot: its cache slot, else -1
+    __shared__ int32_t s_rank[1024]; // at a taken expert's first slot: output index, else -1
+    __shared__ int32_t s_ws[1024];   // at a taken expert's first slot: weight slot
+    const int n = n_ids*n_tokens;
+    const int i = threadIdx.x;
+    const int t = i / n_ids;
+    const int j = i % n_ids;
+
+    if (i < n) {
+        const int32_t id      = *(const int32_t *) (ids + t*nb1 + j*nb0);
+        const bool    skipped = skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f;
+        s_e[i] = !skipped && id >= e0 && id < e1 ? id : -1;
+    }
+    for (int c = i; c < n_out; c += blockDim.x) {
+        wslot[c] = -1;
+    }
+    for (int c = i; c < n_out*n_tokens; c += blockDim.x) {
+        slots[c] = -1;
+    }
+    for (int c = i; c < k; c += blockDim.x) {
+        fill_e[c] = -1;
+        fill_s[c] = -1;
+    }
+    __syncthreads();
+
+    int first = -1;
+    if (i < n) {
+        int cnt = 0;
+        if (s_e[i] >= 0) {
+            for (int i2 = 0; i2 < n; ++i2) {
+                if (s_e[i2] == s_e[i]) {
+                    first = first < 0 ? i2 : first;
+                    cnt++;
+                }
+            }
+        }
+        int hit = -1;
+        for (int s = 0; first == i && s < n_slots; ++s) {
+            if (state[s] == s_e[i]) {
+                hit = s;
+                break;
+            }
+        }
+        s_hit[i]  = hit;
+        s_cnt[i]  = first == i && hit < 0 ? cnt : 0;
+        s_rank[i] = -1;
+    }
+    __syncthreads();
+
+    // the CPU's serial walk: hits in order of first occurrence, then the k ranked uncached experts
+    if (i == 0) {
+        int32_t * se = state;
+        int32_t * sa = state + n_slots;
+        const int32_t clock = state[2*n_slots];
+        int r = 0;
+        for (int u = 0; u < n; ++u) {
+            if (s_hit[u] >= 0) {
+                sa[s_hit[u]] = clock;
+                s_rank[u] = r++;
+                s_ws[u]   = s_hit[u];
+            }
+        }
+        for (int c = 0; c < k; ++c) {
+            int best = -1;
+            for (int u = 0; u < n; ++u) {
+                if (s_cnt[u] > 0 && (best < 0 || s_cnt[u] > s_cnt[best])) {
+                    best = u;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            s_cnt[best] = 0;
+            int v = -1;
+            for (int s = 0; s < n_slots; ++s) {
+                if (sa[s] < clock && (v < 0 || sa[s] < sa[v])) {
+                    v = s;
+                }
+            }
+            if (v >= 0) {
+                se[v] = s_e[best];
+                sa[v] = clock;
+            }
+            fill_e[c]    = s_e[best];
+            fill_s[c]    = v >= 0 ? v : n_slots + c;
+            s_rank[best] = r++;
+            s_ws[best]   = fill_s[c];
+        }
+        state[2*n_slots] = clock + 1;
+    }
+    __syncthreads();
+
+    if (i < n && first >= 0 && s_rank[first] >= 0) {
+        const int r = s_rank[first];
+        if (first == i) {
+            wslot[r] = s_ws[i];
+        }
+        slots[r*n_tokens + t] = j;
+    }
+}
+
+// copy the experts listed by mul_mat_id_cache_plan from src0 (host memory: wide loads over PCIe) into their cache slots
+static __global__ void mul_mat_id_cache_fill(const int4 * src, int4 * cache, const int32_t * fill_e, const int32_t * fill_s,
+        const int64_t n16_per_expert) {
+    const int32_t e = fill_e[blockIdx.y];
+    if (e < 0) {
+        return;
+    }
+    const int4 * s = src   + e*n16_per_expert;
+    int4       * d = cache + fill_s[blockIdx.y]*n16_per_expert;
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n16_per_expert; i += (int64_t) gridDim.x*blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2067,6 +2192,38 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const char * skip_d  = dst->src[3] ? (const char *) dst->src[3]->data : nullptr;
         const size_t skip_nb0 = dst->src[3] ? dst->src[3]->nb[0] : 0;
         const size_t skip_nb1 = dst->src[3] ? dst->src[3]->nb[1] : 0;
+
+        // the GPU part with an expert cache: copy the k newly taken experts into their slots, then compute all taken
+        // experts (cached + new) from the cache, expert-major
+        if (mode == 1 && dst->src[4] && dst->src[5] && k > 0 && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst)) {
+            const ggml_tensor * cache = dst->src[5];
+            const int n_slots = (int) (ggml_nelements(dst->src[4])/2);
+            const int n_out   = std::min(n_slots + k, n_ids*n_tokens);
+            GGML_ASSERT(ggml_is_contiguous(src0) && nb02 % 16 == 0 && (uintptr_t) src0->data % 16 == 0 &&
+                ggml_nbytes(cache) >= (size_t) (n_slots + k)*nb02);
+            ggml_cuda_pool_alloc<int32_t> plan(ctx.pool(), n_out + n_out*n_tokens + 2*k);
+            int32_t * wslot  = plan.get();
+            int32_t * slots  = wslot + n_out;
+            int32_t * fill_e = slots + n_out*n_tokens;
+            int32_t * fill_s = fill_e + k;
+            mul_mat_id_cache_plan<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3), skip_d, skip_nb0, skip_nb1,
+                (int32_t *) dst->src[4]->data, n_slots, n_out, wslot, slots, fill_e, fill_s);
+            const dim3 grid((82*4 + k - 1)/k, k);
+            mul_mat_id_cache_fill<<<grid, 256, 0, ctx.stream()>>>((const int4 *) src0->data, (int4 *) cache->data,
+                fill_e, fill_s, nb02/16);
+
+            ggml_tensor src0_t = *src0;
+            src0_t.data   = cache->data;
+            src0_t.buffer = cache->buffer;
+            src0_t.ne[2]  = n_slots + k;
+            src0_t.nb[3]  = nb02*(n_slots + k);
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            ggml_cuda_mul_mat_vec_q_moe_xm(ctx, &src0_t, src1, wslot, slots, n_out, dst);
+            return;
+        }
+        // the other paths would not update the cache state (the other part of the split would diverge)
+        GGML_ASSERT(!dst->src[4] && "expert cache: needs mode 1, cache memory and an mmvq-xm type");
 
         // the GPU part at a few tokens: expert-major, each taken expert is read once for all its tokens
         if (mode == 1 && n_tokens > 1 && k > 0 && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst)) {

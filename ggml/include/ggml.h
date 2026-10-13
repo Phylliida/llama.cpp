@@ -1526,6 +1526,15 @@ extern "C" {
     // so w must be the weights the expert outputs are multiplied with
     GGML_API void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w);
 
+    // expert cache for a split MUL_MAT_ID (needs ggml_mul_mat_id_set_split): the experts held in the cache's slots are
+    // taken on top of the k ranked ones, which are chosen among the uncached eligible experts and admitted to the cache
+    // (into an empty slot, else the least recently used one not used by this batch, lowest index on ties; none: not
+    // admitted). state: I32 [2*n_slots + 1] = expert per slot (-1: empty), last use per slot, clock; initialize to
+    // -1.., 0.., 1. Each evaluation updates it in place, so the two parts of a split keep separate copies that stay equal.
+    // cache (optional, for backends that compute from it): at least [nb02, n_slots + k] bytes of src0 expert matrices,
+    // slots n_slots.. are scratch for experts that are not admitted; backends that read src0 directly ignore it
+    GGML_API void ggml_mul_mat_id_set_cache(struct ggml_tensor * a, struct ggml_tensor * state, struct ggml_tensor * cache);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
