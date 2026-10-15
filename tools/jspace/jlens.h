@@ -128,6 +128,17 @@ bool jlens_build_forward_dt (const jlens_weights & m, int n_tokens, jlens_forwar
                              ggml_tensor * dt_one, ggml_tensor * dt_eps);
 bool jlens_build_forward_lrp(const jlens_weights & m, int n_tokens, jlens_lrp_forward & out);
 
+// steering-vector optimization graph: forward with a learnable vector v [n_embd] added to every
+// position after block steer_layer, full head, and a soft-label cross-entropy loss against
+// labels [n_vocab, n_tokens] (one distribution per row). v is the only PARAM, so the backward
+// pass covers blocks > steer_layer and the head only.
+struct jlens_steer_forward : jlens_forward {
+    ggml_tensor * steer  = nullptr; // f32 [n_embd] param
+    ggml_tensor * labels = nullptr; // f32 [n_vocab, n_tokens] input
+    ggml_tensor * loss   = nullptr; // f32 [1], loss-flagged; caller seeds its grad with 1
+};
+bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_layer, jlens_steer_forward & out);
+
 // single-block graph for local validation: h_in leaf -> (+zero_pad param) -> block -> h_out (loss)
 struct jlens_block {
     ggml_context * gctx = nullptr;

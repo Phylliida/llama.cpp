@@ -302,6 +302,69 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
     return true;
 }
 
+bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_layer, jlens_steer_forward & out) {
+    const auto & hp = m.hparams;
+    if (steer_layer < 0 || steer_layer >= hp.n_layer) {
+        fprintf(stderr, "jlens_build_forward_steer: steer_layer out of range\n");
+        return false;
+    }
+
+    const int    gsize    = hp.n_layer * 256;
+    const int    n_tensors= hp.n_layer * 220;
+    const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, true);
+    struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
+    out.gctx = ggml_init(iparams);
+    ggml_context * ctx = out.gctx;
+
+    out.gf = ggml_new_graph_custom(ctx, gsize, /*grads=*/true);
+
+    out.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.tokens, "jlens_tokens");
+    ggml_set_input(out.tokens);
+
+    out.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.pos, "jlens_pos");
+    ggml_set_input(out.pos);
+
+    out.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_set_name(out.mask, "jlens_mask");
+    ggml_set_input(out.mask);
+
+    out.steer = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+    ggml_set_name(out.steer, "jlens_steer");
+    ggml_set_param(out.steer);
+
+    ggml_tensor * inpL = ggml_get_rows(ctx, m.get("token_embd.weight"), out.tokens);
+    out.l_out.resize(hp.n_layer, nullptr);
+    for (int il = 0; il < hp.n_layer; ++il) {
+        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, /*use_flash_attn=*/false);
+        char name[64];
+        snprintf(name, sizeof(name), "jlens_l_out_%d", il);
+        ggml_set_name(cur, name);
+        out.l_out[il] = cur;
+        if (il == steer_layer) {
+            cur = ggml_add(ctx, cur, out.steer); // broadcast over positions
+        }
+        inpL = cur;
+    }
+
+    ggml_tensor * normed = rms_norm_mul(ctx, inpL, m.get("output_norm.weight"), hp.norm_eps);
+    out.logits = ggml_mul_mat(ctx, m.get("output.weight"), normed);
+    ggml_set_name(out.logits, "jlens_logits");
+    ggml_set_output(out.logits);
+
+    out.labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out.logits->ne[0], n_tokens);
+    ggml_set_name(out.labels, "jlens_labels");
+    ggml_set_input(out.labels);
+
+    out.loss = ggml_cross_entropy_loss(ctx, out.logits, out.labels);
+    ggml_set_name(out.loss, "jlens_loss");
+    ggml_set_output(out.loss);
+    out.loss->flags |= GGML_TENSOR_FLAG_LOSS;
+    ggml_build_forward_expand(out.gf, out.loss);
+    return true;
+}
+
 ggml_cgraph * jlens_build_head(const jlens_weights & m, ggml_context * gctx, ggml_tensor ** x_in) {
     ggml_tensor * x = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, m.hparams.n_embd, 1);
     ggml_set_name(x, "jlens_head_x");
