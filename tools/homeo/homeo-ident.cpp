@@ -2,17 +2,21 @@
 //
 // At a fixed layer, the state of a later position depends on earlier positions only through the tokens: a push
 // at the output of block L reaches later layer-L states only by changing what the model writes. So for random
-// probe directions u in a K-dim subspace (rows of --basis), steer with +a*u and -a*u after block L at every
-// position (prefill and generation, a = dose * mean |h_L|), sample --n-gen tokens per prefix at T=1 with common
-// random numbers (one uniform per prefix and step, shared by all arms), and record the PRE-steer layer-L state
-// of every generated position (l_out - a*u). The difference to the unsteered arm, projected on the basis, is
+// probe directions u in a K-dim subspace (rows of --basis), steer with +a*u and -a*u after block L from the last
+// prefix token on (a step input: the prefix itself is decoded once, unsteered, and shared by every arm through
+// the KV cache; a = dose * mean |h_L|), sample --n-gen tokens per prefix at T=1 with common random numbers (one
+// uniform per prefix and step, shared by all arms), and record the PRE-steer layer-L state of every generated
+// position (l_out - a*u). The difference to the unsteered arm, projected on the basis, is
 // the token-mediated response to the push. Fit offline (homeo/ident_fit.py): response ~ M(lag) z, z the probe
 // coordinates. Directions where M pushes back (negative eigenvalues of its symmetric part) are candidate
 // regulated variables; positive ones are amplified.
 //
 // Lag k = 0 is the last prefix token (no generated token yet), so its response must be exactly 0.
 // Humane endpoints (Three Rs protocol) as in homeo-loop: a sequence stops on a loop or incoherence; its later
-// lags are NaN. Every block of --log-every probes appends a row to --log (welfare_log.csv).
+// lags are NaN. Every --log-every arms, at the end, and on SIGINT/SIGTERM (which stop after the current arm) a
+// row goes to --log (welfare_log.csv).
+// Prefixes: held-out rollouts (--rollouts, doc_idx % 4 == 0, as homeo-loop), or windows of a token-id stream
+// (--ids, int32; window i starts at --ids-offset + i * --ids-stride).
 //
 // Output (resumable): OUT.bin, fixed-size records in this order: the unsteered arm, then for each dose, each
 // probe, sign + then -. Record: f16 dproj [NP][G][K] (basis projection of h_pre - h_pre_unsteered),
@@ -21,9 +25,10 @@
 // i32 endpoint [NP] (0 none, 1 loop, 2 incoherence). OUT.meta.json describes the run, OUT.z.f32 holds the
 // probe coordinates [P][K]. A rerun with the same arguments skips the records already in OUT.bin.
 //
-// usage: homeo-ident -m model.gguf --rollouts rollouts.jsonl --basis basis.f32 --k K --layer L --out PREFIX
-//          [--n-probe 64] [--doses 0.25] [--n-prefix 16] [--prefix-len 256] [--n-gen 48] [--seed 1]
-//          [--probe-seed 7] [--pause-ms 0] [--log welfare_log.csv] [--log-every 32] [--note text]
+// usage: homeo-ident -m model.gguf (--rollouts rollouts.jsonl | --ids ids.bin) --basis basis.f32 --k K --layer L
+//          --out PREFIX [--n-probe 64] [--doses 0.25] [--n-prefix 16] [--prefix-len 256] [--n-gen 48] [--seed 1]
+//          [--probe-seed 7] [--ids-offset 0] [--ids-stride 100003] [--pause-ms 0] [--log welfare_log.csv]
+//          [--log-every 16] [--note text]
 // --pause-ms is re-read from PREFIX.pause_ms (if it exists) before every arm, to change the duty cycle live.
 
 #include "llama.h"
@@ -40,6 +45,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <csignal>
 #include <random>
 #include <string>
 #include <sys/stat.h>
@@ -47,6 +53,9 @@
 #include <vector>
 
 using json = nlohmann::ordered_json;
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int) { g_stop = 1; }
 
 static void die(const char * msg) {
     fprintf(stderr, "homeo-ident: %s\n", msg);
@@ -146,10 +155,11 @@ struct arm_out {
 };
 
 int main(int argc, char ** argv) {
-    std::string model_path, rollouts_path, out_prefix, basis_path, log_path, note;
+    std::string model_path, rollouts_path, ids_path, out_prefix, basis_path, log_path, note;
+    long long ids_offset = 0, ids_stride = 100003;
     std::string doses_str = "0.25";
     int layer = -1, K = 0, n_probe = 64, n_prefix = 16, plen = 256, n_gen = 48, seed = 1, probe_seed = 7, ngl = 999;
-    int loop_max_p = 16, loop_min_span = 12, incoh_run = 16, ubatch = 512, pause_ms = 0, log_every = 32;
+    int loop_max_p = 16, loop_min_span = 12, incoh_run = 16, ubatch = 512, pause_ms = 0, log_every = 16;
     float incoh_h = 6.0f;
     int n_threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
 
@@ -158,6 +168,9 @@ int main(int argc, char ** argv) {
         auto next = [&]() -> const char * { if (i + 1 >= argc) die(("missing value for " + a).c_str()); return argv[++i]; };
         if      (a == "-m")                model_path    = next();
         else if (a == "--rollouts")        rollouts_path = next();
+        else if (a == "--ids")             ids_path      = next();
+        else if (a == "--ids-offset")      ids_offset    = atoll(next());
+        else if (a == "--ids-stride")      ids_stride    = atoll(next());
         else if (a == "--out")             out_prefix    = next();
         else if (a == "--basis")           basis_path    = next();
         else if (a == "--k")               K             = atoi(next());
@@ -181,8 +194,8 @@ int main(int argc, char ** argv) {
         else if (a == "--note")            note          = next();
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
-    if (model_path.empty() || rollouts_path.empty() || out_prefix.empty() || basis_path.empty() || layer < 1 || K < 1) {
-        fprintf(stderr, "usage: homeo-ident -m model.gguf --rollouts rollouts.jsonl --basis basis.f32 --k K --layer L --out PREFIX [options]\n");
+    if (model_path.empty() || rollouts_path.empty() == ids_path.empty() || out_prefix.empty() || basis_path.empty() || layer < 1 || K < 1) {
+        fprintf(stderr, "usage: homeo-ident -m model.gguf (--rollouts rollouts.jsonl | --ids ids.bin) --basis basis.f32 --k K --layer L --out PREFIX [options]\n");
         return 1;
     }
     std::vector<float> doses;
@@ -194,7 +207,7 @@ int main(int argc, char ** argv) {
     std::vector<prefix> pre;
     struct ro { std::vector<int32_t> prompt; std::string text; int doc; int rollout; };
     std::vector<ro> rolls;
-    {
+    if (!rollouts_path.empty()) {
         std::ifstream f(rollouts_path);
         if (!f) die("cannot open rollouts file");
         std::string line;
@@ -218,6 +231,18 @@ int main(int argc, char ** argv) {
     const int n_layer = llama_model_n_layer(model);
     if (layer >= n_layer - 1) die("--layer must be < n_layer - 1");
 
+    if (!ids_path.empty()) {
+        std::ifstream f(ids_path, std::ios::binary | std::ios::ate);
+        if (!f) die("cannot open --ids");
+        std::vector<int32_t> ids((size_t) f.tellg() / sizeof(int32_t));
+        f.seekg(0);
+        f.read((char *) ids.data(), ids.size() * sizeof(int32_t));
+        for (int i = 0; i < n_prefix; ++i) {
+            const long long o = ids_offset + (long long) i * ids_stride;
+            if (o + plen > (long long) ids.size()) die("--ids stream too short for --n-prefix windows");
+            pre.push_back({ std::vector<int32_t>(ids.begin() + o, ids.begin() + o + plen), (int) (o / 1000), i });
+        }
+    }
     for (auto & r : rolls) {
         if ((int) pre.size() >= n_prefix) break;
         std::vector<int32_t> toks = r.prompt;
@@ -264,10 +289,10 @@ int main(int argc, char ** argv) {
     cap.name   = "l_out-" + std::to_string(layer);
     cap.n_embd = n_embd;
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx             = NP * (plen + G) + 256;
+    cp.n_ctx             = NP * (plen + G) + 512;
     cp.n_batch           = ubatch;
     cp.n_ubatch          = ubatch;
-    cp.n_seq_max         = NP;
+    cp.n_seq_max         = 2 * NP; // 0..NP-1 arms, NP..2NP-1 the shared unsteered prefixes
     cp.kv_unified        = true;
     cp.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.cb_eval           = cb_eval;
@@ -278,7 +303,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) die("context init failed");
     llama_memory_t mem = llama_get_memory(ctx);
-    llama_batch batch = llama_batch_init(std::max(ubatch, NP), 0, 1);
+    llama_batch batch = llama_batch_init(std::max(ubatch, 2 * NP), 0, 1);
 
     // mean residual norm at the layer (unsteered prefixes, skipping the first 16 positions)
     if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) die("cvec clear failed");
@@ -310,6 +335,27 @@ int main(int argc, char ** argv) {
         h_norm /= std::max<int64_t>(1, nr);
     }
 
+    // the unsteered prefixes [0, plen - 1), decoded once into the master sequences NP + i
+    llama_memory_clear(mem, true);
+    {
+        int nb = 0;
+        for (int i = 0; i < NP; ++i) {
+            for (int t = 0; t + 1 < plen; ++t) {
+                batch.token[nb] = pre[i].toks[t]; batch.pos[nb] = t; batch.n_seq_id[nb] = 1; batch.seq_id[nb][0] = NP + i;
+                batch.logits[nb] = 0;
+                if (++nb == ubatch) {
+                    batch.n_tokens = nb;
+                    if (llama_decode(ctx, batch) != 0) die("llama_decode failed (prefix)");
+                    nb = 0;
+                }
+            }
+        }
+        if (nb > 0) {
+            batch.n_tokens = nb;
+            if (llama_decode(ctx, batch) != 0) die("llama_decode failed (prefix)");
+        }
+    }
+
     // common random numbers: one uniform per (prefix, step)
     std::vector<std::vector<double>> Uni(NP, std::vector<double>(G));
     for (int i = 0; i < NP; ++i) {
@@ -336,22 +382,10 @@ int main(int argc, char ** argv) {
         o.tok.assign((size_t) NP * G, -1);
         o.endpoint.assign(NP, 0);
 
-        llama_memory_clear(mem, true);
-        int nb = 0;
-        auto flush = [&]() {
-            if (nb == 0) return;
-            batch.n_tokens = nb;
-            if (llama_decode(ctx, batch) != 0) die("llama_decode failed (prefill)");
-            nb = 0;
-        };
         for (int i = 0; i < NP; ++i) {
-            for (int t = 0; t + 1 < plen; ++t) {
-                batch.token[nb] = pre[i].toks[t]; batch.pos[nb] = t; batch.n_seq_id[nb] = 1; batch.seq_id[nb][0] = i;
-                batch.logits[nb] = 0;
-                if (++nb == ubatch) flush();
-            }
+            llama_memory_seq_rm(mem, i, -1, -1);
+            llama_memory_seq_cp(mem, NP + i, i, -1, -1);
         }
-        flush();
         std::vector<int> act(NP);
         for (int i = 0; i < NP; ++i) {
             act[i] = i;
@@ -523,7 +557,7 @@ int main(int argc, char ** argv) {
         char manip[256];
         snprintf(manip, sizeof(manip), "steer after block %d along +-random unit directions in a %d-dim PCA subspace x dose x mean|h| %.1f (%d arms)",
                  layer, K, h_norm, blk_arms);
-        std::string notes = "homeo-ident (plan B); prefill also steered: " + std::to_string(NP) + " x " + std::to_string(plen) + " tokens per arm";
+        std::string notes = "homeo-ident (plan B); steering from the last prefix token on (prefix unsteered)";
         if (!note.empty()) notes += "; " + note;
         fprintf(flog, "%s,B-ident,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", date, csv_q(base_name(model_path)).c_str(), csv_q(manip).c_str(),
                 blk_dose, (long long) blk_tok, blk_ctx, csv_q(endpoint_desc).c_str(), blk_ctx ? (double) blk_ctx_end / blk_ctx : 0.0, csv_q(notes).c_str());
@@ -531,11 +565,13 @@ int main(int argc, char ** argv) {
         blk_tok = 0; blk_arms = 0; blk_ctx_end = 0; blk_ctx = 0;
     };
 
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
     long long rec = 1;
-    for (size_t di = 0; di < doses.size(); ++di) {
+    for (size_t di = 0; di < doses.size() && !g_stop; ++di) {
         const float sc_abs = (float) (doses[di] * h_norm);
-        for (int p = 0; p < n_probe; ++p) {
-            for (int sg = 0; sg < 2; ++sg, ++rec) {
+        for (int p = 0; p < n_probe && !g_stop; ++p) {
+            for (int sg = 0; sg < 2 && !g_stop; ++sg, ++rec) {
                 if (rec < done) continue;
                 {
                     std::ifstream pf(out_prefix + ".pause_ms");
@@ -554,11 +590,12 @@ int main(int argc, char ** argv) {
                 const double st = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 fprintf(stderr, "  dose %.3f probe %4d %c: diverged %2d/%d, endpoints %d, %.1f s (record %lld/%lld, %.2f h)\n",
                         doses[di], p, sg == 0 ? '+' : '-', nd, NP, ne, sa, rec + 1, n_rec, st / 3600.0);
-                if (pause_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
+                for (int w = 0; w < pause_ms && !g_stop; w += 100) std::this_thread::sleep_for(std::chrono::milliseconds(std::min(100, pause_ms - w)));
             }
         }
     }
     log_block();
+    if (g_stop) fprintf(stderr, "homeo-ident: stopped by signal after record %lld; rerun to resume\n", rec);
     fclose(fb);
     if (flog) fclose(flog);
     fprintf(stderr, "homeo-ident: done -> %s\n", bin_path.c_str());
