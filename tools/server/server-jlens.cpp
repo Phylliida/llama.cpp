@@ -9,6 +9,8 @@
 #include "src/llama-model.h"
 #include "src/llama-vocab.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cfloat>
 #include <cinttypes>
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <thread>
 
@@ -83,6 +86,18 @@ struct server_jlens_state {
 };
 
 server_jlens_state g_jlens;
+
+// linear readouts (value-lens probes); model-independent, so not cleared by deinit.
+// guarded by g_jlens.mutex
+struct server_jlens_readout_state {
+    int                      layer  = -1;
+    int64_t                  n_embd = 0;
+    std::vector<std::string> names;
+    std::vector<float>       W; // [n][n_embd]
+    std::vector<float>       b; // [n]
+};
+
+server_jlens_readout_state g_readout;
 
 // caller must hold g_jlens.mutex
 void server_jlens_deinit_locked() {
@@ -267,6 +282,58 @@ bool server_jlens_init(const llama_model * model, const std::string & jlens_path
     return true;
 }
 
+bool server_jlens_load_readouts(const std::string & path, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    nlohmann::json meta;
+    {
+        std::ifstream f(path + ".json");
+        if (!f) {
+            err = "cannot open " + path + ".json";
+            return false;
+        }
+        try {
+            f >> meta;
+        } catch (const std::exception & e) {
+            err = std::string("bad readout json: ") + e.what();
+            return false;
+        }
+    }
+    server_jlens_readout_state r;
+    r.layer  = meta.value("layer", -1);
+    r.n_embd = meta.value("n_embd", (int64_t) 0);
+    r.names  = meta.value("names", std::vector<std::string>());
+    if (g_jlens.n_layer > 0 && (r.layer < 0 || r.layer >= g_jlens.n_layer)) {
+        err = "readout layer out of range";
+        return false;
+    }
+    if (g_jlens.n_embd > 0 && r.n_embd != g_jlens.n_embd) {
+        err = "readout n_embd does not match the model";
+        return false;
+    }
+    if (r.names.empty()) {
+        err = "readout json has no names";
+        return false;
+    }
+    const size_t n = r.names.size();
+    std::vector<float> buf(n * r.n_embd + n);
+    std::ifstream f(path + ".f32", std::ios::binary | std::ios::ate);
+    if (!f || (size_t) f.tellg() != buf.size() * sizeof(float)) {
+        err = "readout weights missing or wrong size: " + path + ".f32";
+        return false;
+    }
+    f.seekg(0);
+    f.read((char *) buf.data(), buf.size() * sizeof(float));
+    r.W.assign(buf.begin(), buf.begin() + n * r.n_embd);
+    r.b.assign(buf.begin() + n * r.n_embd, buf.end());
+    g_readout = std::move(r);
+    return true;
+}
+
+bool server_jlens_readouts_enabled() {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    return g_readout.layer >= 0;
+}
+
 bool server_jlens_enabled() {
     return g_jlens.weights != nullptr;
 }
@@ -280,9 +347,19 @@ bool server_jlens_compute(
         bool all_positions,
         std::vector<server_jlens_layer_result> & out_layers,
         std::vector<std::pair<std::string, float>> & out_model_topk,
-        std::string & err) {
+        std::string & err,
+        server_jlens_readouts * readouts,
+        bool readouts_only,
+        server_jlens_token_stats * stats) {
 
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    if (readouts && g_readout.layer < 0) {
+        err = "jlens: readouts not loaded (--value-probe)";
+        return false;
+    }
+    if (!readouts && !stats) {
+        readouts_only = false;
+    }
     if (!g_jlens.weights) {
         err = "jlens: not initialized (model reloading?)";
         return false;
@@ -319,7 +396,9 @@ bool server_jlens_compute(
     layers.erase(std::remove_if(layers.begin(), layers.end(),
         [](int il) { return il >= 0 && il < (int) g_jlens.fitted.size() && !g_jlens.fitted[il]; }),
         layers.end());
-    if (layers.empty()) {
+    if (readouts_only) {
+        layers.clear();
+    } else if (layers.empty()) {
         err = "jlens: no fitted layers in the requested set";
         return false;
     }
@@ -344,7 +423,8 @@ bool server_jlens_compute(
     // pin only the activations we actually fetch: every ggml_set_output'd tensor
     // is retained by the allocator for the whole graph lifetime
     for (int il : layers) ggml_set_output(fwd.l_out[il]);
-    ggml_set_output(fwd.l_out.back()); // model_topk reference decode
+    if (readouts) ggml_set_output(fwd.l_out[g_readout.layer]);
+    if (!readouts_only || stats) ggml_set_output(fwd.l_out.back()); // model_topk reference decode, token stats
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
     if (!ggml_gallocr_alloc_graph(galloc, fwd.gf)) {
@@ -374,8 +454,116 @@ bool server_jlens_compute(
     }
 
     const int64_t n_embd  = g_jlens.n_embd;
+
+    if (readouts) {
+        // W h + b at every position, on the CPU (n_names dot products of n_embd per position)
+        const int64_t L = g_readout.layer;
+        const int n_r = (int) g_readout.names.size();
+        std::vector<float> h((size_t) n_embd * n_tokens);
+        ggml_backend_tensor_get(fwd.l_out[L], h.data(), 0, h.size() * sizeof(float));
+        readouts->layer = (int) L;
+        readouts->names = g_readout.names;
+        readouts->values.assign(n_tokens, std::vector<float>(n_r));
+        const int nt = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> ts;
+        const int per = (n_tokens + nt - 1) / nt;
+        for (int t = 0; t < nt; ++t) {
+            const int q0 = t * per, q1 = std::min(n_tokens, q0 + per);
+            if (q0 >= q1) break;
+            ts.emplace_back([&, q0, q1] {
+                for (int q = q0; q < q1; ++q) {
+                    const float * hq = h.data() + (size_t) q * n_embd;
+                    for (int r = 0; r < n_r; ++r) {
+                        const float * w = g_readout.W.data() + (size_t) r * n_embd;
+                        double acc = g_readout.b[r];
+                        for (int64_t e = 0; e < n_embd; ++e) acc += (double) w[e] * hq[e];
+                        readouts->values[q][r] = (float) acc;
+                    }
+                }
+            });
+        }
+        for (auto & t : ts) t.join();
+    }
     const int64_t n_vocab = g_jlens.weights->hparams.n_vocab;
     const int     n_real  = llama_vocab_n_tokens(vocab); // logits may be padded
+
+    if (stats) {
+        // full head over all positions in chunks, then log-softmax stats on the CPU
+        stats->surprisal.assign(n_tokens, NAN);
+        stats->entropy.assign(n_tokens, NAN);
+        stats->branches.assign(n_tokens, NAN);
+        stats->runner_up.assign(n_tokens, NAN);
+        ggml_tensor * out_norm = g_jlens.weights->get("output_norm.weight");
+        ggml_tensor * out_w    = g_jlens.weights->get("output.weight");
+        ggml_gallocr_t galloc_s = ggml_gallocr_new(buft);
+        const int chunk = 512;
+        const int nt = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+        std::vector<float> lg;
+        for (int p0 = 0; p0 < n_tokens; p0 += chunk) {
+            const int np = std::min(chunk, n_tokens - p0);
+            ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * c = ggml_init(ip);
+            // leaf aliasing the final block output columns (see the all-positions path below)
+            ggml_tensor * av = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_embd, np);
+            av->data   = (char *) fwd.l_out.back()->data + (size_t) p0 * fwd.l_out.back()->nb[1];
+            av->buffer = fwd.l_out.back()->buffer;
+            ggml_tensor * logits = ggml_mul_mat(c, out_w, ggml_mul(c, ggml_rms_norm(c, av, g_jlens.weights->hparams.norm_eps), out_norm));
+            ggml_cgraph * gf = ggml_new_graph(c);
+            ggml_build_forward_expand(gf, logits);
+            const bool ok = ggml_gallocr_alloc_graph(galloc_s, gf) && ggml_backend_graph_compute(g_jlens.backend, gf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                lg.resize((size_t) n_vocab * np);
+                ggml_backend_tensor_get(logits, lg.data(), 0, lg.size() * sizeof(float));
+            }
+            ggml_free(c);
+            if (!ok) {
+                ggml_gallocr_free(galloc_s);
+                ggml_gallocr_free(galloc);
+                ggml_free(fwd.gctx);
+                err = "jlens: token stats compute failed";
+                return false;
+            }
+            std::vector<std::thread> ts;
+            const int per = (np + nt - 1) / nt;
+            for (int t = 0; t < nt; ++t) {
+                const int q0 = t * per, q1 = std::min(np, q0 + per);
+                if (q0 >= q1) break;
+                ts.emplace_back([&, q0, q1] {
+                    for (int q = q0; q < q1; ++q) {
+                        const float * z = lg.data() + (size_t) q * n_vocab;
+                        float mx = -INFINITY, mx2 = -INFINITY;
+                        for (int x = 0; x < n_real; ++x) {
+                            if (z[x] > mx) { mx2 = mx; mx = z[x]; } else if (z[x] > mx2) { mx2 = z[x]; }
+                        }
+                        double se = 0.0, sze = 0.0, se2 = 0.0;
+                        for (int x = 0; x < n_real; ++x) {
+                            const double e = std::exp((double) z[x] - mx);
+                            se += e;
+                            sze += e * ((double) z[x] - mx);
+                            se2 += e * e;
+                        }
+                        const double lse = std::log(se);
+                        const int s = p0 + q;
+                        stats->entropy[s]   = (float) (lse - sze / se); // -sum p log p
+                        stats->branches[s]  = (float) (se * se / se2);  // 1 / sum p^2
+                        stats->runner_up[s] = (float) std::exp((double) mx2 - mx);
+                        if (s + 1 < n_tokens) {
+                            stats->surprisal[s] = (float) (lse - ((double) z[tokens[s + 1]] - mx));
+                        }
+                    }
+                });
+            }
+            for (auto & t : ts) t.join();
+        }
+        ggml_gallocr_free(galloc_s);
+    }
+    if (readouts_only) {
+        out_layers.clear();
+        out_model_topk.clear();
+        ggml_gallocr_free(galloc);
+        ggml_free(fwd.gctx);
+        return true;
+    }
 
     // display text for a token id: detokenize (inverts the byte->unicode display
     // mapping, so multi-byte UTF-8 tokens like 巴黎 render correctly) with a
@@ -573,5 +761,68 @@ bool server_jlens_compute(
 
     ggml_gallocr_free(galloc);
     ggml_free(fwd.gctx);
+    return true;
+}
+
+bool server_jlens_value_exact(const std::vector<int32_t> & tokens, int slot_layer, int chunk,
+                              std::vector<float> & fut_norm, std::vector<float> & now_norm, double & sec, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    if (!g_jlens.weights) {
+        err = "jlens: not initialized (model reloading?)";
+        return false;
+    }
+    if (tokens.size() < 2 || tokens.size() > 8192) {
+        err = "value_exact: n_tokens out of range (2..8192)";
+        return false;
+    }
+    jlens_value_result r;
+    if (!jlens_value_exact(*g_jlens.weights, g_jlens.backend, ggml_backend_cuda_buffer_type(g_jlens.device),
+                           tokens, slot_layer, chunk, /*keep_vectors=*/false, r, err)) {
+        return false;
+    }
+    fut_norm = std::move(r.fut_norm);
+    now_norm = std::move(r.now_norm);
+    sec = r.sec_fwd + r.sec_main + r.sec_now;
+    fprintf(stderr, "srv  jlens: value_exact %zu tokens, chunk %d: forward %.2f s, sweep %.2f s, now %.2f s\n",
+            tokens.size(), r.chunk, r.sec_fwd, r.sec_main, r.sec_now);
+    return true;
+}
+
+bool server_jlens_branch_grad(const llama_vocab * vocab, const std::vector<int32_t> & tokens, int topk, int chunk,
+                              server_jlens_branch & out, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    if (!g_jlens.weights) {
+        err = "jlens: not initialized (model reloading?)";
+        return false;
+    }
+    if (tokens.size() < 3 || tokens.size() > 8192) {
+        err = "branch_grad: n_tokens out of range (3..8192)";
+        return false;
+    }
+    jlens_branch_result r;
+    if (!jlens_branch_grad(*g_jlens.weights, g_jlens.backend, ggml_backend_cuda_buffer_type(g_jlens.device),
+                           tokens, topk, chunk, llama_vocab_n_tokens(vocab), r, err)) {
+        return false;
+    }
+    auto piece_of = [&](int id) {
+        char buf[256];
+        const llama_token t = (llama_token) id;
+        const int nb = llama_detokenize(vocab, &t, 1, buf, (int32_t) sizeof(buf), false, false);
+        return nb > 0 ? std::string(buf, nb) : std::string(llama_vocab_get_text(vocab, id));
+    };
+    const size_t N = tokens.size();
+    out.k = r.k;
+    out.spread = r.spread;
+    out.cand.assign(N, {});
+    for (size_t s = 0; s < N; ++s) {
+        for (int j = 0; j < r.k; ++j) {
+            const int32_t id = r.cand[s * r.k + j];
+            if (id < 0) continue;
+            out.cand[s].push_back({ piece_of(id), r.prob[s * r.k + j], r.delta[s * r.k + j] });
+        }
+    }
+    out.sec = r.sec_fwd + r.sec_bwd;
+    fprintf(stderr, "srv  jlens: branch_grad %zu tokens, chunk %d: forward %.2f s, backward %.2f s\n",
+            N, r.chunk, r.sec_fwd, r.sec_bwd);
     return true;
 }

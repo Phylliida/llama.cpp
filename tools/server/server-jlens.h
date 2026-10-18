@@ -36,6 +36,30 @@ struct server_jlens_layer_result {
     std::vector<std::vector<std::pair<std::string, float>>> positions;
 };
 
+// linear readouts on one block output (value-lens probes from
+// homeo/value_readout_export.py): PATH.f32 holds [n][n_embd] weights then [n]
+// biases, PATH.json {"layer", "n_embd", "names"}. readout = W h + b per position.
+// Load after server_jlens_init; survives model reloads.
+bool server_jlens_load_readouts(const std::string & path, std::string & err);
+bool server_jlens_readouts_enabled();
+
+struct server_jlens_readouts {
+    int layer = -1;
+    std::vector<std::string> names;
+    std::vector<std::vector<float>> values; // [n_tokens][n_names]
+};
+
+// per-position next-token statistics from the model's own output distribution
+struct server_jlens_token_stats {
+    std::vector<float> surprisal; // [n_tokens] -log p(x_{s+1}); NaN at the last position
+    std::vector<float> entropy;   // [n_tokens] entropy of the next-token distribution (nats)
+    std::vector<float> branches;  // [n_tokens] 1 / sum p^2: effective number of strong candidates
+    std::vector<float> runner_up; // [n_tokens] p2 / p1: second candidate relative to the first
+};
+
+// readouts != nullptr: also compute the readouts at every position.
+// stats != nullptr: also compute surprisal and entropy at every position.
+// readouts_only: skip the J-lens decode (layers and model_topk stay empty).
 bool server_jlens_compute(
         const llama_vocab * vocab,
         const std::vector<int32_t> & tokens,
@@ -45,4 +69,28 @@ bool server_jlens_compute(
         bool all_positions,
         std::vector<server_jlens_layer_result> & out_layers,
         std::vector<std::pair<std::string, float>> & out_model_topk,
-        std::string & err);
+        std::string & err,
+        server_jlens_readouts * readouts = nullptr,
+        bool readouts_only = false,
+        server_jlens_token_stats * stats = nullptr);
+
+// exact value lens (jlens_value_exact) at slot_layer for every position: |d log p(x_{s+1}) / d h_s| (now) and
+// |sum over all later t > s of d log p(x_{t+1}) / d h_s| (fut). Needs only the model weights (no probe file).
+bool server_jlens_value_exact(const std::vector<int32_t> & tokens, int slot_layer, int chunk,
+                              std::vector<float> & fut_norm, std::vector<float> & now_norm, double & sec, std::string & err);
+
+// branch gradients (jlens_branch_grad): per position the spread of the linearized effect of the top-k candidates
+// for the next token on the log-likelihood of all later tokens, and the candidates themselves
+struct server_jlens_branch_cand {
+    std::string piece;
+    float       prob;
+    float       delta; // linearized change in the later log-likelihood if this were the next token (NaN if undefined)
+};
+struct server_jlens_branch {
+    int k = 0;
+    std::vector<float> spread;                                  // [n_tokens], NaN where undefined
+    std::vector<std::vector<server_jlens_branch_cand>> cand;    // [n_tokens][k]
+    double sec = 0.0;
+};
+bool server_jlens_branch_grad(const llama_vocab * vocab, const std::vector<int32_t> & tokens, int topk, int chunk,
+                              server_jlens_branch & out, std::string & err);

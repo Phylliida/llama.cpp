@@ -16,18 +16,29 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x, ggml_tens
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
 }
 
+// [D, Hkv, n] -> [D, H, n] with the mul_mat GQA head map (q head h uses kv head h / (H/Hkv))
+static ggml_tensor * gqa_expand(ggml_context * ctx, ggml_tensor * x, int64_t n_head) {
+    const int64_t D = x->ne[0], Hkv = x->ne[1], n = x->ne[2];
+    ggml_tensor * x4 = ggml_reshape_4d(ctx, x, D, 1, Hkv, n);
+    x4 = ggml_repeat_4d(ctx, x4, D, n_head / Hkv, Hkv, n);
+    return ggml_reshape_3d(ctx, x4, D, n_head, n);
+}
+
 // one GLM-4 dense block: post-norm attention + swiglu MLP with residuals.
 // dt_src mode: instead of the raw detach sources, emits the FINAL detached leaf
 // values computed in-graph (rms_inv = 1/sqrt(mean(x^2)+eps), sigmoid(gate),
 // silu(gate), up) so the LRP graph's leaf inputs can alias them directly —
 // no separate leaf buffers, no host roundtrip. dt_one/dt_eps are [1] f32
 // constant leaves (1.0, norm_eps) supplied by the caller.
+// ckv: chunk mode (see jlens_upper_chunk); the block's queries are the n_tokens chunk positions and
+// keys/values span ckv->k_kv. kv_out: receives the block's keys (after rope) and values, [D, Hkv, n_tokens].
 static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int il, int n_tokens,
                                ggml_tensor * inpL, ggml_tensor * pos, ggml_tensor * mask,
                                bool use_flash_attn,
                                jlens_lrp_leaves * lrp = nullptr,
                                std::vector<ggml_tensor *> * dt_src = nullptr,
-                               ggml_tensor * dt_one = nullptr, ggml_tensor * dt_eps = nullptr) {
+                               ggml_tensor * dt_one = nullptr, ggml_tensor * dt_eps = nullptr,
+                               jlens_chunk_kv * ckv = nullptr, ggml_tensor ** kv_out = nullptr) {
     const auto & hp = m.hparams;
     const int64_t n_embd      = hp.n_embd;
     const int64_t n_head      = hp.n_head;
@@ -79,6 +90,27 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
                       /*attn_factor=*/1.0f, /*beta_fast=*/32.0f, /*beta_slow=*/1.0f);
     k = ggml_rope_ext(ctx, k, pos, nullptr, hp.n_rot, 0, hp.n_ctx_train,
                       hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    if (kv_out) {
+        kv_out[0] = k;
+        kv_out[1] = v;
+    }
+
+    // chunk mode: swap in the keys/values of all positions [0, n_kv)
+    ggml_tensor * k_live = k, * v_live = v;
+    if (ckv) {
+        GGML_ASSERT(!use_flash_attn);
+        ckv->k_live = k;
+        ckv->v_live = v;
+        if (ckv->now) {
+            k = ckv->k_kv;
+            v = ckv->v_kv;
+        } else {
+            // x 1: the grad that reaches the SET comes back through a permute (strided); the MUL backward
+            // makes it contiguous, which the SET backward (ggml_acc) requires
+            k = ggml_mul(ctx, ggml_set_1d(ctx, ckv->k_kv, k, ckv->a * ckv->k_kv->nb[2]), ckv->one);
+            v = ggml_mul(ctx, ggml_set_1d(ctx, ckv->v_kv, v, ckv->a * ckv->v_kv->nb[2]), ckv->one);
+        }
+    }
 
     // GQA: ggml_mul_mat broadcasts a's head dims (b head i maps to a head i / (Hb/Ha),
     // contiguous groups) and the MUL_MAT backward handles the broadcast, so no manual
@@ -110,6 +142,21 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
         // attention scores [n_kv, n_q, n_head] (k broadcast 2 -> 48 heads)
         ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);
         ggml_prec_set_acc(kq, GGML_PREC_F32); // matches llama-graph.cpp's GLM4 handling
+
+        // now mode: each query sees the frozen keys/values, except its own key/value, which is live.
+        // The diagonal terms add q.(k_live - k_frozen) and p_ii (v_live - v_frozen): value ~0, but
+        // the gradient reaches k_live/v_live through the query's own position only.
+        const bool diag = ckv && ckv->now;
+        const size_t a_off = diag ? (size_t) ckv->a : 0;
+        if (diag) {
+            ggml_tensor * k_fz = ggml_view_3d(ctx, ckv->k_kv, n_embd_head, n_head_kv, n_tokens,
+                                              ckv->k_kv->nb[1], ckv->k_kv->nb[2], a_off * ckv->k_kv->nb[2]);
+            ggml_tensor * dk = gqa_expand(ctx, ggml_sub(ctx, k_live, k_fz), n_head); // [D, H, n_q]
+            ggml_tensor * s_self = ggml_sum_rows(ctx, ggml_mul(ctx, q, dk));          // [1, H, n_q]
+            s_self = ggml_cont(ctx, ggml_permute(ctx, s_self, 0, 2, 1, 3));          // [1, n_q, H]
+            // diagonal of kq: element (a + i, i, h), so row stride nb[1] + nb[0]
+            kq = ggml_acc(ctx, kq, s_self, kq->nb[1] + kq->nb[0], kq->nb[2], kq->nb[3], a_off * kq->nb[0]);
+        }
         kq = ggml_soft_max_ext(ctx, kq, mask, kq_scale, /*max_bias=*/0.0f);
 
         // weighted values: [n_embd_head, n_q, n_head]
@@ -118,6 +165,15 @@ static ggml_tensor * glm_block(ggml_context * ctx, const jlens_weights & m, int 
         // non-contiguous grad view to a CONT node, which ggml asserts against.
         ggml_tensor * vt  = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [n_kv, n_embd_head, n_head_kv]
         kqv = ggml_mul_mat(ctx, vt, kq);                        // [n_embd_head, n_q, n_head]
+        if (diag) {
+            ggml_tensor * v_fz = ggml_view_3d(ctx, ckv->v_kv, n_embd_head, n_head_kv, n_tokens,
+                                              ckv->v_kv->nb[1], ckv->v_kv->nb[2], a_off * ckv->v_kv->nb[2]);
+            ggml_tensor * dv = gqa_expand(ctx, ggml_sub(ctx, v_live, v_fz), n_head);   // [D, H, n_q]
+            dv = ggml_cont(ctx, ggml_permute(ctx, dv, 0, 2, 1, 3));                   // [D, n_q, H]
+            ggml_tensor * p_ii = ggml_cont(ctx, ggml_view_3d(ctx, kq, 1, n_tokens, n_head,
+                                                             kq->nb[1] + kq->nb[0], kq->nb[2], a_off * kq->nb[0]));
+            kqv = ggml_add(ctx, kqv, ggml_mul(ctx, dv, p_ii));
+        }
 
         // merge heads -> [n_embd, n_q]
         kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));       // [n_embd_head, n_head, n_q]
@@ -261,9 +317,15 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
     }
 
     out.l_out.resize(hp.n_layer, nullptr);
+    out.k_out.resize(hp.n_layer, nullptr);
+    out.v_out.resize(hp.n_layer, nullptr);
 
     for (int il = 0; il < hp.n_layer; ++il) {
-        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, use_flash_attn);
+        ggml_tensor * kv[2] = {};
+        ggml_tensor * cur = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, use_flash_attn,
+                                      nullptr, nullptr, nullptr, nullptr, nullptr, kv);
+        out.k_out[il] = kv[0];
+        out.v_out[il] = kv[1];
 
         {
             char name[64];
@@ -302,7 +364,8 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
     return true;
 }
 
-bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_layer, jlens_steer_forward & out) {
+bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_layer, jlens_steer_forward & out,
+                               bool per_position) {
     const auto & hp = m.hparams;
     if (steer_layer < 0 || steer_layer >= hp.n_layer) {
         fprintf(stderr, "jlens_build_forward_steer: steer_layer out of range\n");
@@ -330,7 +393,8 @@ bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_
     ggml_set_name(out.mask, "jlens_mask");
     ggml_set_input(out.mask);
 
-    out.steer = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
+    out.steer = per_position ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens)
+                             : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hp.n_embd);
     ggml_set_name(out.steer, "jlens_steer");
     ggml_set_param(out.steer);
 
@@ -343,7 +407,7 @@ bool jlens_build_forward_steer(const jlens_weights & m, int n_tokens, int steer_
         ggml_set_name(cur, name);
         out.l_out[il] = cur;
         if (il == steer_layer) {
-            cur = ggml_add(ctx, cur, out.steer); // broadcast over positions
+            cur = ggml_add(ctx, cur, out.steer); // broadcast over positions (or one slot per position)
         }
         inpL = cur;
     }
@@ -510,5 +574,154 @@ bool jlens_build_forward_lrp(const jlens_weights & m, int n_tokens, jlens_lrp_fo
         inpL = cur;
     }
 
+    return true;
+}
+
+bool jlens_build_upper_chunk(const jlens_weights & m, int slot_layer, int64_t a, int n_tokens, int64_t n_kv, int n_rows,
+                             bool now_mode, jlens_upper_chunk & out, int top_layer) {
+    const auto & hp = m.hparams;
+    if (top_layer < 0) top_layer = (int) hp.n_layer - 1;
+    const bool head = top_layer == hp.n_layer - 1;
+    if (slot_layer < -1 || slot_layer >= top_layer || top_layer >= hp.n_layer || (head && (n_rows < 1 || n_rows > n_tokens)) ||
+        (!head && now_mode) || a + n_tokens > n_kv) {
+        fprintf(stderr, "jlens_build_upper_chunk: bad arguments\n");
+        return false;
+    }
+    const int n_up = top_layer - slot_layer;
+    const int64_t D = hp.n_embd_head, Hkv = hp.n_head_kv;
+
+    const int    gsize    = n_up * 512 + 256;
+    const int    n_tensors= n_up * 400 + 64;
+    const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, true);
+    struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
+    out.gctx = ggml_init(iparams);
+    ggml_context * ctx = out.gctx;
+    out.gf = ggml_new_graph_custom(ctx, gsize, /*grads=*/true);
+
+    out.h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens);
+    ggml_set_name(out.h, "jlens_chunk_h");
+    ggml_set_param(out.h);
+
+    out.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(out.pos, "jlens_chunk_pos");
+    ggml_set_input(out.pos);
+
+    out.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+    ggml_set_name(out.mask, "jlens_chunk_mask");
+    ggml_set_input(out.mask);
+
+    out.one = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(out.one, "jlens_chunk_one");
+
+    out.k_kv.assign(n_up, nullptr);
+    out.v_kv.assign(n_up, nullptr);
+    out.dk_in.assign(n_up, nullptr);
+    out.dv_in.assign(n_up, nullptr);
+    std::vector<jlens_chunk_kv> ckv(n_up);
+
+    ggml_tensor * inpL = out.h;
+    for (int u = 0; u < n_up; ++u) {
+        const int il = slot_layer + 1 + u;
+        char name[64];
+        out.k_kv[u] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_kv);
+        out.v_kv[u] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_kv);
+        snprintf(name, sizeof(name), "jlens_chunk_k_%d", il); ggml_set_name(out.k_kv[u], name);
+        snprintf(name, sizeof(name), "jlens_chunk_v_%d", il); ggml_set_name(out.v_kv[u], name);
+        if (!now_mode) {
+            ggml_set_param(out.k_kv[u]);
+            ggml_set_param(out.v_kv[u]);
+        }
+        ckv[u].now  = now_mode;
+        ckv[u].a    = a;
+        ckv[u].k_kv = out.k_kv[u];
+        ckv[u].v_kv = out.v_kv[u];
+        ckv[u].one  = out.one;
+        inpL = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, /*use_flash_attn=*/false,
+                         nullptr, nullptr, nullptr, nullptr, &ckv[u]);
+    }
+
+    ggml_tensor * loss;
+    if (head) {
+        // next-token loss on the first n_rows positions, as a sum (cross_entropy_loss is the row mean)
+        ggml_tensor * x = n_rows == n_tokens ? inpL : ggml_view_2d(ctx, inpL, hp.n_embd, n_rows, inpL->nb[1], 0);
+        ggml_tensor * logits = ggml_mul_mat(ctx, m.get("output.weight"), rms_norm_mul(ctx, x, m.get("output_norm.weight"), hp.norm_eps));
+        out.labels = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, logits->ne[0], n_rows);
+        ggml_set_name(out.labels, "jlens_chunk_labels");
+        ggml_set_input(out.labels);
+        loss = ggml_scale(ctx, ggml_cross_entropy_loss(ctx, logits, out.labels), (float) n_rows);
+    } else {
+        // gradient of the loss at the top_layer output, from the layer group above: add <g_top, h_top>
+        out.g_top = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens);
+        ggml_set_name(out.g_top, "jlens_chunk_g_top");
+        loss = ggml_sum(ctx, ggml_mul(ctx, inpL, out.g_top));
+    }
+
+    if (!now_mode) {
+        // gradient that later chunks sent to this chunk's keys/values: add <dk_in, k> + <dv_in, v>
+        for (int u = 0; u < n_up; ++u) {
+            out.dk_in[u] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_tokens);
+            out.dv_in[u] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_tokens);
+            loss = ggml_add(ctx, loss, ggml_sum(ctx, ggml_mul(ctx, ckv[u].k_live, out.dk_in[u])));
+            loss = ggml_add(ctx, loss, ggml_sum(ctx, ggml_mul(ctx, ckv[u].v_live, out.dv_in[u])));
+        }
+    }
+    out.loss = loss;
+    ggml_set_name(out.loss, "jlens_chunk_loss");
+    ggml_set_output(out.loss);
+    out.loss->flags |= GGML_TENSOR_FLAG_LOSS;
+    ggml_build_forward_expand(out.gf, out.loss);
+    return true;
+}
+
+bool jlens_build_chunk_forward(const jlens_weights & m, int64_t a, int n_tokens, int64_t n_kv, jlens_chunk_forward & out,
+                               bool with_emb_add) {
+    const auto & hp = m.hparams;
+    if (a + n_tokens > n_kv) {
+        fprintf(stderr, "jlens_build_chunk_forward: bad arguments\n");
+        return false;
+    }
+    const int64_t D = hp.n_embd_head, Hkv = hp.n_head_kv;
+    const int    gsize    = hp.n_layer * 96 + 64;
+    const int    n_tensors= hp.n_layer * 96 + 64; // block ops + leaves + the caller's copy-out nodes
+    const size_t ctx_size = (size_t) n_tensors * ggml_tensor_overhead() + ggml_graph_overhead_custom(gsize, false);
+    struct ggml_init_params iparams = { ctx_size, nullptr, /*no_alloc=*/true };
+    out.gctx = ggml_init(iparams);
+    ggml_context * ctx = out.gctx;
+    out.gf = ggml_new_graph_custom(ctx, gsize, /*grads=*/false);
+
+    out.tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(out.tokens);
+    out.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(out.pos);
+    out.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+    ggml_set_input(out.mask);
+    out.one = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+
+    out.k_kv.assign(hp.n_layer, nullptr);
+    out.v_kv.assign(hp.n_layer, nullptr);
+    out.k_live.assign(hp.n_layer, nullptr);
+    out.v_live.assign(hp.n_layer, nullptr);
+    out.l_out.assign(hp.n_layer, nullptr);
+
+    ggml_tensor * inpL = ggml_get_rows(ctx, m.get("token_embd.weight"), out.tokens);
+    if (with_emb_add) {
+        out.emb_add = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens);
+        inpL = ggml_add(ctx, inpL, out.emb_add);
+    }
+    out.emb = inpL;
+    for (int il = 0; il < hp.n_layer; ++il) {
+        out.k_kv[il] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_kv);
+        out.v_kv[il] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, Hkv, n_kv);
+        jlens_chunk_kv ckv;
+        ckv.a    = a;
+        ckv.k_kv = out.k_kv[il];
+        ckv.v_kv = out.v_kv[il];
+        ckv.one  = out.one;
+        inpL = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, /*use_flash_attn=*/false,
+                         nullptr, nullptr, nullptr, nullptr, &ckv);
+        out.k_live[il] = ckv.k_live;
+        out.v_live[il] = ckv.v_live;
+        out.l_out[il]  = inpL;
+    }
     return true;
 }

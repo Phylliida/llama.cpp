@@ -1136,6 +1136,13 @@ private:
                 return false;
             }
             SRV_INF("jlens endpoint enabled, matrices from '%s'\n", params_base.jlens_path.c_str());
+            if (!params_base.value_probe_path.empty()) {
+                if (!server_jlens_load_readouts(params_base.value_probe_path, jlens_err)) {
+                    SRV_ERR("failed to load value probe: %s\n", jlens_err.c_str());
+                    return false;
+                }
+                SRV_INF("jlens readouts enabled from '%s'\n", params_base.value_probe_path.c_str());
+            }
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -5186,9 +5193,87 @@ void server_routes::init_routes() {
             return res;
         }
 
+        if (json_value(body, "value_exact", false)) {
+            // exact value lens only: per position log |now| and log |fut| (all later tokens)
+            const int layer = json_value(body, "value_layer", 40);
+            const int chunk = json_value(body, "value_chunk", 64);
+            std::vector<float> fut, now;
+            double sec = 0.0;
+            std::string err;
+            if (!server_jlens_value_exact(tokens, layer, chunk, fut, now, sec, err)) {
+                res->error(json{
+                    {"code", 400},
+                    {"message", err},
+                    {"type", "invalid_request_error"},
+                });
+                return res;
+            }
+            json values = json::array();
+            for (size_t s = 0; s < tokens.size(); ++s) {
+                // log of the norm; null where there is no later prediction (s >= n - 2) or no next token
+                auto lg = [](float x) { return x > 0.0f ? json(std::log(x)) : json(nullptr); };
+                json row = json::array();
+                row.push_back(s + 2 < tokens.size() ? lg(fut[s]) : json(nullptr));
+                row.push_back(lg(now[s]));
+                values.push_back(std::move(row));
+            }
+            json ve = json::object();
+            ve["layer"]  = layer;
+            ve["names"]  = std::vector<std::string>{"stakes_all", "now"};
+            ve["values"] = std::move(values); // [n_tokens][2], log norms
+            ve["sec"]    = sec;
+            json out = json::object();
+            out["n_tokens"]    = (int) tokens.size();
+            out["value_exact"] = std::move(ve);
+            res->ok(out);
+            return res;
+        }
+
+        if (json_value(body, "branch_grad", false)) {
+            // branch gradients only: per position the spread and the top candidates with their linearized effect
+            const int k     = json_value(body, "branch_k", 8);
+            const int chunk = json_value(body, "value_chunk", 64);
+            server_jlens_branch br;
+            std::string err;
+            if (!server_jlens_branch_grad(ctx_server.vocab, tokens, k, chunk, br, err)) {
+                res->error(json{
+                    {"code", 400},
+                    {"message", err},
+                    {"type", "invalid_request_error"},
+                });
+                return res;
+            }
+            json spread = json::array(), cand = json::array();
+            for (size_t s = 0; s < tokens.size(); ++s) {
+                spread.push_back(std::isfinite(br.spread[s]) ? json(br.spread[s]) : json(nullptr));
+                json cs = json::array();
+                for (const auto & c : br.cand[s]) {
+                    json row = json::array();
+                    row.push_back(c.piece);
+                    row.push_back(c.prob);
+                    row.push_back(std::isfinite(c.delta) ? json(c.delta) : json(nullptr));
+                    cs.push_back(std::move(row));
+                }
+                cand.push_back(std::move(cs));
+            }
+            json bj = json::object();
+            bj["k"]      = br.k;
+            bj["spread"] = std::move(spread); // [n_tokens], nats (linearized)
+            bj["cand"]   = std::move(cand);   // [n_tokens][k] of [piece, prob, delta]
+            bj["sec"]    = br.sec;
+            json out = json::object();
+            out["n_tokens"] = (int) tokens.size();
+            out["branch"]   = std::move(bj);
+            res->ok(out);
+            return res;
+        }
+
         const int pos  = json_value(body, "pos", -1);
         const int topk = json_value(body, "topk", 5);
         const bool all_positions = json_value(body, "all_positions", false);
+        const bool want_readouts = json_value(body, "readouts", false);
+        const bool readouts_only = json_value(body, "readouts_only", false);
+        const bool want_stats    = json_value(body, "token_stats", false);
         std::vector<int> layers;
         if (body.count("layers") != 0 && body.at("layers").is_array()) {
             for (const auto & l : body.at("layers")) {
@@ -5198,11 +5283,24 @@ void server_routes::init_routes() {
 
         std::vector<server_jlens_layer_result> layer_results;
         std::vector<std::pair<std::string, float>> model_topk;
+        server_jlens_readouts readouts;
+        server_jlens_token_stats stats;
         std::string err;
+        if (want_readouts && !server_jlens_readouts_enabled()) {
+            res->error(json{
+                {"code", 400},
+                {"message", "readouts are not enabled (start the server with --value-probe PATH)"},
+                {"type", "invalid_request_error"},
+            });
+            return res;
+        }
         if (!server_jlens_compute(ctx_server.vocab, tokens, pos, topk,
                                   layers.empty() ? nullptr : &layers,
                                   all_positions,
-                                  layer_results, model_topk, err)) {
+                                  layer_results, model_topk, err,
+                                  want_readouts ? &readouts : nullptr,
+                                  readouts_only,
+                                  want_stats ? &stats : nullptr)) {
             res->error(json{
                 {"code", 400},
                 {"message", err},
@@ -5238,12 +5336,35 @@ void server_routes::init_routes() {
             }
         }
 
-        res->ok(json{
+        json out = {
             {"pos", pos < 0 ? (int) tokens.size() + pos : pos},
             {"n_tokens", (int) tokens.size()},
             {"model_topk", topk_json(model_topk)},
             {"layers", std::move(layers_json)},
-        });
+        };
+        if (want_stats) {
+            json values = json::array();
+            for (size_t s = 0; s < stats.entropy.size(); ++s) {
+                json row = json::array();
+                row.push_back(std::isfinite(stats.surprisal[s]) ? json(stats.surprisal[s]) : json(nullptr));
+                row.push_back(stats.entropy[s]);
+                row.push_back(stats.branches[s]);
+                row.push_back(stats.runner_up[s]);
+                values.push_back(std::move(row));
+            }
+            json ts = json::object();
+            ts["names"]  = std::vector<std::string>{"surprisal", "entropy", "branches", "runner_up"};
+            ts["values"] = std::move(values); // [n_tokens][4]; surprisal, entropy in nats
+            out["token_stats"] = std::move(ts);
+        }
+        if (want_readouts) {
+            out["readouts"] = {
+                {"layer",  readouts.layer},
+                {"names",  readouts.names},
+                {"values", readouts.values}, // [n_tokens][n_names]
+            };
+        }
+        res->ok(out);
         return res;
     };
 

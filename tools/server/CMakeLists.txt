@@ -27,6 +27,7 @@ add_library(${TARGET} STATIC
     server-jlens.h
     ../jspace/jlens-graph.cpp
     ../jspace/jlens-model.cpp
+    ../jspace/jlens-value.cpp
 )
 
 if (BUILD_SHARED_LIBS)
