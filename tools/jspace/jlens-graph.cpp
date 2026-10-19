@@ -614,6 +614,7 @@ bool jlens_build_upper_chunk(const jlens_weights & m, int slot_layer, int64_t a,
     ggml_set_name(out.one, "jlens_chunk_one");
 
     out.k_kv.assign(n_up, nullptr);
+    out.l_out.clear();
     out.v_kv.assign(n_up, nullptr);
     out.dk_in.assign(n_up, nullptr);
     out.dv_in.assign(n_up, nullptr);
@@ -638,6 +639,7 @@ bool jlens_build_upper_chunk(const jlens_weights & m, int slot_layer, int64_t a,
         ckv[u].one  = out.one;
         inpL = glm_block(ctx, m, il, n_tokens, inpL, out.pos, out.mask, /*use_flash_attn=*/false,
                          nullptr, nullptr, nullptr, nullptr, &ckv[u]);
+        out.l_out.push_back(inpL);
     }
 
     ggml_tensor * loss;

@@ -175,6 +175,7 @@ struct jlens_upper_chunk {
     ggml_tensor *  one    = nullptr; // f32 [1] leaf, caller wires it to a device 1.0
     std::vector<ggml_tensor *> k_kv, v_kv;   // per block above slot_layer
     std::vector<ggml_tensor *> dk_in, dv_in; // main mode only, [n_embd_head, n_head_kv, n_tokens]
+    std::vector<ggml_tensor *> l_out;        // per block above slot_layer, its output [n_embd, n_tokens]
     ggml_tensor *  loss   = nullptr; // f32 [1], loss-flagged
 };
 // top_layer < n_layer - 1 (main mode only): run blocks slot_layer+1 .. top_layer, and the loss is <g_top, h_top> plus the
