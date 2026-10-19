@@ -18,12 +18,18 @@
 // usage: homeo-capture -m model.gguf --rollouts rollouts.jsonl --out DIR
 //          [--layers 0,4,...] [--stride 4] [--skip 32] [--n-forced 16]
 //          [--max-len 2100] [--n-rollouts N] [--seed 1] [--ubatch 512]
+//          [--proj PATTERN --proj-k 64 [--proj-extra FILE]] [--pause-ms 0]
 //
 // outputs in DIR (little endian):
 //   labels.bin    label_rec per (rollout, position)
 //   samples.bin   sample_rec per captured row
 //   acts_LNN.f16  [n_samples, n_embd] f16, row i <-> samples.bin record i
 //   meta.json
+//
+// --proj: write proj_LNN.f32 [n_samples, P + 1] instead of acts_LNN.f16: the block output projected on P = K + F
+// directions (the first --proj-k rows of PATTERN with {L} replaced by the layer, f32 [rows, n_embd], then the F rows
+// of --proj-extra at every layer), then |h|.
+// --pause-ms N: sleep N ms after each rollout; re-read from DIR/pause_ms if that file exists.
 
 #include "llama.h"
 #include "ggml.h"
@@ -162,6 +168,27 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * ud) {
     return true;
 }
 
+static float dot_f32(const float * a, const float * b, int n) {
+    float acc[8] = { 0 };
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        for (int k = 0; k < 8; ++k) acc[k] += a[i + k] * b[i + k];
+    }
+    float s = 0.0f;
+    for (int k = 0; k < 8; ++k) s += acc[k];
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+static std::vector<float> read_f32_rows(const std::string & path, int rows, int n_embd) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) die(("cannot open " + path).c_str());
+    std::vector<float> w((size_t) rows * n_embd);
+    f.read((char *) w.data(), (std::streamsize) (w.size() * sizeof(float)));
+    if (f.gcount() != (std::streamsize) (w.size() * sizeof(float))) die(("too few rows in " + path).c_str());
+    return w;
+}
+
 static void decode_checked(llama_context * ctx, capture & cap, const llama_batch & batch) {
     std::fill(cap.rows.begin(), cap.rows.end(), 0);
     if (llama_decode(ctx, batch) != 0) {
@@ -185,6 +212,9 @@ int main(int argc, char ** argv) {
     int  seed       = 1;
     int  ubatch     = 512;
     int  n_threads  = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+    std::string proj_pattern, proj_extra;
+    int  proj_k     = 64;
+    int  pause_ms   = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -201,6 +231,10 @@ int main(int argc, char ** argv) {
         else if (a == "--seed")       seed          = atoi(next());
         else if (a == "--ubatch")     ubatch        = atoi(next());
         else if (a == "--threads")    n_threads     = atoi(next());
+        else if (a == "--proj")       proj_pattern  = next();
+        else if (a == "--proj-k")     proj_k        = atoi(next());
+        else if (a == "--proj-extra") proj_extra    = next();
+        else if (a == "--pause-ms")   pause_ms      = atoi(next());
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty() || rollouts_path.empty() || out_dir.empty()) {
@@ -256,6 +290,45 @@ int main(int argc, char ** argv) {
         cap.slot_of["l_out-" + std::to_string(layers[s])] = (int) s;
     }
 
+    // ---- projection directions: per slot [P, n_embd] ----
+    const bool proj = !proj_pattern.empty();
+    int n_extra = 0;
+    std::vector<std::vector<float>> proj_w(layers.size());
+    if (proj) {
+        std::vector<float> extra;
+        if (!proj_extra.empty()) {
+            std::ifstream f(proj_extra, std::ios::binary | std::ios::ate);
+            if (!f) die("cannot open --proj-extra");
+            const int64_t nb = f.tellg();
+            if (nb % ((int64_t) n_embd * 4) != 0) die("--proj-extra size is not a whole number of rows");
+            n_extra = (int) (nb / ((int64_t) n_embd * 4));
+            extra = read_f32_rows(proj_extra, n_extra, n_embd);
+        }
+        for (size_t s = 0; s < layers.size(); ++s) {
+            std::string path = proj_pattern;
+            const size_t at = path.find("{L}");
+            if (at == std::string::npos) die("--proj pattern has no {L}");
+            path.replace(at, 3, std::to_string(layers[s]));
+            proj_w[s] = read_f32_rows(path, proj_k, n_embd);
+            proj_w[s].insert(proj_w[s].end(), extra.begin(), extra.end());
+        }
+        fprintf(stderr, "homeo-capture: projecting on %d + %d directions per layer\n", proj_k, n_extra);
+    }
+    const int n_proj = proj ? proj_k + n_extra : 0;
+    std::vector<std::vector<float>> proj_buf(layers.size());
+    // project rows [0, n) of the last decode, all slots
+    auto project_rows = [&](int n) {
+        for (auto & b : proj_buf) b.resize((size_t) n * (n_proj + 1));
+        parallel_for(n, n_threads, [&](int j) {
+            for (size_t s = 0; s < layers.size(); ++s) {
+                const float * x = cap.buf[s].data() + (size_t) j * n_embd;
+                float * o = proj_buf[s].data() + (size_t) j * (n_proj + 1);
+                for (int p = 0; p < n_proj; ++p) o[p] = dot_f32(proj_w[s].data() + (size_t) p * n_embd, x, n_embd);
+                o[n_proj] = std::sqrt(dot_f32(x, x, n_embd));
+            }
+        });
+    };
+
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx             = max_len + 256;
     cp.n_batch           = ubatch;
@@ -280,7 +353,7 @@ int main(int argc, char ** argv) {
     std::vector<FILE *> f_acts;
     for (int il : layers) {
         char name[64];
-        snprintf(name, sizeof(name), "/acts_L%02d.f16", il);
+        snprintf(name, sizeof(name), proj ? "/proj_L%02d.f32" : "/acts_L%02d.f16", il);
         FILE * f = fopen((out_dir + name).c_str(), "wb");
         if (!f) die("cannot open acts file");
         f_acts.push_back(f);
@@ -292,6 +365,10 @@ int main(int argc, char ** argv) {
     auto write_sample = [&](const sample_rec & rec, int row) {
         fwrite(&rec, sizeof(rec), 1, f_samples);
         for (size_t s = 0; s < layers.size(); ++s) {
+            if (proj) {
+                fwrite(proj_buf[s].data() + (size_t) row * (n_proj + 1), sizeof(float), n_proj + 1, f_acts[s]);
+                continue;
+            }
             ggml_fp32_to_fp16_row(cap.buf[s].data() + (size_t) row * n_embd, row16.data(), n_embd);
             fwrite(row16.data(), sizeof(ggml_fp16_t), n_embd, f_acts[s]);
         }
@@ -364,6 +441,7 @@ int main(int argc, char ** argv) {
                 batch.logits[j]    = 1;
             }
             decode_checked(ctx, cap, batch);
+            if (proj) project_rows(n);
 
             zrows.resize(n);
             for (int j = 0; j < n; ++j) zrows[j] = llama_get_logits_ith(ctx, j);
@@ -438,6 +516,7 @@ int main(int argc, char ** argv) {
                     batch.logits[k]    = 1;
                 }
                 decode_checked(ctx, cap, batch);
+                if (proj) project_rows(K);
 
                 for (int k = 0; k < K; ++k) {
                     const float * z = llama_get_logits_ith(ctx, k);
@@ -472,6 +551,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "rollout %zu/%zu len=%d samples=%lld (nat %lld forced %lld) %.0f tok/s\n",
                 r + 1, rollouts.size(), len, (long long) n_samples, (long long) n_kind[0],
                 (long long) (n_kind[1] + n_kind[2]), n_tok_total / el);
+        {
+            std::ifstream pf(out_dir + "/pause_ms");
+            int v;
+            if (pf >> v) pause_ms = v;
+        }
+        if (pause_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
     }
 
     fclose(f_labels);
@@ -494,6 +579,13 @@ int main(int argc, char ** argv) {
     meta["n_forced"]    = n_forced;
     meta["max_len"]     = max_len;
     meta["seed"]        = seed;
+    if (proj) {
+        meta["proj"]       = proj_pattern;
+        meta["proj_k"]     = proj_k;
+        meta["proj_extra"] = proj_extra;
+        meta["n_extra"]    = n_extra;
+        meta["proj_rec"]   = "f32 [proj_k + n_extra] projections, then f32 |h|";
+    }
     meta["bin_edges_log10p"] = std::vector<float>(std::begin(BIN_EDGES), std::end(BIN_EDGES));
     meta["label_rec"]   = "i32 seq, i32 pos, i32 token, i32 rank_prev, f32 surprisal, f32 entropy_prev, f32 entropy, f32 pad";
     meta["sample_rec"]  = "i32 seq, i32 pos, i32 token, i32 kind, i32 bin, i32 rank_prev, f32 surprisal, f32 entropy_prev, f32 entropy, f32 pad[3]";
