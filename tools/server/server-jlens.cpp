@@ -99,6 +99,30 @@ struct server_jlens_readout_state {
 
 server_jlens_readout_state g_readout;
 
+// direction probes (one layer per direction); model-independent like the readouts. guarded by g_jlens.mutex
+struct server_jlens_dirs_state {
+    int64_t                  n_embd = 0;
+    std::vector<std::string> names;
+    std::vector<int>         layers;
+    std::vector<float>       W; // [n][n_embd]
+};
+
+server_jlens_dirs_state g_dirs;
+
+// fn(q) for q in [0, n) on up to 32 threads
+template <typename F>
+void parallel_for_rows(int n, F && fn) {
+    const int nt = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+    const int per = (n + nt - 1) / nt;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < nt; ++t) {
+        const int q0 = t * per, q1 = std::min(n, q0 + per);
+        if (q0 >= q1) break;
+        ts.emplace_back([&fn, q0, q1] { for (int q = q0; q < q1; ++q) fn(q); });
+    }
+    for (auto & t : ts) t.join();
+}
+
 // caller must hold g_jlens.mutex
 void server_jlens_deinit_locked() {
     g_jlens.weights.reset(); // drop raw tensor pointers before the model dies
@@ -334,6 +358,57 @@ bool server_jlens_readouts_enabled() {
     return g_readout.layer >= 0;
 }
 
+bool server_jlens_load_dirs(const std::string & path, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    nlohmann::json meta;
+    {
+        std::ifstream f(path + ".json");
+        if (!f) {
+            err = "cannot open " + path + ".json";
+            return false;
+        }
+        try {
+            f >> meta;
+        } catch (const std::exception & e) {
+            err = std::string("bad probe-dirs json: ") + e.what();
+            return false;
+        }
+    }
+    server_jlens_dirs_state d;
+    d.n_embd = meta.value("n_embd", (int64_t) 0);
+    d.names  = meta.value("names", std::vector<std::string>());
+    d.layers = meta.value("layers", std::vector<int>());
+    if (d.names.empty() || d.layers.size() != d.names.size()) {
+        err = "probe-dirs json needs \"names\" and one entry of \"layers\" per name";
+        return false;
+    }
+    if (g_jlens.n_embd > 0 && d.n_embd != g_jlens.n_embd) {
+        err = "probe-dirs n_embd does not match the model";
+        return false;
+    }
+    for (int L : d.layers) {
+        if (L < 0 || (g_jlens.n_layer > 0 && L >= g_jlens.n_layer)) {
+            err = "probe-dirs layer out of range: " + std::to_string(L);
+            return false;
+        }
+    }
+    d.W.resize(d.names.size() * d.n_embd);
+    std::ifstream f(path + ".f32", std::ios::binary | std::ios::ate);
+    if (!f || (size_t) f.tellg() != d.W.size() * sizeof(float)) {
+        err = "probe-dirs weights missing or wrong size: " + path + ".f32";
+        return false;
+    }
+    f.seekg(0);
+    f.read((char *) d.W.data(), d.W.size() * sizeof(float));
+    g_dirs = std::move(d);
+    return true;
+}
+
+bool server_jlens_dirs_enabled() {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    return !g_dirs.names.empty();
+}
+
 bool server_jlens_enabled() {
     return g_jlens.weights != nullptr;
 }
@@ -350,15 +425,41 @@ bool server_jlens_compute(
         std::string & err,
         server_jlens_readouts * readouts,
         bool readouts_only,
-        server_jlens_token_stats * stats) {
+        server_jlens_token_stats * stats,
+        server_jlens_dirs * dirs,
+        const std::vector<int> * dir_layers) {
 
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     if (readouts && g_readout.layer < 0) {
         err = "jlens: readouts not loaded (--value-probe)";
         return false;
     }
-    if (!readouts && !stats) {
+    if (dirs && g_dirs.names.empty()) {
+        err = "jlens: direction probes not loaded (--probe-dirs)";
+        return false;
+    }
+    if (!readouts && !stats && !dirs) {
         readouts_only = false;
+    }
+    // selected direction probes (all, or those at dir_layers) and the layers they need
+    std::vector<int> dir_sel, dir_need;
+    if (dirs) {
+        for (size_t r = 0; r < g_dirs.names.size(); ++r) {
+            const int L = g_dirs.layers[r];
+            if (dir_layers && !dir_layers->empty() && std::find(dir_layers->begin(), dir_layers->end(), L) == dir_layers->end()) {
+                continue;
+            }
+            dir_sel.push_back((int) r);
+            if (std::find(dir_need.begin(), dir_need.end(), L) == dir_need.end()) dir_need.push_back(L);
+        }
+        if (dir_sel.empty()) {
+            err = "jlens: no direction probes at the requested layers";
+            return false;
+        }
+        if (g_dirs.n_embd != g_jlens.n_embd) {
+            err = "jlens: probe-dirs n_embd does not match the model";
+            return false;
+        }
     }
     if (!g_jlens.weights) {
         err = "jlens: not initialized (model reloading?)";
@@ -424,6 +525,7 @@ bool server_jlens_compute(
     // is retained by the allocator for the whole graph lifetime
     for (int il : layers) ggml_set_output(fwd.l_out[il]);
     if (readouts) ggml_set_output(fwd.l_out[g_readout.layer]);
+    for (int L : dir_need) ggml_set_output(fwd.l_out[L]);
     if (!readouts_only || stats) ggml_set_output(fwd.l_out.back()); // model_topk reference decode, token stats
 
     ggml_gallocr_t galloc = ggml_gallocr_new(buft);
@@ -464,25 +566,45 @@ bool server_jlens_compute(
         readouts->layer = (int) L;
         readouts->names = g_readout.names;
         readouts->values.assign(n_tokens, std::vector<float>(n_r));
-        const int nt = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
-        std::vector<std::thread> ts;
-        const int per = (n_tokens + nt - 1) / nt;
-        for (int t = 0; t < nt; ++t) {
-            const int q0 = t * per, q1 = std::min(n_tokens, q0 + per);
-            if (q0 >= q1) break;
-            ts.emplace_back([&, q0, q1] {
-                for (int q = q0; q < q1; ++q) {
-                    const float * hq = h.data() + (size_t) q * n_embd;
-                    for (int r = 0; r < n_r; ++r) {
-                        const float * w = g_readout.W.data() + (size_t) r * n_embd;
-                        double acc = g_readout.b[r];
-                        for (int64_t e = 0; e < n_embd; ++e) acc += (double) w[e] * hq[e];
-                        readouts->values[q][r] = (float) acc;
-                    }
+        parallel_for_rows(n_tokens, [&](int q) {
+            const float * hq = h.data() + (size_t) q * n_embd;
+            for (int r = 0; r < n_r; ++r) {
+                const float * w = g_readout.W.data() + (size_t) r * n_embd;
+                double acc = g_readout.b[r];
+                for (int64_t e = 0; e < n_embd; ++e) acc += (double) w[e] * hq[e];
+                readouts->values[q][r] = (float) acc;
+            }
+        });
+    }
+    if (dirs) {
+        // u.h and |h| at every position, one selected layer at a time, on the CPU
+        const int n_sel = (int) dir_sel.size();
+        dirs->names.clear();
+        dirs->layers.clear();
+        for (int r : dir_sel) {
+            dirs->names.push_back(g_dirs.names[r]);
+            dirs->layers.push_back(g_dirs.layers[r]);
+        }
+        dirs->values.assign(n_tokens, std::vector<float>(n_sel));
+        dirs->cos.assign(n_tokens, std::vector<float>(n_sel));
+        std::vector<float> h((size_t) n_embd * n_tokens);
+        for (int L : dir_need) {
+            ggml_backend_tensor_get(fwd.l_out[L], h.data(), 0, h.size() * sizeof(float));
+            parallel_for_rows(n_tokens, [&](int q) {
+                const float * hq = h.data() + (size_t) q * n_embd;
+                double nn = 0.0;
+                for (int64_t e = 0; e < n_embd; ++e) nn += (double) hq[e] * hq[e];
+                const double norm = std::sqrt(nn);
+                for (int k = 0; k < n_sel; ++k) {
+                    if (dirs->layers[k] != L) continue;
+                    const float * w = g_dirs.W.data() + (size_t) dir_sel[k] * n_embd;
+                    double acc = 0.0;
+                    for (int64_t e = 0; e < n_embd; ++e) acc += (double) w[e] * hq[e];
+                    dirs->values[q][k] = (float) acc;
+                    dirs->cos[q][k]    = norm > 0.0 ? (float) (acc / norm) : 0.0f;
                 }
             });
         }
-        for (auto & t : ts) t.join();
     }
     const int64_t n_vocab = g_jlens.weights->hparams.n_vocab;
     const int     n_real  = llama_vocab_n_tokens(vocab); // logits may be padded

@@ -694,6 +694,7 @@ struct common_params {
     std::string media_path; // path to directory for loading media files
     std::string jlens_path; // path to JLNS transport matrices for the /jlens endpoint (server, default: disabled)
     std::string value_probe_path; // linear readouts on a block output for /jlens (PATH.f32 + PATH.json, server)
+    std::string probe_dirs_path;  // direction probes at several layers for /jlens (PATH.f32 + PATH.json, server)
 
     float slot_prompt_similarity = 0.1f;
 

@@ -1143,6 +1143,13 @@ private:
                 }
                 SRV_INF("jlens readouts enabled from '%s'\n", params_base.value_probe_path.c_str());
             }
+            if (!params_base.probe_dirs_path.empty()) {
+                if (!server_jlens_load_dirs(params_base.probe_dirs_path, jlens_err)) {
+                    SRV_ERR("failed to load direction probes: %s\n", jlens_err.c_str());
+                    return false;
+                }
+                SRV_INF("jlens direction probes enabled from '%s'\n", params_base.probe_dirs_path.c_str());
+            }
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -5274,10 +5281,16 @@ void server_routes::init_routes() {
         const bool want_readouts = json_value(body, "readouts", false);
         const bool readouts_only = json_value(body, "readouts_only", false);
         const bool want_stats    = json_value(body, "token_stats", false);
-        std::vector<int> layers;
+        const bool want_dirs     = json_value(body, "dirs", false);
+        std::vector<int> layers, dir_layers;
         if (body.count("layers") != 0 && body.at("layers").is_array()) {
             for (const auto & l : body.at("layers")) {
                 layers.push_back(l.get<int>());
+            }
+        }
+        if (body.count("dir_layers") != 0 && body.at("dir_layers").is_array()) {
+            for (const auto & l : body.at("dir_layers")) {
+                dir_layers.push_back(l.get<int>());
             }
         }
 
@@ -5285,11 +5298,20 @@ void server_routes::init_routes() {
         std::vector<std::pair<std::string, float>> model_topk;
         server_jlens_readouts readouts;
         server_jlens_token_stats stats;
+        server_jlens_dirs dirs;
         std::string err;
         if (want_readouts && !server_jlens_readouts_enabled()) {
             res->error(json{
                 {"code", 400},
                 {"message", "readouts are not enabled (start the server with --value-probe PATH)"},
+                {"type", "invalid_request_error"},
+            });
+            return res;
+        }
+        if (want_dirs && !server_jlens_dirs_enabled()) {
+            res->error(json{
+                {"code", 400},
+                {"message", "direction probes are not enabled (start the server with --probe-dirs PATH)"},
                 {"type", "invalid_request_error"},
             });
             return res;
@@ -5300,7 +5322,9 @@ void server_routes::init_routes() {
                                   layer_results, model_topk, err,
                                   want_readouts ? &readouts : nullptr,
                                   readouts_only,
-                                  want_stats ? &stats : nullptr)) {
+                                  want_stats ? &stats : nullptr,
+                                  want_dirs ? &dirs : nullptr,
+                                  &dir_layers)) {
             res->error(json{
                 {"code", 400},
                 {"message", err},
@@ -5362,6 +5386,14 @@ void server_routes::init_routes() {
                 {"layer",  readouts.layer},
                 {"names",  readouts.names},
                 {"values", readouts.values}, // [n_tokens][n_names]
+            };
+        }
+        if (want_dirs) {
+            out["dirs"] = {
+                {"names",  dirs.names},
+                {"layers", dirs.layers},
+                {"values", dirs.values}, // [n_tokens][n_sel] u.h
+                {"cos",    dirs.cos},    // [n_tokens][n_sel] u.h / |h|
             };
         }
         res->ok(out);

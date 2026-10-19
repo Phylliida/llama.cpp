@@ -49,6 +49,20 @@ struct server_jlens_readouts {
     std::vector<std::vector<float>> values; // [n_tokens][n_names]
 };
 
+// direction probes at several layers (layer-sweep directions from homeo/score_probe_export.py in
+// base-model-welfare): PATH.f32 holds [n][n_embd] directions, PATH.json {"n_embd", "names", "layers"} (one layer
+// per direction). Per position, u.h and u.h / |h| at the direction's layer. Load after server_jlens_init; survives
+// model reloads.
+bool server_jlens_load_dirs(const std::string & path, std::string & err);
+bool server_jlens_dirs_enabled();
+
+struct server_jlens_dirs {
+    std::vector<std::string> names;          // the selected directions
+    std::vector<int> layers;                 // their layers
+    std::vector<std::vector<float>> values;  // [n_tokens][n_sel] u.h
+    std::vector<std::vector<float>> cos;     // [n_tokens][n_sel] u.h / |h|
+};
+
 // per-position next-token statistics from the model's own output distribution
 struct server_jlens_token_stats {
     std::vector<float> surprisal; // [n_tokens] -log p(x_{s+1}); NaN at the last position
@@ -59,6 +73,8 @@ struct server_jlens_token_stats {
 
 // readouts != nullptr: also compute the readouts at every position.
 // stats != nullptr: also compute surprisal and entropy at every position.
+// dirs != nullptr: also project on the direction probes, those at dir_layers only (all when null or empty). Each
+// selected layer's block output stays in VRAM until the end of the pass (n_tokens * n_embd floats per layer).
 // readouts_only: skip the J-lens decode (layers and model_topk stay empty).
 bool server_jlens_compute(
         const llama_vocab * vocab,
@@ -72,7 +88,9 @@ bool server_jlens_compute(
         std::string & err,
         server_jlens_readouts * readouts = nullptr,
         bool readouts_only = false,
-        server_jlens_token_stats * stats = nullptr);
+        server_jlens_token_stats * stats = nullptr,
+        server_jlens_dirs * dirs = nullptr,
+        const std::vector<int> * dir_layers = nullptr);
 
 // exact value lens (jlens_value_exact) at slot_layer for every position: |d log p(x_{s+1}) / d h_s| (now) and
 // |sum over all later t > s of d log p(x_{t+1}) / d h_s| (fut). Needs only the model weights (no probe file).
