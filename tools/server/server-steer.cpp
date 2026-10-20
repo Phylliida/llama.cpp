@@ -134,8 +134,20 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
     int layer = -1;
     float h_norm = 0.0f;
     std::vector<float> u;
-    if (!server_jlens_dir_get(p.dir, layer, h_norm, u)) { err = "steer: unknown direction '" + p.dir + "' (start the server with --probe-dirs)"; return false; }
-    if (layer < 1) { err = "steer: cannot push after block 0"; return false; }
+    if (!p.dir.empty()) {
+        if (!server_jlens_dir_get(p.dir, layer, h_norm, u)) { err = "steer: unknown direction '" + p.dir + "' (start the server with --probe-dirs)"; return false; }
+    } else {
+        // a raw direction: normalized; the dose unit is the mean |h| of a probe direction at the same layer (else measured on the prefix)
+        layer = p.layer;
+        double n2 = 0.0;
+        for (float x : p.vector) n2 += (double) x * x;
+        if (n2 <= 0.0) { err = "steer: need \"dir\", or \"vector\" and \"layer\""; return false; }
+        u.resize(p.vector.size());
+        for (size_t e = 0; e < u.size(); ++e) u[e] = (float) (p.vector[e] / std::sqrt(n2));
+        h_norm = server_jlens_layer_h_norm(layer);
+    }
+    if (layer < 1 || layer >= llama_model_n_layer(g_steer.model)) { err = "steer: layer must be in [1, n_layer)"; return false; }
+    if (p.set && !p.impulse) { err = "steer: set mode needs mode \"impulse\""; return false; }
 
     const int n_embd  = llama_model_n_embd(g_steer.model);
     const int n_layer = llama_model_n_layer(g_steer.model);
@@ -143,7 +155,7 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
     if ((int) u.size() != n_embd) { err = "steer: direction size does not match the model"; return false; }
 
     std::vector<float> doses = {0.0f};
-    for (float d : p.doses) {
+    for (float d : (p.set ? std::vector<float>{1.0f} : p.doses)) {
         if (!std::isfinite(d) || std::fabs(d) > g_steer.max_dose) {
             err = "steer: |dose| must be <= " + std::to_string(g_steer.max_dose) + " (--steer-max-dose)";
             return false;
@@ -236,6 +248,26 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
     out.layer  = layer;
     out.h_norm = h_norm;
     out.arms.assign(n_arm, server_steer_arm());
+    float set_push_val = 0.0f;
+    if (p.set) {
+        // the push token unpushed, to read its u.h and |h|; then push = set_cos |h| - u.h
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        if (s > 0) llama_memory_seq_cp(mem, MS, 0, -1, -1);
+        batch.n_tokens = 1;
+        batch.token[0] = p.prefix[s]; batch.pos[0] = s; batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = 0;
+        cap.enabled = true;
+        cap.rows = 0;
+        if (llama_decode(ctx, batch) != 0) return fail("steer: decode failed (set)");
+        cap.enabled = false;
+        if (cap.rows != 1) return fail("steer: l_out capture failed (set)");
+        double d = 0.0, s2 = 0.0;
+        for (int e = 0; e < n_embd; ++e) { d += (double) cap.buf[e] * u[e]; s2 += (double) cap.buf[e] * cap.buf[e]; }
+        out.proj0 = (float) d;
+        out.norm0 = (float) std::sqrt(s2);
+        set_push_val = (float) (p.set_cos * std::sqrt(s2) - d);
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        if (std::fabs(set_push_val) > g_steer.max_dose * h_norm) return fail("steer: the set value needs a push beyond --steer-max-dose");
+    }
 
     // common random numbers: one uniform per (sequence, step)
     std::vector<std::vector<double>> uni(NS, std::vector<double>(G));
@@ -251,6 +283,7 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
         server_steer_arm & arm = out.arms[a];
         arm.dose = doses[a];
         arm.push = doses[a] * h_norm;
+        if (p.set && a > 0) { arm.push = set_push_val; arm.dose = set_push_val / h_norm; }
         arm.seqs.assign(NS, server_steer_seq());
         if (!set_push(ctx, u, layer, arm.push, n_embd, n_layer, cvec)) return fail("steer: cvec set failed");
         std::vector<int> act(NS), hot(NS, 0);
@@ -336,8 +369,8 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
         }
     }
 
-    // ---- teacher-forced: the existing text after the push token, under each arm ----
-    if (n_f > 0) {
+    // ---- teacher-forced: the existing text after the push token (or just the push token), under each arm ----
+    if (n_f > 0 || !p.classes.empty()) {
         std::vector<std::vector<float>> base((size_t) n_f + 1, std::vector<float>(n_vocab));
         std::vector<std::vector<float>> cur((size_t) n_f + 1, std::vector<float>(n_vocab));
         for (int a = 0; a < n_arm; ++a) {
@@ -349,6 +382,7 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
             // impulse: the push token alone under the push, then the rest unsteered
             const int n_first = p.impulse ? 1 : n_f + 1;
             for (int part = 0, k0 = 0; k0 <= n_f; ++part) {
+                if (part > 0 && n_f == 0) break;
                 const int n = part == 0 ? n_first : n_f + 1 - k0;
                 batch.n_tokens = n;
                 for (int j = 0; j < n; ++j) {
@@ -364,6 +398,16 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
                 if (part == 0 && p.impulse && !set_push(ctx, u, layer, 0.0f, n_embd, n_layer, cvec)) return fail("steer: cvec clear failed");
             }
             llama_memory_seq_rm(mem, 0, -1, -1);
+            arm.tf.class_logp.assign(p.classes.size(), std::vector<float>(n_f + 1));
+            parallel_for(n_f + 1, n_threads, [&](int k) {
+                for (size_t c = 0; c < p.classes.size(); ++c) {
+                    double m = -INFINITY, acc = 0.0;
+                    for (int32_t t : p.classes[c].second) if (t >= 0 && t < n_vocab) m = std::max(m, (double) dst[k][t]);
+                    if (!std::isfinite(m)) { arm.tf.class_logp[c][k] = -INFINITY; continue; }
+                    for (int32_t t : p.classes[c].second) if (t >= 0 && t < n_vocab) acc += std::exp((double) dst[k][t] - m);
+                    arm.tf.class_logp[c][k] = (float) (m + std::log(acc));
+                }
+            });
             if (a == 0) continue;
             arm.tf.kl.assign(n_f + 1, 0.0f);
             arm.tf.dlogp.assign(n_f, 0.0f);
@@ -398,7 +442,7 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
                 n_ctx_pushed++;
                 n_end += sq.endpoint != 0;
             }
-            if (n_f > 0) { tok += p.impulse ? 1 : n_f + 1; n_ctx_pushed++; }
+            if (n_f > 0 || !p.classes.empty()) { tok += p.impulse ? 1 : n_f + 1; n_ctx_pushed++; }
         }
         char date[16];
         const std::time_t now = std::time(nullptr);
@@ -406,8 +450,9 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
         std::string ds;
         for (int a = 1; a < n_arm; ++a) { char b[32]; snprintf(b, sizeof(b), "%s%+.3g", ds.empty() ? "" : " ", doses[a]); ds += b; }
         char manip[512];
-        snprintf(manip, sizeof(manip), "steer after block %d along %s (unit) x dose x mean|h| %.1f; doses %s; %s", layer, p.dir.c_str(),
-                 h_norm, ds.c_str(), p.impulse ? "impulse (push token only)" : "step (from the push token on)");
+        snprintf(manip, sizeof(manip), "steer after block %d along %s (unit) x dose x mean|h| %.1f; doses %s; %s", layer,
+                 p.dir.empty() ? "a raw vector" : p.dir.c_str(), h_norm, ds.c_str(),
+                 p.set ? "set u.h/|h| at the push token (impulse)" : p.impulse ? "impulse (push token only)" : "step (from the push token on)");
         char row[2048];
         snprintf(row, sizeof(row), "%s,loom-steer,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", date, csv_q(g_steer.model_name).c_str(), csv_q(manip).c_str(),
                  max_dose, tok, n_ctx_pushed, csv_q("loop: period<=16 over max(3p;12) tokens | incoh: H>6.0 for 16 steps").c_str(),

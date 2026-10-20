@@ -415,6 +415,14 @@ bool server_jlens_dirs_enabled() {
     return !g_dirs.names.empty();
 }
 
+float server_jlens_layer_h_norm(int layer) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    for (size_t r = 0; r < g_dirs.layers.size(); ++r) {
+        if (g_dirs.layers[r] == layer && !g_dirs.h_norms.empty()) return g_dirs.h_norms[r];
+    }
+    return 0.0f;
+}
+
 bool server_jlens_dir_get(const std::string & name, int & layer, float & h_norm, std::vector<float> & u) {
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     const auto it = std::find(g_dirs.names.begin(), g_dirs.names.end(), name);

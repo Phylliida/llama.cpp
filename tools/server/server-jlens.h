@@ -58,6 +58,8 @@ bool server_jlens_dirs_enabled();
 // one direction by name: its layer, unit vector and the mean |h| at its layer in natural text (PATH.json "h_norms";
 // 0 if absent). false if unknown.
 bool server_jlens_dir_get(const std::string & name, int & layer, float & h_norm, std::vector<float> & u);
+// mean |h| at a layer from any probe direction there (0 if none)
+float server_jlens_layer_h_norm(int layer);
 
 struct server_jlens_dirs {
     std::vector<std::string> names;          // the selected directions

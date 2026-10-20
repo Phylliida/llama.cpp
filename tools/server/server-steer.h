@@ -30,7 +30,12 @@ void server_steer_deinit();
 struct server_steer_params {
     std::vector<int32_t> prefix;          // tokens up to and including the push token
     std::vector<int32_t> follow;          // teacher-forced: the existing text after the push token (may be empty)
-    std::string          dir;             // direction probe name
+    std::string          dir;             // direction probe name, or empty with vector + layer
+    std::vector<float>   vector;          // a raw direction (normalized here), e.g. a random control
+    int                  layer = -1;      // its layer
+    bool                 set = false;     // impulse only: one pushed arm that sets u.h / |h| at the push token to set_cos
+    float                set_cos = 0.0f;
+    std::vector<std::pair<std::string, std::vector<int32_t>>> classes; // teacher-forced: log P(class) per position
     std::vector<float>   doses = {0.25f, -0.25f}; // in units of mean |h_L|; an unsteered arm always runs first
     bool                 impulse = false; // push at the push token only (default: from it on)
     int                  n_seq   = 4;     // sequences per arm (common random numbers across arms)
@@ -55,6 +60,7 @@ struct server_steer_tf {
     std::vector<float> kl;     // [n_follow + 1] KL(unsteered || this arm) of the next-token distribution (nats)
     std::vector<float> dlogp;  // [n_follow] change in log p of the actual next token
     std::vector<std::pair<int32_t, float>> up, down; // at the push token: tokens whose log p rises / falls most
+    std::vector<std::vector<float>> class_logp; // [n_class][n_follow + 1] log P(class) of the next token
 };
 
 struct server_steer_arm {
@@ -67,6 +73,8 @@ struct server_steer_arm {
 struct server_steer_result {
     int                           layer  = -1;
     float                         h_norm = 0.0f;
+    float                         proj0  = 0.0f; // set mode: u.h and |h| at the push token before the push
+    float                         norm0  = 0.0f;
     std::vector<server_steer_arm> arms; // arms[0] unsteered
     double                        sec = 0.0;
 };

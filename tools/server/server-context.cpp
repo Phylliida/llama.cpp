@@ -5437,6 +5437,12 @@ void server_routes::init_routes() {
         sp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
         if (json_value(body, "teacher_forced", false)) sp.follow.assign(tokens.begin() + pos + 1, tokens.end());
         sp.dir     = json_value(body, "dir", std::string());
+        sp.vector  = json_value(body, "vector", std::vector<float>());
+        sp.layer   = json_value(body, "layer", -1);
+        if (body.count("set_cos") != 0) { sp.set = true; sp.set_cos = body.at("set_cos").get<float>(); }
+        if (body.count("classes") != 0 && body.at("classes").is_object()) {
+            for (const auto & [name, ids] : body.at("classes").items()) sp.classes.emplace_back(name, ids.get<std::vector<int32_t>>());
+        }
         sp.doses   = json_value(body, "doses", std::vector<float>{0.25f, -0.25f});
         sp.impulse = json_value(body, "mode", std::string("step")) == "impulse";
         sp.n_seq   = json_value(body, "n_seq", 4);
@@ -5475,6 +5481,15 @@ void server_routes::init_routes() {
                 for (const auto & [t, d] : a.tf.down) down.push_back(json::array({piece(t), d}));
                 arm["tf"] = {{"kl", a.tf.kl}, {"dlogp", a.tf.dlogp}, {"up", std::move(up)}, {"down", std::move(down)}};
             }
+            if (!a.tf.class_logp.empty()) {
+                json cl = json::object();
+                for (size_t c = 0; c < sp.classes.size(); ++c) {
+                    json v = json::array();
+                    for (float x : a.tf.class_logp[c]) v.push_back(std::isfinite(x) ? json(x) : json(nullptr));
+                    cl[sp.classes[c].first] = std::move(v);
+                }
+                arm["class_logp"] = std::move(cl); // per position k (0 = the push token): log P(next token in class)
+            }
             arms.push_back(std::move(arm));
         }
         res->ok({
@@ -5485,6 +5500,8 @@ void server_routes::init_routes() {
             {"pos",        pos},
             {"n_tokens",   (int) tokens.size()},
             {"push_piece", piece(tokens[pos])},
+            {"proj0",      r.proj0}, // set mode: u.h and |h| at the push token before the push
+            {"norm0",      r.norm0},
             {"n_follow",   (int) std::min<size_t>(sp.follow.size(), 256)},
             {"arms",       std::move(arms)},
             {"sec",        r.sec},
