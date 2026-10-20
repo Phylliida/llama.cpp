@@ -55,6 +55,9 @@ struct server_jlens_readouts {
 // model reloads.
 bool server_jlens_load_dirs(const std::string & path, std::string & err);
 bool server_jlens_dirs_enabled();
+// one direction by name: its layer, unit vector and the mean |h| at its layer in natural text (PATH.json "h_norms";
+// 0 if absent). false if unknown.
+bool server_jlens_dir_get(const std::string & name, int & layer, float & h_norm, std::vector<float> & u);
 
 struct server_jlens_dirs {
     std::vector<std::string> names;          // the selected directions

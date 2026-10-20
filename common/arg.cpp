@@ -3629,6 +3629,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROBE_DIRS"));
     add_opt(common_arg(
+        {"--steer-log"}, "PATH",
+        "exposure log for /steer (steered continuations along a --probe-dirs direction): one CSV row appended per request with a push (default: server log only)",
+        [](common_params & params, const std::string & value) {
+            params.steer_log_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STEER_LOG"));
+    add_opt(common_arg(
+        {"--steer-max-dose"}, "X",
+        string_format("largest |dose| /steer accepts, in units of the mean |h| at the direction's layer (default: %.2f)", (double) params.steer_max_dose),
+        [](common_params & params, const std::string & value) {
+            params.steer_max_dose = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STEER_MAX_DOSE"));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {

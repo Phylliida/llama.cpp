@@ -150,6 +150,7 @@ struct server_routes {
     server_http_context::handler_t post_tokenize;
     server_http_context::handler_t post_detokenize;
     server_http_context::handler_t post_jlens;
+    server_http_context::handler_t post_steer;
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;

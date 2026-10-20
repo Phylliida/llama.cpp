@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-jlens.h"
+#include "server-steer.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -951,6 +952,7 @@ private:
         // jlens holds raw ggml_tensor pointers into the model; release them
         // (after any in-flight /jlens compute) before the model is freed
         server_jlens_deinit();
+        server_steer_deinit();
 
         spec.reset();
         spec_init.reset();
@@ -1149,6 +1151,10 @@ private:
                     return false;
                 }
                 SRV_INF("jlens direction probes enabled from '%s'\n", params_base.probe_dirs_path.c_str());
+                const std::string mp = params_base.model.path;
+                server_steer_init(model_tgt, mp.substr(mp.find_last_of('/') + 1), params_base.steer_log_path, params_base.steer_max_dose);
+                SRV_INF("/steer enabled (exposure log: %s, max dose %.2f)\n",
+                        params_base.steer_log_path.empty() ? "server log" : params_base.steer_log_path.c_str(), (double) params_base.steer_max_dose);
             }
         }
 
@@ -5397,6 +5403,92 @@ void server_routes::init_routes() {
             };
         }
         res->ok(out);
+        return res;
+    };
+
+    this->post_steer = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto bad = [&](const std::string & msg, int code = 400) {
+            res->error(json{{"code", code}, {"message", msg}, {"type", code == 404 ? "not_found_error" : "invalid_request_error"}});
+        };
+        if (!server_jlens_dirs_enabled()) {
+            { bad("/steer needs direction probes (start the server with --jlens PATH --probe-dirs PATH)", 404); return res; }
+        }
+        const json body = json::parse(req.body);
+        llama_tokens tokens;
+        if (body.count("tokens") != 0) {
+            const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
+            for (const auto & t : body.at("tokens")) {
+                const llama_token id = t.get<llama_token>();
+                if (id < 0 || id >= n_vocab) { bad("token id out of range"); return res; }
+                tokens.push_back(id);
+            }
+        } else if (body.count("content") != 0) {
+            tokens = tokenize_mixed(ctx_server.vocab, body.at("content"), /*add_special=*/false, /*parse_special=*/true);
+        } else {
+            { bad("request must contain \"tokens\" or \"content\""); return res; }
+        }
+        if (tokens.empty()) { bad("empty text"); return res; }
+        int pos = json_value(body, "pos", -1);
+        if (pos < 0) pos += (int) tokens.size();
+        if (pos < 0 || pos >= (int) tokens.size()) { bad("pos out of range"); return res; }
+
+        server_steer_params sp;
+        sp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
+        if (json_value(body, "teacher_forced", false)) sp.follow.assign(tokens.begin() + pos + 1, tokens.end());
+        sp.dir     = json_value(body, "dir", std::string());
+        sp.doses   = json_value(body, "doses", std::vector<float>{0.25f, -0.25f});
+        sp.impulse = json_value(body, "mode", std::string("step")) == "impulse";
+        sp.n_seq   = json_value(body, "n_seq", 4);
+        sp.n_gen   = json_value(body, "n_gen", 48);
+        sp.seed    = json_value(body, "seed", 1);
+        sp.temp    = json_value(body, "temperature", 1.0f);
+        sp.n_top   = json_value(body, "n_top", 8);
+        sp.note    = json_value(body, "note", std::string());
+
+        server_steer_result r;
+        std::string err;
+        if (!server_steer_run(ctx_server.vocab, sp, r, err)) { bad(err); return res; }
+
+        auto piece = [&](llama_token t) { return common_token_to_piece(ctx_server.vocab, t, true); };
+        json arms = json::array();
+        for (const auto & a : r.arms) {
+            json seqs = json::array();
+            for (const auto & sq : a.seqs) {
+                json pieces = json::array();
+                for (auto t : sq.tok) pieces.push_back(piece(t));
+                seqs.push_back({
+                    {"tokens",    sq.tok},
+                    {"pieces",    std::move(pieces)},
+                    {"text",      tokens_to_str(ctx_server.vocab, llama_tokens(sq.tok.begin(), sq.tok.end()))},
+                    {"proj",      sq.proj}, // pre-push u.h per step, step 0 = the push token
+                    {"norm",      sq.norm},
+                    {"ent",       sq.ent},
+                    {"first_div", sq.first_div},
+                    {"endpoint",  sq.endpoint == 1 ? "loop" : sq.endpoint == 2 ? "incoherent" : ""},
+                });
+            }
+            json arm = {{"dose", a.dose}, {"push", a.push}, {"seqs", std::move(seqs)}};
+            if (!a.tf.kl.empty()) {
+                json up = json::array(), down = json::array();
+                for (const auto & [t, d] : a.tf.up)   up.push_back(json::array({piece(t), d}));
+                for (const auto & [t, d] : a.tf.down) down.push_back(json::array({piece(t), d}));
+                arm["tf"] = {{"kl", a.tf.kl}, {"dlogp", a.tf.dlogp}, {"up", std::move(up)}, {"down", std::move(down)}};
+            }
+            arms.push_back(std::move(arm));
+        }
+        res->ok({
+            {"dir",        sp.dir},
+            {"layer",      r.layer},
+            {"h_norm",     r.h_norm},
+            {"mode",       sp.impulse ? "impulse" : "step"},
+            {"pos",        pos},
+            {"n_tokens",   (int) tokens.size()},
+            {"push_piece", piece(tokens[pos])},
+            {"n_follow",   (int) std::min<size_t>(sp.follow.size(), 256)},
+            {"arms",       std::move(arms)},
+            {"sec",        r.sec},
+        });
         return res;
     };
 

@@ -25,6 +25,8 @@ add_library(${TARGET} STATIC
     server-schema.h
     server-jlens.cpp
     server-jlens.h
+    server-steer.cpp
+    server-steer.h
     ../jspace/jlens-graph.cpp
     ../jspace/jlens-model.cpp
     ../jspace/jlens-value.cpp

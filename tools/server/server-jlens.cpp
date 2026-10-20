@@ -104,6 +104,7 @@ struct server_jlens_dirs_state {
     int64_t                  n_embd = 0;
     std::vector<std::string> names;
     std::vector<int>         layers;
+    std::vector<float>       h_norms; // [n] mean |h| at each direction's layer (empty if absent)
     std::vector<float>       W; // [n][n_embd]
 };
 
@@ -378,8 +379,13 @@ bool server_jlens_load_dirs(const std::string & path, std::string & err) {
     d.n_embd = meta.value("n_embd", (int64_t) 0);
     d.names  = meta.value("names", std::vector<std::string>());
     d.layers = meta.value("layers", std::vector<int>());
+    d.h_norms = meta.value("h_norms", std::vector<float>());
     if (d.names.empty() || d.layers.size() != d.names.size()) {
         err = "probe-dirs json needs \"names\" and one entry of \"layers\" per name";
+        return false;
+    }
+    if (!d.h_norms.empty() && d.h_norms.size() != d.names.size()) {
+        err = "probe-dirs json: \"h_norms\" needs one entry per name";
         return false;
     }
     if (g_jlens.n_embd > 0 && d.n_embd != g_jlens.n_embd) {
@@ -407,6 +413,17 @@ bool server_jlens_load_dirs(const std::string & path, std::string & err) {
 bool server_jlens_dirs_enabled() {
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     return !g_dirs.names.empty();
+}
+
+bool server_jlens_dir_get(const std::string & name, int & layer, float & h_norm, std::vector<float> & u) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    const auto it = std::find(g_dirs.names.begin(), g_dirs.names.end(), name);
+    if (it == g_dirs.names.end()) return false;
+    const size_t r = (size_t) (it - g_dirs.names.begin());
+    layer  = g_dirs.layers[r];
+    h_norm = g_dirs.h_norms.empty() ? 0.0f : g_dirs.h_norms[r];
+    u.assign(g_dirs.W.begin() + r * g_dirs.n_embd, g_dirs.W.begin() + (r + 1) * g_dirs.n_embd);
+    return true;
 }
 
 bool server_jlens_enabled() {
