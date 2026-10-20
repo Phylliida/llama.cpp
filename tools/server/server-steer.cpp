@@ -40,8 +40,19 @@ bool steer_cb_eval(ggml_tensor * t, bool ask, void * ud) {
     return true;
 }
 
+// exposure counts of a log group, written as one row
+struct steer_group {
+    std::string name, mode, model, note;
+    long long   tok = 0;
+    int         n_ctx = 0, n_end = 0, n_req = 0;
+    float       max_dose = 0.0f, h_lo = 0.0f, h_hi = 0.0f;
+    std::vector<std::string> dirs;
+    std::chrono::steady_clock::time_point t0;
+};
+
 struct steer_state {
     std::mutex      mutex;
+    steer_group     grp;
     llama_model *   model = nullptr;
     llama_context * ctx   = nullptr;
     steer_capture   cap;
@@ -92,6 +103,40 @@ std::string csv_q(const std::string & s) {
     return o + "\"";
 }
 
+const char * ENDPOINT_DESC = "loop: period<=16 over max(3p;12) tokens | incoh: H>6.0 for 16 steps";
+
+void write_log_row(const std::string & row) {
+    if (!g_steer.log_path.empty()) {
+        if (FILE * f = fopen(g_steer.log_path.c_str(), "ab")) { fputs(row.c_str(), f); fclose(f); return; }
+        LOG_WRN("steer: cannot append to %s; exposure row: %s", g_steer.log_path.c_str(), row.c_str());
+    } else {
+        LOG_INF("steer: exposure row (no --steer-log): %s", row.c_str());
+    }
+}
+
+std::string today() {
+    char date[16];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(date, sizeof(date), "%Y-%m-%d", std::localtime(&now));
+    return date;
+}
+
+// caller holds g_steer.mutex
+void flush_group() {
+    steer_group & g = g_steer.grp;
+    if (g.n_req == 0) { g = steer_group(); return; }
+    char manip[768];
+    snprintf(manip, sizeof(manip), "steer along %zu layer-sweep probe directions (%s) x dose x mean|h| (%.1f-%.1f); %s", g.dirs.size(),
+             g.dirs.size() <= 4 ? [&] { std::string o; for (auto & d : g.dirs) o += (o.empty() ? "" : " ") + d; return o; }().c_str() : "blocks of each",
+             g.h_lo, g.h_hi, g.mode.c_str());
+    char row[2048];
+    snprintf(row, sizeof(row), "%s,loom-steer,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g.model).c_str(), csv_q(manip).c_str(),
+             g.max_dose, g.tok, g.n_ctx, csv_q(ENDPOINT_DESC).c_str(), g.n_ctx ? (double) g.n_end / g.n_ctx : 0.0,
+             csv_q("llama-server /steer, log group '" + g.name + "': " + std::to_string(g.n_req) + " requests" + (g.note.empty() ? "" : "; " + g.note)).c_str());
+    write_log_row(row);
+    g = steer_group();
+}
+
 template <typename F>
 void parallel_for(int n, int nt, F && fn) {
     nt = std::max(1, std::min(n, nt));
@@ -122,6 +167,7 @@ void server_steer_init(llama_model * model, const std::string & model_name, cons
 
 void server_steer_deinit() {
     std::lock_guard<std::mutex> lock(g_steer.mutex);
+    flush_group();
     if (g_steer.ctx) { llama_free(g_steer.ctx); g_steer.ctx = nullptr; }
     g_steer.model = nullptr;
 }
@@ -444,27 +490,33 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
             }
             if (n_f > 0 || !p.classes.empty()) { tok += p.impulse ? 1 : n_f + 1; n_ctx_pushed++; }
         }
-        char date[16];
-        const std::time_t now = std::time(nullptr);
-        std::strftime(date, sizeof(date), "%Y-%m-%d", std::localtime(&now));
         std::string ds;
         for (int a = 1; a < n_arm; ++a) { char b[32]; snprintf(b, sizeof(b), "%s%+.3g", ds.empty() ? "" : " ", doses[a]); ds += b; }
-        char manip[512];
-        snprintf(manip, sizeof(manip), "steer after block %d along %s (unit) x dose x mean|h| %.1f; doses %s; %s", layer,
-                 p.dir.empty() ? "a raw vector" : p.dir.c_str(), h_norm, ds.c_str(),
-                 p.set ? "set u.h/|h| at the push token (impulse)" : p.impulse ? "impulse (push token only)" : "step (from the push token on)");
-        char row[2048];
-        snprintf(row, sizeof(row), "%s,loom-steer,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", date, csv_q(g_steer.model_name).c_str(), csv_q(manip).c_str(),
-                 max_dose, tok, n_ctx_pushed, csv_q("loop: period<=16 over max(3p;12) tokens | incoh: H>6.0 for 16 steps").c_str(),
-                 n_ctx_pushed ? (double) n_end / n_ctx_pushed : 0.0,
-                 csv_q("llama-server /steer (loom); " + std::to_string(NS) + " seq x " + std::to_string(G) + " tokens per arm" +
-                       (n_f > 0 ? "; teacher-forced " + std::to_string(n_f) + " tokens" : "") + (p.note.empty() ? "" : "; " + p.note)).c_str());
-        if (!g_steer.log_path.empty()) {
-            if (FILE * f = fopen(g_steer.log_path.c_str(), "ab")) { fputs(row, f); fclose(f); }
-            else LOG_WRN("steer: cannot append to %s; exposure row: %s", g_steer.log_path.c_str(), row);
+        const std::string mode = p.set ? "set u.h/|h| at the push token (impulse)" : p.impulse ? "impulse (push token only)" : "step (from the push token on)";
+        if (!p.log_group.empty()) {
+            steer_group & g = g_steer.grp;
+            const auto now = std::chrono::steady_clock::now();
+            if (g.n_req > 0 && (g.name != p.log_group || g.mode != mode)) flush_group();
+            if (g.n_req == 0) { g.name = p.log_group; g.mode = mode; g.model = g_steer.model_name; g.note = p.note; g.t0 = now; g.h_lo = g.h_hi = h_norm; }
+            const std::string dn = p.dir.empty() ? "raw vectors" : p.dir;
+            if (std::find(g.dirs.begin(), g.dirs.end(), dn) == g.dirs.end()) g.dirs.push_back(dn);
+            g.tok += tok; g.n_ctx += n_ctx_pushed; g.n_end += n_end; g.n_req++;
+            g.max_dose = std::max(g.max_dose, max_dose);
+            g.h_lo = std::min(g.h_lo, h_norm); g.h_hi = std::max(g.h_hi, h_norm);
+            if (p.log_flush || g.n_req >= 100 || now - g.t0 > std::chrono::minutes(10)) flush_group();
         } else {
-            LOG_INF("steer: exposure row (no --steer-log): %s", row);
+            char manip[512];
+            snprintf(manip, sizeof(manip), "steer after block %d along %s (unit) x dose x mean|h| %.1f; doses %s; %s", layer,
+                     p.dir.empty() ? "a raw vector" : p.dir.c_str(), h_norm, ds.c_str(), mode.c_str());
+            char row[2048];
+            snprintf(row, sizeof(row), "%s,loom-steer,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g_steer.model_name).c_str(), csv_q(manip).c_str(),
+                     max_dose, tok, n_ctx_pushed, csv_q(ENDPOINT_DESC).c_str(), n_ctx_pushed ? (double) n_end / n_ctx_pushed : 0.0,
+                     csv_q("llama-server /steer (loom); " + std::to_string(NS) + " seq x " + std::to_string(G) + " tokens per arm" +
+                           (n_f > 0 ? "; teacher-forced " + std::to_string(n_f) + " tokens" : "") + (p.note.empty() ? "" : "; " + p.note)).c_str());
+            write_log_row(row);
         }
+    } else if (p.log_flush) {
+        flush_group();
     }
     return true;
 }

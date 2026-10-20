@@ -5451,6 +5451,8 @@ void server_routes::init_routes() {
         sp.temp    = json_value(body, "temperature", 1.0f);
         sp.n_top   = json_value(body, "n_top", 8);
         sp.note    = json_value(body, "note", std::string());
+        sp.log_group = json_value(body, "log_group", std::string());
+        sp.log_flush = json_value(body, "log_flush", false);
 
         server_steer_result r;
         std::string err;

@@ -24,7 +24,7 @@ struct llama_vocab;
 
 // after every model (re)load; log_path empty = exposure rows go to the server log only
 void server_steer_init(llama_model * model, const std::string & model_name, const std::string & log_path, float max_dose);
-// before the model is freed (sleep/shutdown); blocks until a running request finishes
+// before the model is freed (sleep/shutdown); blocks until a running request finishes; writes a pending group row
 void server_steer_deinit();
 
 struct server_steer_params {
@@ -44,6 +44,9 @@ struct server_steer_params {
     float                temp    = 1.0f;
     int                  n_top   = 8;     // teacher-forced: tokens listed per side at the push token
     std::string          note;            // goes into the exposure log
+    std::string          log_group;       // non-empty: one exposure row per group (written when the group changes, every
+                                          // 100 requests or 10 minutes, on log_flush and at shutdown), not per request
+    bool                 log_flush = false;
 };
 
 struct server_steer_seq {
