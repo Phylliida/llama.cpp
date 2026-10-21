@@ -2,14 +2,16 @@
 // NOTES-homeostasis.md): does the base model represent "the previous token
 // was unlikely"?
 //
-// Teacher-forces each rollout (gen_rollouts.py JSONL: prompt_ids + text) with
-// logits at every position and records, for every position t:
+// Teacher-forces each rollout (gen_rollouts.py JSONL: prompt_ids + text, or prompt_ids + tokens: the generated token
+// ids, used as they are instead of retokenizing the text) with logits at every position and records, for every
+// position t:
 //   surprisal     -ln p_{t-1}(x_t) under the model's own previous-position distribution
 //   entropy_prev  H(p_{t-1})
 //   rank_prev     rank of x_t under p_{t-1} (0 = argmax)
 //   entropy       H(p_t), the next-token entropy after seeing x_t
 // Block outputs l_out-N are captured at
-//   natural positions: every --stride-th position from --skip on
+//   natural positions: every --stride-th position from --skip on, or, if the record has "positions" (a list of
+//     token positions), exactly those
 //   forced positions:  --n-forced contexts per rollout. The prefix is branched
 //     (seq_cp on a unified KV cache) and one random token from each log10-p
 //     bin is decoded at the same position in its own sequence, plus the
@@ -244,7 +246,8 @@ int main(int argc, char ** argv) {
     if (skip < 1 || stride < 1) die("--skip and --stride must be >= 1");
 
     // ---- rollouts ----
-    struct rollout { std::vector<int32_t> prompt; std::string text; int doc_idx, rollout_idx; };
+    struct rollout { std::vector<int32_t> prompt; std::string text; int doc_idx, rollout_idx;
+                     bool has_tokens; std::vector<int32_t> tokens; bool has_positions; std::vector<int32_t> positions; };
     std::vector<rollout> rollouts;
     {
         std::ifstream f(rollouts_path);
@@ -253,8 +256,16 @@ int main(int argc, char ** argv) {
         while (std::getline(f, line)) {
             if (line.empty()) continue;
             const json j = json::parse(line);
-            rollouts.push_back({ j.at("prompt_ids").get<std::vector<int32_t>>(), j.at("text").get<std::string>(),
-                                 j.value("doc_idx", -1), j.value("rollout_idx", -1) });
+            rollout ro;
+            ro.prompt        = j.at("prompt_ids").get<std::vector<int32_t>>();
+            ro.has_tokens    = j.contains("tokens");
+            ro.text          = ro.has_tokens ? std::string() : j.at("text").get<std::string>();
+            ro.doc_idx       = j.value("doc_idx", -1);
+            ro.rollout_idx   = j.value("rollout_idx", -1);
+            if (ro.has_tokens) ro.tokens = j.at("tokens").get<std::vector<int32_t>>();
+            ro.has_positions = j.contains("positions");
+            if (ro.has_positions) ro.positions = j.at("positions").get<std::vector<int32_t>>();
+            rollouts.push_back(std::move(ro));
         }
     }
     if (n_rollouts >= 0 && (size_t) n_rollouts < rollouts.size()) rollouts.resize(n_rollouts);
@@ -392,7 +403,10 @@ int main(int argc, char ** argv) {
     for (size_t r = 0; r < rollouts.size(); ++r) {
         // tokens: prompt ids + generated text (parse_special: rollouts may contain doc-restart specials)
         std::vector<int32_t> toks = rollouts[r].prompt;
-        {
+        if (rollouts[r].has_tokens) {
+            toks.insert(toks.end(), rollouts[r].tokens.begin(), rollouts[r].tokens.end());
+            for (int32_t t : toks) if (t < 0 || t >= n_vocab) die("token id out of range");
+        } else {
             const std::string & text = rollouts[r].text;
             std::vector<llama_token> tt(text.size() + 16);
             int32_t n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), tt.data(), (int32_t) tt.size(),
@@ -402,7 +416,17 @@ int main(int argc, char ** argv) {
         }
         if ((int) toks.size() > max_len) toks.resize(max_len);
         const int len = (int) toks.size();
-        if (len <= skip + 1) continue;
+        if (!rollouts[r].has_positions && len <= skip + 1) continue;
+        // capture mask: listed positions, or every --stride-th from --skip
+        std::vector<char> want(len, 0);
+        if (rollouts[r].has_positions) {
+            for (int32_t p : rollouts[r].positions) {
+                if (p < 0 || p >= len) die("position out of range");
+                want[p] = 1;
+            }
+        } else {
+            for (int i = skip; i < len; i += stride) want[i] = 1;
+        }
 
         std::vector<label_rec> lab(len);
         for (int i = 0; i < len; ++i) {
@@ -474,7 +498,7 @@ int main(int argc, char ** argv) {
 
             for (int j = 0; j < n; ++j) {
                 const int i = cur + j;
-                if (i < skip || (i - skip) % stride != 0) continue;
+                if (!want[i]) continue;
                 const label_rec & L = lab[i];
                 sample_rec rec = {};
                 rec.seq = (int32_t) r; rec.pos = i; rec.token = L.token; rec.kind = 0;
