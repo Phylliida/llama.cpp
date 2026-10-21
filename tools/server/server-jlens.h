@@ -68,6 +68,18 @@ struct server_jlens_dirs {
     std::vector<std::vector<float>> cos;     // [n_tokens][n_sel] u.h / |h|
 };
 
+// linear probes on all block outputs at once (all-layer probes from homeo/lin_probes_export.py in base-model-welfare):
+// PATH.f32 holds [n][n_layer][n_embd] weights then [n] biases (raw block outputs, value = sum_L w_L . h_L + b),
+// PATH.json {"n_embd", "n_layer", "names"}. Computed inside the forward graph. Load after server_jlens_init; survives
+// model reloads.
+bool server_jlens_load_lin(const std::string & path, std::string & err);
+bool server_jlens_lin_enabled();
+
+struct server_jlens_lin {
+    std::vector<std::string> names;
+    std::vector<std::vector<float>> values; // [n_tokens][n]
+};
+
 // per-position next-token statistics from the model's own output distribution
 struct server_jlens_token_stats {
     std::vector<float> surprisal; // [n_tokens] -log p(x_{s+1}); NaN at the last position
@@ -78,6 +90,7 @@ struct server_jlens_token_stats {
 
 // readouts != nullptr: also compute the readouts at every position.
 // stats != nullptr: also compute surprisal and entropy at every position.
+// lin != nullptr: also the all-layer linear probes at every position.
 // dirs != nullptr: also project on the direction probes, those at dir_layers only (all when null or empty). Each
 // selected layer's block output stays in VRAM until the end of the pass (n_tokens * n_embd floats per layer).
 // readouts_only: skip the J-lens decode (layers and model_topk stay empty).
@@ -95,7 +108,8 @@ bool server_jlens_compute(
         bool readouts_only = false,
         server_jlens_token_stats * stats = nullptr,
         server_jlens_dirs * dirs = nullptr,
-        const std::vector<int> * dir_layers = nullptr);
+        const std::vector<int> * dir_layers = nullptr,
+        server_jlens_lin * lin = nullptr);
 
 // exact value lens (jlens_value_exact) at slot_layer for every position: |d log p(x_{s+1}) / d h_s| (now) and
 // |sum over all later t > s of d log p(x_{t+1}) / d h_s| (fut). Needs only the model weights (no probe file).

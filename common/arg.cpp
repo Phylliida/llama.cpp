@@ -3629,6 +3629,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PROBE_DIRS"));
     add_opt(common_arg(
+        {"--lin-probes"}, "PATH",
+        "linear probes on all block outputs, returned by /jlens with \"lin\": true per token (PATH.f32 [n][n_layer][n_embd] weights then [n] biases, PATH.json names + n_layer + n_embd; needs --jlens)",
+        [](common_params & params, const std::string & value) {
+            params.lin_probes_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LIN_PROBES"));
+    add_opt(common_arg(
         {"--steer-log"}, "PATH",
         "exposure log for /steer (steered continuations along a --probe-dirs direction): one CSV row appended per request with a push (default: server log only)",
         [](common_params & params, const std::string & value) {

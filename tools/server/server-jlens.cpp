@@ -110,6 +110,52 @@ struct server_jlens_dirs_state {
 
 server_jlens_dirs_state g_dirs;
 
+// linear probes on all block outputs (homeo/lin_probes_export.py in base-model-welfare): host weights are
+// model-independent; the per-layer device copies are dropped by deinit and re-uploaded on first use. guarded by
+// g_jlens.mutex
+struct server_jlens_lin_state {
+    int64_t                  n_embd  = 0;
+    int64_t                  n_layer = 0;
+    std::vector<std::string> names;
+    std::vector<float>       W; // [n][n_layer][n_embd]
+    std::vector<float>       b; // [n]
+    ggml_context *              ctx = nullptr; // per-layer device tensors [n_embd, n]
+    ggml_backend_buffer_t       buf = nullptr;
+    std::vector<ggml_tensor *>  w_dev;
+};
+
+server_jlens_lin_state g_lin;
+
+void lin_free_device() {
+    if (g_lin.buf) { ggml_backend_buffer_free(g_lin.buf); g_lin.buf = nullptr; }
+    if (g_lin.ctx) { ggml_free(g_lin.ctx);                g_lin.ctx = nullptr; }
+    g_lin.w_dev.clear();
+}
+
+// caller holds g_jlens.mutex and g_jlens is initialized
+bool lin_upload(std::string & err) {
+    if (g_lin.buf) return true;
+    const int64_t n = (int64_t) g_lin.names.size(), E = g_lin.n_embd, NLy = g_lin.n_layer;
+    ggml_init_params ip = { (size_t) NLy * ggml_tensor_overhead(), nullptr, true };
+    g_lin.ctx = ggml_init(ip);
+    g_lin.w_dev.assign(NLy, nullptr);
+    for (int64_t L = 0; L < NLy; ++L) g_lin.w_dev[L] = ggml_new_tensor_2d(g_lin.ctx, GGML_TYPE_F32, E, n);
+    g_lin.buf = ggml_backend_alloc_ctx_tensors_from_buft(g_lin.ctx, ggml_backend_cuda_buffer_type(g_jlens.device));
+    if (!g_lin.buf) {
+        lin_free_device();
+        err = "jlens: cannot allocate linear probe weights on the device";
+        return false;
+    }
+    std::vector<float> tmp((size_t) E * n);
+    for (int64_t L = 0; L < NLy; ++L) {
+        for (int64_t r = 0; r < n; ++r) {
+            std::memcpy(tmp.data() + r * E, g_lin.W.data() + ((size_t) r * NLy + L) * E, E * sizeof(float));
+        }
+        ggml_backend_tensor_set(g_lin.w_dev[L], tmp.data(), 0, tmp.size() * sizeof(float));
+    }
+    return true;
+}
+
 // fn(q) for q in [0, n) on up to 32 threads
 template <typename F>
 void parallel_for_rows(int n, F && fn) {
@@ -136,6 +182,7 @@ void server_jlens_deinit_locked() {
     if (g_jlens.jbuf)    { ggml_backend_buffer_free(g_jlens.jbuf);  g_jlens.jbuf    = nullptr; }
     if (g_jlens.jctx)    { ggml_free(g_jlens.jctx);                 g_jlens.jctx    = nullptr; }
     if (g_jlens.backend) { ggml_backend_free(g_jlens.backend);      g_jlens.backend = nullptr; }
+    lin_free_device();
     g_jlens.x_in     = nullptr;
     g_jlens.hgf      = nullptr;
     g_jlens.hlogits  = nullptr;
@@ -415,6 +462,59 @@ bool server_jlens_dirs_enabled() {
     return !g_dirs.names.empty();
 }
 
+bool server_jlens_load_lin(const std::string & path, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    nlohmann::json meta;
+    {
+        std::ifstream f(path + ".json");
+        if (!f) {
+            err = "cannot open " + path + ".json";
+            return false;
+        }
+        try {
+            f >> meta;
+        } catch (const std::exception & e) {
+            err = std::string("bad lin-probes json: ") + e.what();
+            return false;
+        }
+    }
+    lin_free_device();
+    server_jlens_lin_state l;
+    l.n_embd  = meta.value("n_embd", (int64_t) 0);
+    l.n_layer = meta.value("n_layer", (int64_t) 0);
+    l.names   = meta.value("names", std::vector<std::string>());
+    if (l.names.empty() || l.n_embd <= 0 || l.n_layer <= 0) {
+        err = "lin-probes json needs \"names\", \"n_embd\" and \"n_layer\"";
+        return false;
+    }
+    if (g_jlens.n_embd > 0 && (l.n_embd != g_jlens.n_embd || l.n_layer != g_jlens.n_layer)) {
+        err = "lin-probes n_embd / n_layer do not match the model";
+        return false;
+    }
+    const size_t n = l.names.size();
+    std::vector<float> buf(n * l.n_layer * l.n_embd + n);
+    std::ifstream f(path + ".f32", std::ios::binary | std::ios::ate);
+    if (!f || (size_t) f.tellg() != buf.size() * sizeof(float)) {
+        err = "lin-probes weights missing or wrong size: " + path + ".f32";
+        return false;
+    }
+    f.seekg(0);
+    f.read((char *) buf.data(), buf.size() * sizeof(float));
+    l.W.assign(buf.begin(), buf.begin() + n * l.n_layer * l.n_embd);
+    l.b.assign(buf.begin() + n * l.n_layer * l.n_embd, buf.end());
+    g_lin.n_embd  = l.n_embd;
+    g_lin.n_layer = l.n_layer;
+    g_lin.names   = std::move(l.names);
+    g_lin.W       = std::move(l.W);
+    g_lin.b       = std::move(l.b);
+    return true;
+}
+
+bool server_jlens_lin_enabled() {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    return !g_lin.names.empty();
+}
+
 float server_jlens_layer_h_norm(int layer) {
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     for (size_t r = 0; r < g_dirs.layers.size(); ++r) {
@@ -452,9 +552,14 @@ bool server_jlens_compute(
         bool readouts_only,
         server_jlens_token_stats * stats,
         server_jlens_dirs * dirs,
-        const std::vector<int> * dir_layers) {
+        const std::vector<int> * dir_layers,
+        server_jlens_lin * lin) {
 
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    if (lin && g_lin.names.empty()) {
+        err = "jlens: linear probes not loaded (--lin-probes)";
+        return false;
+    }
     if (readouts && g_readout.layer < 0) {
         err = "jlens: readouts not loaded (--value-probe)";
         return false;
@@ -463,7 +568,7 @@ bool server_jlens_compute(
         err = "jlens: direction probes not loaded (--probe-dirs)";
         return false;
     }
-    if (!readouts && !stats && !dirs) {
+    if (!readouts && !stats && !dirs && !lin) {
         readouts_only = false;
     }
     // selected direction probes (all, or those at dir_layers) and the layers they need
@@ -540,12 +645,16 @@ bool server_jlens_compute(
     // forward pass exposing block outputs (flash attention, forward only).
     // with_head=false: skip the full-sequence logits GEMM + [n_vocab, n_tokens]
     // tensor; the model reference is decoded per-position through the head graph.
+    if (lin && !lin_upload(err)) {
+        return false;
+    }
     jlens_forward fwd;
     if (!jlens_build_forward(*g_jlens.weights, n_tokens, /*with_grad_flags=*/false, fwd,
-                             -1, /*use_flash_attn=*/true, /*with_head=*/false)) {
+                             -1, /*use_flash_attn=*/true, /*with_head=*/false, lin ? &g_lin.w_dev : nullptr)) {
         err = "jlens: graph build failed";
         return false;
     }
+    if (lin) ggml_set_output(fwd.lin);
     // pin only the activations we actually fetch: every ggml_set_output'd tensor
     // is retained by the allocator for the whole graph lifetime
     for (int il : layers) ggml_set_output(fwd.l_out[il]);
@@ -582,6 +691,17 @@ bool server_jlens_compute(
 
     const int64_t n_embd  = g_jlens.n_embd;
 
+    if (lin) {
+        // sum over layers of W_L^T h_L (computed in the forward graph) + bias
+        const int n_l = (int) g_lin.names.size();
+        std::vector<float> v((size_t) n_l * n_tokens);
+        ggml_backend_tensor_get(fwd.lin, v.data(), 0, v.size() * sizeof(float));
+        lin->names = g_lin.names;
+        lin->values.assign(n_tokens, std::vector<float>(n_l));
+        for (int q = 0; q < n_tokens; ++q) {
+            for (int r = 0; r < n_l; ++r) lin->values[q][r] = v[(size_t) q * n_l + r] + g_lin.b[r];
+        }
+    }
     if (readouts) {
         // W h + b at every position, on the CPU (n_names dot products of n_embd per position)
         const int64_t L = g_readout.layer;

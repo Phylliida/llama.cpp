@@ -695,6 +695,7 @@ struct common_params {
     std::string jlens_path; // path to JLNS transport matrices for the /jlens endpoint (server, default: disabled)
     std::string value_probe_path; // linear readouts on a block output for /jlens (PATH.f32 + PATH.json, server)
     std::string probe_dirs_path;  // direction probes at several layers for /jlens (PATH.f32 + PATH.json, server)
+    std::string lin_probes_path;  // linear probes on all block outputs for /jlens (PATH.f32 + PATH.json, server)
     std::string steer_log_path;   // exposure log (CSV, appended) for /steer pushes (server)
     float       steer_max_dose = 1.0f; // largest |dose| /steer accepts, in units of mean |h| at the layer (server)
 

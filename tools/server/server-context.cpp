@@ -1145,6 +1145,13 @@ private:
                 }
                 SRV_INF("jlens readouts enabled from '%s'\n", params_base.value_probe_path.c_str());
             }
+            if (!params_base.lin_probes_path.empty()) {
+                if (!server_jlens_load_lin(params_base.lin_probes_path, jlens_err)) {
+                    SRV_ERR("failed to load linear probes: %s\n", jlens_err.c_str());
+                    return false;
+                }
+                SRV_INF("jlens all-layer linear probes enabled from '%s'\n", params_base.lin_probes_path.c_str());
+            }
             if (!params_base.probe_dirs_path.empty()) {
                 if (!server_jlens_load_dirs(params_base.probe_dirs_path, jlens_err)) {
                     SRV_ERR("failed to load direction probes: %s\n", jlens_err.c_str());
@@ -5288,6 +5295,7 @@ void server_routes::init_routes() {
         const bool readouts_only = json_value(body, "readouts_only", false);
         const bool want_stats    = json_value(body, "token_stats", false);
         const bool want_dirs     = json_value(body, "dirs", false);
+        const bool want_lin      = json_value(body, "lin", false);
         std::vector<int> layers, dir_layers;
         if (body.count("layers") != 0 && body.at("layers").is_array()) {
             for (const auto & l : body.at("layers")) {
@@ -5305,7 +5313,16 @@ void server_routes::init_routes() {
         server_jlens_readouts readouts;
         server_jlens_token_stats stats;
         server_jlens_dirs dirs;
+        server_jlens_lin lin;
         std::string err;
+        if (want_lin && !server_jlens_lin_enabled()) {
+            res->error(json{
+                {"code", 400},
+                {"message", "linear probes are not enabled (start the server with --lin-probes PATH)"},
+                {"type", "invalid_request_error"},
+            });
+            return res;
+        }
         if (want_readouts && !server_jlens_readouts_enabled()) {
             res->error(json{
                 {"code", 400},
@@ -5330,7 +5347,8 @@ void server_routes::init_routes() {
                                   readouts_only,
                                   want_stats ? &stats : nullptr,
                                   want_dirs ? &dirs : nullptr,
-                                  &dir_layers)) {
+                                  &dir_layers,
+                                  want_lin ? &lin : nullptr)) {
             res->error(json{
                 {"code", 400},
                 {"message", err},
@@ -5392,6 +5410,12 @@ void server_routes::init_routes() {
                 {"layer",  readouts.layer},
                 {"names",  readouts.names},
                 {"values", readouts.values}, // [n_tokens][n_names]
+            };
+        }
+        if (want_lin) {
+            out["lin"] = {
+                {"names",  lin.names},
+                {"values", lin.values}, // [n_tokens][n_names]
             };
         }
         if (want_dirs) {

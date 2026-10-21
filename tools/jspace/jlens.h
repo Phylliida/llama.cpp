@@ -79,6 +79,7 @@ struct jlens_forward {
     std::vector<ggml_tensor *> k_out;   // per-block keys after rope [n_embd_head, n_head_kv, n_tokens] (set_output to keep)
     std::vector<ggml_tensor *> v_out;   // per-block values, same shape
     ggml_tensor *              logits = nullptr; // [n_vocab, n_tokens]
+    ggml_tensor *              lin    = nullptr; // [n_lin, n_tokens] sum over layers of W_L^T l_out[L] (lin_w only)
 };
 
 // build the GLM-4 dense forward graph; n_tokens must be fixed at build time.
@@ -95,8 +96,12 @@ struct jlens_forward {
 // with_head: build the full-model head (final norm + lm_head over all
 // positions); pass false when only block outputs are needed to skip the
 // [n_vocab, n_tokens] logits tensor and its GEMM
+// lin_w: per-layer f32 weights [n_embd, n_lin] (nullptr entries skipped) of linear probes on all block outputs;
+// out.lin = sum over layers of W_L^T l_out[L], accumulated right after each block so no block output has to stay
+// alive to the end of the graph
 bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer = -1, bool use_flash_attn = false, bool with_head = true);
+                         int perturb_layer = -1, bool use_flash_attn = false, bool with_head = true,
+                         const std::vector<ggml_tensor *> * lin_w = nullptr);
 
 // R-lens (LRP backward): two-phase variant of the above.
 //

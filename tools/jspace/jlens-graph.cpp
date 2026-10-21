@@ -265,7 +265,8 @@ bool jlens_build_block(const jlens_weights & m, int il, int n_tokens, jlens_bloc
 
 
 bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_flags, jlens_forward & out,
-                         int perturb_layer, bool use_flash_attn, bool with_head) {
+                         int perturb_layer, bool use_flash_attn, bool with_head,
+                         const std::vector<ggml_tensor *> * lin_w) {
     if (with_grad_flags && use_flash_attn) {
         fprintf(stderr, "jlens_build_forward: flash attention has no backward path\n");
         return false;
@@ -341,6 +342,11 @@ bool jlens_build_forward(const jlens_weights & m, int n_tokens, bool with_grad_f
         }
 
         out.l_out[il] = cur;
+        if (lin_w && il < (int) lin_w->size() && (*lin_w)[il]) {
+            ggml_tensor * mm = ggml_mul_mat(ctx, (*lin_w)[il], cur); // [n_lin, n_tokens]
+            out.lin = out.lin ? ggml_add(ctx, out.lin, mm) : mm;
+            ggml_build_forward_expand(out.gf, out.lin);
+        }
         if (with_grad_flags && il == perturb_layer) {
             // additive probe input for finite-difference validation of the backward pass
             out.perturb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, n_tokens);
