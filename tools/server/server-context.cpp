@@ -19,6 +19,11 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -5477,6 +5482,79 @@ void server_routes::init_routes() {
         sp.note    = json_value(body, "note", std::string());
         sp.log_group = json_value(body, "log_group", std::string());
         sp.log_flush = json_value(body, "log_flush", false);
+        const bool stream = json_value(body, "stream", false);
+        sp.baseline = json_value(body, "baseline", !stream);
+
+        if (stream) {
+            // the first pushed arm's first sequence as server-sent events in /completion's format ({"content", "tokens",
+            // "stop"}), then a final event with "stop": true, the endpoint and the token count, then [DONE]. The run goes
+            // on a worker thread; a client disconnect stops it (the partial run is still logged as exposure).
+            if (!sp.follow.empty() || sp.set) { bad("stream needs mode step or impulse without teacher_forced / set_cos"); return res; }
+            struct steer_stream {
+                std::mutex m;
+                std::condition_variable cv;
+                std::deque<std::string> q;
+                std::string pending; // bytes of an incomplete utf-8 character
+                bool done = false;
+                std::atomic<bool> cancel{false};
+            };
+            // destroyed with the response (also when the client disconnects and the server stops calling next()):
+            // stops the worker at its next token
+            struct cancel_on_destroy {
+                std::shared_ptr<steer_stream> st;
+                ~cancel_on_destroy() { if (st) st->cancel = true; }
+            };
+            auto st = std::make_shared<steer_stream>();
+            auto guard = std::make_shared<cancel_on_destroy>();
+            guard->st = st;
+            const llama_vocab * vocab = ctx_server.vocab;
+            auto sse = [](const json & j) { return "data: " + safe_json_to_str(j) + "\n\n"; };
+            sp.on_token = [st, vocab, sse](int arm, int seq, int32_t tok) -> bool {
+                if (arm != 1 || seq != 0) return !st->cancel;
+                std::lock_guard<std::mutex> lk(st->m);
+                st->pending += common_token_to_piece(vocab, tok, true);
+                const size_t ok = validate_utf8(st->pending);
+                json tj = json::array({tok});
+                st->q.push_back(sse({{"content", st->pending.substr(0, ok)}, {"tokens", tj}, {"stop", false}}));
+                st->pending.erase(0, ok);
+                st->cv.notify_all();
+                return !st->cancel;
+            };
+            std::thread([st, sp, vocab, sse, pos, n_tok = (int) tokens.size()]() mutable {
+                server_steer_result r;
+                std::string err;
+                const bool ok = server_steer_run(vocab, sp, r, err);
+                std::lock_guard<std::mutex> lk(st->m);
+                if (!ok) {
+                    st->q.push_back(sse({{"error", {{"code", 400}, {"message", err}, {"type", "invalid_request_error"}}}}));
+                } else {
+                    const server_steer_seq * sq = r.arms.size() > 1 && !r.arms[1].seqs.empty() ? &r.arms[1].seqs[0] : nullptr;
+                    st->q.push_back(sse({{"content", st->pending}, {"stop", true}, {"stopped_by_client", (bool) st->cancel},
+                        {"endpoint", !sq ? "" : sq->endpoint == 1 ? "loop" : sq->endpoint == 2 ? "incoherent" : ""},
+                        {"n_gen", sq ? (int) sq->tok.size() : 0}, {"layer", r.layer}, {"h_norm", r.h_norm}, {"pos", pos},
+                        {"n_tokens", n_tok}, {"sec", r.sec}}));
+                }
+                st->q.push_back("data: [DONE]\n\n");
+                st->done = true;
+                st->cv.notify_all();
+            }).detach();
+            res->status = 200;
+            res->content_type = "text/event-stream";
+            res->data = "";
+            res->set_req(&req); // should_stop() needs the request (client disconnect)
+            res->set_next([st, guard, res_this = res.get()](std::string & output) -> bool {
+                std::unique_lock<std::mutex> lk(st->m);
+                while (st->q.empty() && !st->done) {
+                    if (res_this->should_stop()) { st->cancel = true; return false; }
+                    st->cv.wait_for(lk, std::chrono::milliseconds(200));
+                }
+                if (st->q.empty()) return false;
+                output = std::move(st->q.front());
+                st->q.pop_front();
+                return true;
+            });
+            return res;
+        }
 
         server_steer_result r;
         std::string err;

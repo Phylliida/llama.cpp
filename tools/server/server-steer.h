@@ -15,6 +15,7 @@
 // server's slots. Requests are serialized.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,6 +48,10 @@ struct server_steer_params {
     std::string          log_group;       // non-empty: one exposure row per group (written when the group changes, every
                                           // 100 requests or 10 minutes, on log_flush and at shutdown), not per request
     bool                 log_flush = false;
+    bool                 baseline = true;  // run the unsteered arm (arm 0); false: skip it (streaming, the loom's generation)
+    // called with each sampled token (arm, sequence, token), in order per sequence; return false to stop generating
+    // (the run then ends normally with what it has, and is logged)
+    std::function<bool(int, int, int32_t)> on_token;
 };
 
 struct server_steer_seq {

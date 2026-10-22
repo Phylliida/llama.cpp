@@ -325,10 +325,12 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
     std::vector<std::vector<float>> lp(NS, std::vector<float>(n_vocab));
 
     // ---- sampled continuations, one arm at a time (the push applies to the whole batch) ----
-    for (int a = 0; a < n_arm; ++a) {
+    bool cancelled = false;
+    for (int a = 0; a < n_arm && !cancelled; ++a) {
         server_steer_arm & arm = out.arms[a];
         arm.dose = doses[a];
         arm.push = doses[a] * h_norm;
+        if (a == 0 && !p.baseline && !p.set && n_arm > 1) { arm.seqs.assign(NS, server_steer_seq()); continue; } // no control arm
         if (p.set && a > 0) { arm.push = set_push_val; arm.dose = set_push_val / h_norm; }
         arm.seqs.assign(NS, server_steer_seq());
         if (!set_push(ctx, u, layer, arm.push, n_embd, n_layer, cvec)) return fail("steer: cvec set failed");
@@ -387,13 +389,14 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
             for (int j = 0; j < na; ++j) {
                 const int k = act[j];
                 server_steer_seq & sq = arm.seqs[k];
+                if (p.on_token && !p.on_token(a, k, sq.tok.back())) cancelled = true;
                 hot[k] = sq.ent.back() > INCOH_H ? hot[k] + 1 : 0;
                 if (hot[k] >= INCOH_RUN) { sq.endpoint = 2; continue; }
                 if (find_loop(sq.tok, LOOP_MAX_P, LOOP_MIN_SPAN) > 0) { sq.endpoint = 1; continue; }
                 if (llama_vocab_is_eog(vocab, sq.tok.back())) continue; // end of document: stop, not an endpoint
                 nxt.push_back(k);
             }
-            act = nxt;
+            act = cancelled ? std::vector<int>() : nxt;
             for (int j = 0; j < (int) act.size(); ++j) {
                 const int k = act[j];
                 batch.token[j] = arm.seqs[k].tok.back(); batch.pos[j] = s + 1 + step; batch.n_seq_id[j] = 1;
@@ -402,7 +405,7 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
             batch.n_tokens = (int) act.size();
         }
         for (int k = 0; k < NS; ++k) llama_memory_seq_rm(mem, a * NS + k, -1, -1);
-        if (a > 0) {
+        if (a > 0 && !out.arms[0].seqs.empty() && !(out.arms[0].seqs[0].tok.empty() && !p.baseline)) {
             for (int k = 0; k < NS; ++k) {
                 const auto & t0 = out.arms[0].seqs[k].tok;
                 const auto & t1 = arm.seqs[k].tok;
