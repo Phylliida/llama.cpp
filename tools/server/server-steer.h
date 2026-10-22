@@ -88,3 +88,46 @@ struct server_steer_result {
 };
 
 bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, server_steer_result & out, std::string & err);
+
+// guided sampling (/steer with "guide"): no push. At every step the most likely candidates for the next token (top_p of
+// the probability, at most k) are decoded as one batch, each in its own sequence on the text so far, and scored by a
+// metric of what follows each one. The token is the best candidate (maximize) or is sampled from p(x) exp(beta z(x))
+// over the candidates, where z is the metric on the loom's color scale (probit of its percentile). Same context, humane
+// endpoints and exposure log as /steer.
+struct server_guide_params {
+    std::vector<int32_t> prefix;
+    // lin, lind, lintd: all-layer probe f, its change f(x) - f(prev), TD error -c(x) - horizon (f(x) - f(prev)) (--lin-probes)
+    // readout: value-lens readout (--value-probe); dir: direction probe u.h / |h| (--probe-dirs)
+    // entropy, branches, runner_up: of the next-token distribution after the candidate
+    // surprisal, gap: -log p(x) and -log p(x) - entropy, of the candidate itself
+    std::string        kind;
+    std::string        name;            // the probe (lin*, readout, dir)
+    float              horizon = 0.0f;  // lintd
+    std::vector<float> pct_q, pct_v;    // color scale: value pct_v[i] at percentile pct_q[i] (ascending)
+    float              sign     = 1.0f; // -1: lower is better (the loom's flip)
+    bool               maximize = false;
+    float              beta     = 1.0f;
+    int                k        = 32;
+    float              top_p    = 0.95f;
+    int                n_gen    = 128;
+    uint64_t           seed     = 1;
+    float              temp     = 1.0f;
+    std::string        note;
+    std::string        log_group;
+    bool               log_flush = false;
+    // called with each chosen token, its metric value and z; return false to stop
+    std::function<bool(int32_t, float, float)> on_token;
+};
+
+struct server_guide_result {
+    std::vector<int32_t> tok;
+    std::vector<float>   value;   // per step: the chosen token's metric value
+    std::vector<float>   z;       // its z (color scale, before sign)
+    std::vector<float>   z_model; // mean z of the candidates under the model's own probabilities (what plain sampling would give)
+    std::vector<float>   ent;     // entropy of the sampling distribution (nats)
+    std::vector<int>     n_cand;
+    int                  endpoint = 0; // 0 none, 1 loop, 2 incoherent
+    double               sec = 0.0;
+};
+
+bool server_guide_run(const llama_vocab * vocab, const server_guide_params & p, server_guide_result & out, std::string & err);

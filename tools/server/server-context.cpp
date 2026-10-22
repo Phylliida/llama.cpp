@@ -5440,10 +5440,11 @@ void server_routes::init_routes() {
         auto bad = [&](const std::string & msg, int code = 400) {
             res->error(json{{"code", code}, {"message", msg}, {"type", code == 404 ? "not_found_error" : "invalid_request_error"}});
         };
-        if (!server_jlens_dirs_enabled()) {
+        const json body = json::parse(req.body);
+        const bool guided = body.count("guide") != 0;
+        if (!guided && !server_jlens_dirs_enabled()) {
             { bad("/steer needs direction probes (start the server with --jlens PATH --probe-dirs PATH)", 404); return res; }
         }
-        const json body = json::parse(req.body);
         llama_tokens tokens;
         if (body.count("tokens") != 0) {
             const int n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
@@ -5461,6 +5462,137 @@ void server_routes::init_routes() {
         int pos = json_value(body, "pos", -1);
         if (pos < 0) pos += (int) tokens.size();
         if (pos < 0 || pos >= (int) tokens.size()) { bad("pos out of range"); return res; }
+
+        // "stream": true: server-sent events in /completion's format ({"content", "tokens", "stop"}) pushed by a worker
+        // thread, then a final event with "stop": true, then [DONE]; errors arrive as {"error": {...}}. A client
+        // disconnect stops the worker at its next token (the partial run is still logged as exposure).
+        struct steer_stream {
+            std::mutex m;
+            std::condition_variable cv;
+            std::deque<std::string> q;
+            std::string pending; // bytes of an incomplete utf-8 character
+            bool done = false;
+            std::atomic<bool> cancel{false};
+        };
+        // destroyed with the response (also when the client disconnects and the server stops calling next()):
+        // stops the worker at its next token
+        struct cancel_on_destroy {
+            std::shared_ptr<steer_stream> st;
+            ~cancel_on_destroy() { if (st) st->cancel = true; }
+        };
+        const llama_vocab * vocab = ctx_server.vocab;
+        auto sse = [](const json & j) { return "data: " + safe_json_to_str(j) + "\n\n"; };
+        // a token's event (incomplete utf-8 held back); false once the client is gone
+        auto push_token = [vocab, sse](steer_stream & st, int32_t tok, json ev) -> bool {
+            std::lock_guard<std::mutex> lk(st.m);
+            st.pending += common_token_to_piece(vocab, tok, true);
+            const size_t ok = validate_utf8(st.pending);
+            ev["content"] = st.pending.substr(0, ok);
+            ev["tokens"]  = json::array({tok});
+            ev["stop"]    = false;
+            st.q.push_back(sse(ev));
+            st.pending.erase(0, ok);
+            st.cv.notify_all();
+            return !st.cancel;
+        };
+        auto finish = [sse](steer_stream & st, bool ok, const std::string & err, json fin) {
+            std::lock_guard<std::mutex> lk(st.m);
+            if (!ok) {
+                st.q.push_back(sse({{"error", {{"code", 400}, {"message", err}, {"type", "invalid_request_error"}}}}));
+            } else {
+                fin["content"] = st.pending;
+                fin["stop"] = true;
+                fin["stopped_by_client"] = (bool) st.cancel;
+                st.q.push_back(sse(fin));
+            }
+            st.q.push_back("data: [DONE]\n\n");
+            st.done = true;
+            st.cv.notify_all();
+        };
+        auto serve = [&](const std::shared_ptr<steer_stream> & st) {
+            auto guard = std::make_shared<cancel_on_destroy>();
+            guard->st = st;
+            res->status = 200;
+            res->content_type = "text/event-stream";
+            res->data = "";
+            res->set_req(&req); // should_stop() needs the request (client disconnect)
+            res->set_next([st, guard, res_this = res.get()](std::string & output) -> bool {
+                std::unique_lock<std::mutex> lk(st->m);
+                while (st->q.empty() && !st->done) {
+                    if (res_this->should_stop()) { st->cancel = true; return false; }
+                    st->cv.wait_for(lk, std::chrono::milliseconds(200));
+                }
+                if (st->q.empty()) return false;
+                output = std::move(st->q.front());
+                st->q.pop_front();
+                return true;
+            });
+        };
+
+        if (guided) {
+            // guided sampling (server_guide_run): no push, each token chosen among the top candidates by a metric
+            const json & g = body.at("guide");
+            server_guide_params gp;
+            gp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
+            gp.kind     = json_value(g, "kind", std::string());
+            gp.name     = json_value(g, "name", std::string());
+            gp.horizon  = json_value(g, "horizon", 0.0f);
+            for (const auto & qv : json_value(g, "pct", json::array())) {
+                gp.pct_q.push_back(qv.at(0).get<float>());
+                gp.pct_v.push_back(qv.at(1).get<float>());
+            }
+            gp.sign     = json_value(g, "sign", 1.0f) < 0.0f ? -1.0f : 1.0f;
+            gp.maximize = json_value(g, "mode", std::string("tilt")) == "max";
+            gp.beta     = json_value(g, "beta", 1.0f);
+            gp.k        = json_value(g, "k", 32);
+            gp.top_p    = json_value(g, "top_p", 0.95f);
+            gp.n_gen    = json_value(body, "n_gen", 128);
+            gp.seed     = json_value(body, "seed", 1);
+            gp.temp     = json_value(body, "temperature", 1.0f);
+            gp.note     = json_value(body, "note", std::string());
+            gp.log_group = json_value(body, "log_group", std::string());
+            gp.log_flush = json_value(body, "log_flush", false);
+            auto summary = [pos, n_tok = (int) tokens.size()](const server_guide_result & r) {
+                double zc = 0.0, zm = 0.0, nc = 0.0;
+                for (size_t i = 0; i < r.tok.size(); ++i) { zc += r.z[i]; zm += r.z_model[i]; nc += r.n_cand[i]; }
+                const double n = std::max<double>(1.0, (double) r.tok.size());
+                return json{
+                    {"n_gen",        (int) r.tok.size()},
+                    {"endpoint",     r.endpoint == 1 ? "loop" : r.endpoint == 2 ? "incoherent" : ""},
+                    {"mean_z",       zc / n}, // the chosen tokens' mean z (color scale, before the sign)
+                    {"mean_z_model", zm / n}, // the same under the model's own probabilities over the candidates
+                    {"mean_cand",    nc / n},
+                    {"pos",          pos},
+                    {"n_tokens",     n_tok},
+                    {"sec",          r.sec},
+                };
+            };
+            if (json_value(body, "stream", false)) {
+                auto st = std::make_shared<steer_stream>();
+                gp.on_token = [st, push_token](int32_t tok, float v, float z) { return push_token(*st, tok, json{{"guide", {{"value", v}, {"z", z}}}}); };
+                std::thread([st, gp, vocab, finish, summary]() {
+                    server_guide_result r;
+                    std::string err;
+                    const bool ok = server_guide_run(vocab, gp, r, err);
+                    finish(*st, ok, err, ok ? summary(r) : json());
+                }).detach();
+                serve(st);
+                return res;
+            }
+            server_guide_result r;
+            std::string err;
+            if (!server_guide_run(vocab, gp, r, err)) { bad(err); return res; }
+            json out = summary(r);
+            out["tokens"]  = r.tok;
+            out["text"]    = tokens_to_str(vocab, llama_tokens(r.tok.begin(), r.tok.end()));
+            out["value"]   = r.value;
+            out["z"]       = r.z;
+            out["z_model"] = r.z_model;
+            out["ent"]     = r.ent;
+            out["n_cand"]  = r.n_cand;
+            res->ok(out);
+            return res;
+        }
 
         server_steer_params sp;
         sp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
@@ -5486,73 +5618,27 @@ void server_routes::init_routes() {
         sp.baseline = json_value(body, "baseline", !stream);
 
         if (stream) {
-            // the first pushed arm's first sequence as server-sent events in /completion's format ({"content", "tokens",
-            // "stop"}), then a final event with "stop": true, the endpoint and the token count, then [DONE]. The run goes
-            // on a worker thread; a client disconnect stops it (the partial run is still logged as exposure).
+            // the first pushed arm's first sequence
             if (!sp.follow.empty() || sp.set) { bad("stream needs mode step or impulse without teacher_forced / set_cos"); return res; }
-            struct steer_stream {
-                std::mutex m;
-                std::condition_variable cv;
-                std::deque<std::string> q;
-                std::string pending; // bytes of an incomplete utf-8 character
-                bool done = false;
-                std::atomic<bool> cancel{false};
-            };
-            // destroyed with the response (also when the client disconnects and the server stops calling next()):
-            // stops the worker at its next token
-            struct cancel_on_destroy {
-                std::shared_ptr<steer_stream> st;
-                ~cancel_on_destroy() { if (st) st->cancel = true; }
-            };
             auto st = std::make_shared<steer_stream>();
-            auto guard = std::make_shared<cancel_on_destroy>();
-            guard->st = st;
-            const llama_vocab * vocab = ctx_server.vocab;
-            auto sse = [](const json & j) { return "data: " + safe_json_to_str(j) + "\n\n"; };
-            sp.on_token = [st, vocab, sse](int arm, int seq, int32_t tok) -> bool {
+            sp.on_token = [st, push_token](int arm, int seq, int32_t tok) -> bool {
                 if (arm != 1 || seq != 0) return !st->cancel;
-                std::lock_guard<std::mutex> lk(st->m);
-                st->pending += common_token_to_piece(vocab, tok, true);
-                const size_t ok = validate_utf8(st->pending);
-                json tj = json::array({tok});
-                st->q.push_back(sse({{"content", st->pending.substr(0, ok)}, {"tokens", tj}, {"stop", false}}));
-                st->pending.erase(0, ok);
-                st->cv.notify_all();
-                return !st->cancel;
+                return push_token(*st, tok, json::object());
             };
-            std::thread([st, sp, vocab, sse, pos, n_tok = (int) tokens.size()]() mutable {
+            std::thread([st, sp, vocab, finish, pos, n_tok = (int) tokens.size()]() mutable {
                 server_steer_result r;
                 std::string err;
                 const bool ok = server_steer_run(vocab, sp, r, err);
-                std::lock_guard<std::mutex> lk(st->m);
-                if (!ok) {
-                    st->q.push_back(sse({{"error", {{"code", 400}, {"message", err}, {"type", "invalid_request_error"}}}}));
-                } else {
+                json fin;
+                if (ok) {
                     const server_steer_seq * sq = r.arms.size() > 1 && !r.arms[1].seqs.empty() ? &r.arms[1].seqs[0] : nullptr;
-                    st->q.push_back(sse({{"content", st->pending}, {"stop", true}, {"stopped_by_client", (bool) st->cancel},
-                        {"endpoint", !sq ? "" : sq->endpoint == 1 ? "loop" : sq->endpoint == 2 ? "incoherent" : ""},
-                        {"n_gen", sq ? (int) sq->tok.size() : 0}, {"layer", r.layer}, {"h_norm", r.h_norm}, {"pos", pos},
-                        {"n_tokens", n_tok}, {"sec", r.sec}}));
+                    fin = {{"endpoint", !sq ? "" : sq->endpoint == 1 ? "loop" : sq->endpoint == 2 ? "incoherent" : ""},
+                           {"n_gen", sq ? (int) sq->tok.size() : 0}, {"layer", r.layer}, {"h_norm", r.h_norm}, {"pos", pos},
+                           {"n_tokens", n_tok}, {"sec", r.sec}};
                 }
-                st->q.push_back("data: [DONE]\n\n");
-                st->done = true;
-                st->cv.notify_all();
+                finish(*st, ok, err, fin);
             }).detach();
-            res->status = 200;
-            res->content_type = "text/event-stream";
-            res->data = "";
-            res->set_req(&req); // should_stop() needs the request (client disconnect)
-            res->set_next([st, guard, res_this = res.get()](std::string & output) -> bool {
-                std::unique_lock<std::mutex> lk(st->m);
-                while (st->q.empty() && !st->done) {
-                    if (res_this->should_stop()) { st->cancel = true; return false; }
-                    st->cv.wait_for(lk, std::chrono::milliseconds(200));
-                }
-                if (st->q.empty()) return false;
-                output = std::move(st->q.front());
-                st->q.pop_front();
-                return true;
-            });
+            serve(st);
             return res;
         }
 

@@ -42,6 +42,8 @@ struct server_jlens_layer_result {
 // Load after server_jlens_init; survives model reloads.
 bool server_jlens_load_readouts(const std::string & path, std::string & err);
 bool server_jlens_readouts_enabled();
+// one readout by name: its layer, weights [n_embd] and bias. false if unknown.
+bool server_jlens_readout_get(const std::string & name, int & layer, std::vector<float> & w, float & b);
 
 struct server_jlens_readouts {
     int layer = -1;
@@ -74,6 +76,8 @@ struct server_jlens_dirs {
 // model reloads.
 bool server_jlens_load_lin(const std::string & path, std::string & err);
 bool server_jlens_lin_enabled();
+// one all-layer probe by name: weights [n_layer][n_embd] and bias. false if unknown.
+bool server_jlens_lin_get(const std::string & name, std::vector<float> & w, float & b);
 
 struct server_jlens_lin {
     std::vector<std::string> names;

@@ -406,6 +406,17 @@ bool server_jlens_readouts_enabled() {
     return g_readout.layer >= 0;
 }
 
+bool server_jlens_readout_get(const std::string & name, int & layer, std::vector<float> & w, float & b) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    const auto it = std::find(g_readout.names.begin(), g_readout.names.end(), name);
+    if (it == g_readout.names.end()) return false;
+    const size_t r = (size_t) (it - g_readout.names.begin());
+    layer = g_readout.layer;
+    w.assign(g_readout.W.begin() + r * g_readout.n_embd, g_readout.W.begin() + (r + 1) * g_readout.n_embd);
+    b = g_readout.b[r];
+    return true;
+}
+
 bool server_jlens_load_dirs(const std::string & path, std::string & err) {
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     nlohmann::json meta;
@@ -513,6 +524,16 @@ bool server_jlens_load_lin(const std::string & path, std::string & err) {
 bool server_jlens_lin_enabled() {
     std::lock_guard<std::mutex> lock(g_jlens.mutex);
     return !g_lin.names.empty();
+}
+
+bool server_jlens_lin_get(const std::string & name, std::vector<float> & w, float & b) {
+    std::lock_guard<std::mutex> lock(g_jlens.mutex);
+    const auto it = std::find(g_lin.names.begin(), g_lin.names.end(), name);
+    if (it == g_lin.names.end()) return false;
+    const size_t r = (size_t) (it - g_lin.names.begin()), n = (size_t) (g_lin.n_layer * g_lin.n_embd);
+    w.assign(g_lin.W.begin() + r * n, g_lin.W.begin() + (r + 1) * n);
+    b = g_lin.b[r];
+    return true;
 }
 
 float server_jlens_layer_h_norm(int layer) {
