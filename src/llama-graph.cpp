@@ -2219,6 +2219,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     moe_gpu_k = 0;
     ggml_backend_t backend_gpu = moe_gpu_backend ? moe_gpu_backend : sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
     moe_gpu_backend = nullptr;
+    ggml_backend_t backend_gpu2 = moe_gpu_backend2;
+    const int gpu_e2 = moe_gpu_e2;
+    moe_gpu_backend2 = nullptr;
+    moe_gpu_e2 = 0;
     // 1-4 tokens: the GPU takes k experts per batch (+ the expert cache); larger batches (prompt processing): a range split,
     // the GPU takes every expert in [0, e1) (gpu_k = n_expert)
     const bool gpu_share = gpu_k > 0 && (n_tokens <= 4 || gpu_k >= n_expert) && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
@@ -2240,6 +2244,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             if (mc) {
                 ggml_mul_mat_id_set_cache(t, mc->state_gpu[x], mc->cache[x]);
+                if (mc->score_gpu[x]) {
+                    ggml_mul_mat_id_set_cache_score(t, mc->score_gpu[x]);
+                }
             }
             t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
             x++;
@@ -2251,14 +2258,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts_gpu, "ffn_moe_down_gpu", il);
         ggml_build_forward_expand(gf, experts_gpu);
     }
+    // second GPU (larger batches): the experts [gpu_e1, gpu_e2), weighted and summed over the slots there, so only
+    // [n_embd, n_tokens] crosses to the layer's GPU
+    ggml_tensor * moe_out_gpu2 = nullptr;
+    if (gpu_share && backend_gpu2 && gpu_e2 > gpu_e1 && n_tokens > 4 && !weight_before_ffn) {
+        ggml_tensor * up_2   = ggml_mul_mat_id(ctx0, up_exps,   cur, selected_experts);
+        ggml_tensor * gate_2 = ggml_mul_mat_id(ctx0, gate_exps, cur, selected_experts);
+        ggml_tensor * act_2  = ggml_situ_split(ctx0, gate_2, up_2, hparams.situ_beta, hparams.situ_linear_beta);
+        ggml_tensor * down_2 = ggml_mul_mat_id(ctx0, down_exps, act_2, selected_experts);
+        for (ggml_tensor * t : {up_2, gate_2, down_2}) {
+            ggml_mul_mat_id_set_split(t, 1, (int) n_expert, gpu_e1, gpu_e2);
+            if (skip_w) {
+                ggml_mul_mat_id_set_skip(t, skip_w);
+            }
+            t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+        }
+        ggml_tensor * w_2 = ggml_mul(ctx0, down_2, weights);
+        std::vector<ggml_tensor *> nodes = {up_2, gate_2, act_2, down_2, w_2};
+        ggml_tensor * sum_2 = ggml_view_2d(ctx0, w_2, n_embd, n_tokens, w_2->nb[2], 0);
+        nodes.push_back(sum_2);
+        for (uint32_t i = 1; i < hparams.n_expert_used(il); ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx0, w_2, n_embd, n_tokens, w_2->nb[2], i*w_2->nb[1]);
+            sum_2 = ggml_add(ctx0, sum_2, v);
+            nodes.push_back(v);
+            nodes.push_back(sum_2);
+        }
+        for (ggml_tensor * t : nodes) {
+            t->flags |= GGML_TENSOR_FLAG_DEFER;
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_gpu2);
+        }
+        cb(sum_2, "ffn_moe_out_gpu2", il);
+        ggml_build_forward_expand(gf, sum_2);
+        moe_out_gpu2 = sum_2;
+    }
     // the CPU nodes skip the slots taken by the GPU (x = 0/1/2: up/gate/down, for the expert cache)
     const llm_graph_moe_cache_layer * mc_cpu = gpu_share && n_tokens <= 4 && moe_cache && il >= 0 && il < (int) moe_cache->size() &&
         (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
     auto set_cpu_part = [&](ggml_tensor * t, int x) {
         if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {
-            ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, gpu_e1);
+            ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, moe_out_gpu2 ? gpu_e2 : gpu_e1);
             if (mc_cpu) {
                 ggml_mul_mat_id_set_cache(t, mc_cpu->state_cpu[x], nullptr);
+                if (mc_cpu->score_cpu[x]) {
+                    ggml_mul_mat_id_set_cache_score(t, mc_cpu->score_cpu[x]);
+                }
             }
         }
         if (skip_w && t->op == GGML_OP_MUL_MAT_ID) {
@@ -2463,6 +2506,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (moe_out_gpu2) {
+        moe_out = ggml_add(ctx0, moe_out, moe_out_gpu2);
     }
 
     cb(moe_out, "ffn_moe_out", il);

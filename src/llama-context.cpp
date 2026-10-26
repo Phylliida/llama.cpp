@@ -484,7 +484,8 @@ llama_context::llama_context(
     const char * moe_gpu_frac = getenv("LLAMA_MOE_GPU_FRAC");
 
     // VRAM expert cache of the share (ggml_mul_mat_id_set_cache): LLAMA_MOE_GPU_CACHE slots per layer on the layer's GPU,
-    // sized for the larger of LLAMA_MOE_GPU_K / LLAMA_MOE_GPU_KB (scratch slots)
+    // sized for the larger of LLAMA_MOE_GPU_K / LLAMA_MOE_GPU_KB (scratch slots); LLAMA_MOE_GPU_CACHE_LFU=1: usage scores
+    // decide what to stream and what to evict (ggml_mul_mat_id_set_cache_score) instead of LRU
     const char * moe_gpu_cache = getenv("LLAMA_MOE_GPU_CACHE");
     if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && moe_gpu_cache && atoi(moe_gpu_cache) > 0) {
         const int n_slots = atoi(moe_gpu_cache);
@@ -499,12 +500,13 @@ llama_context::llama_context(
             if (it != ctx_map.end()) {
                 return it->second;
             }
-            ggml_init_params params = { (size_t) n_layer*9*ggml_tensor_overhead(), nullptr, true };
+            ggml_init_params params = { (size_t) n_layer*15*ggml_tensor_overhead(), nullptr, true };
             ggml_context * c = ggml_init(params);
             moe_cache_ctxs.emplace_back(c);
             ctx_map[buft] = c;
             return c;
         };
+        const bool lfu = getenv("LLAMA_MOE_GPU_CACHE_LFU") && atoi(getenv("LLAMA_MOE_GPU_CACHE_LFU")) != 0;
         moe_cache.resize(n_layer);
         size_t total = 0;
         for (int il = 0; il < n_layer; ++il) {
@@ -521,6 +523,10 @@ llama_context::llama_context(
                 moe_cache[il].cache[x]     = ggml_new_tensor_1d(cg, GGML_TYPE_I8, (int64_t) (n_slots + k_max)*w[x]->nb[2]);
                 moe_cache[il].state_gpu[x] = ggml_new_tensor_1d(cg, GGML_TYPE_I32, 2*n_slots + 1);
                 moe_cache[il].state_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, 2*n_slots + 1);
+                if (lfu) {
+                    moe_cache[il].score_gpu[x] = ggml_new_tensor_1d(cg, GGML_TYPE_I32, w[x]->ne[2]);
+                    moe_cache[il].score_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, w[x]->ne[2]);
+                }
                 total += ggml_nbytes(moe_cache[il].cache[x]);
             }
         }
@@ -538,9 +544,14 @@ llama_context::llama_context(
             for (int x = 0; mc.cache[0] && x < 3; ++x) {
                 ggml_backend_tensor_set(mc.state_gpu[x], init.data(), 0, init.size()*sizeof(int32_t));
                 ggml_backend_tensor_set(mc.state_cpu[x], init.data(), 0, init.size()*sizeof(int32_t));
+                if (mc.score_gpu[x]) {
+                    ggml_backend_tensor_memset(mc.score_gpu[x], 0, 0, ggml_nbytes(mc.score_gpu[x]));
+                    ggml_backend_tensor_memset(mc.score_cpu[x], 0, 0, ggml_nbytes(mc.score_cpu[x]));
+                }
             }
         }
-        LLAMA_LOG_INFO("%s: %d slots per layer, %.2f GiB of VRAM\n", "moe_gpu_cache", n_slots, total/1073741824.0);
+        LLAMA_LOG_INFO("%s: %d slots per layer, %.2f GiB of VRAM%s\n", "moe_gpu_cache", n_slots, total/1073741824.0,
+            lfu ? ", usage scores" : "");
     }
     if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && !model.devices.empty()) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.devices[0].dev);

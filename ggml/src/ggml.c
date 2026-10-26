@@ -3429,6 +3429,12 @@ void ggml_mul_mat_id_set_cache(struct ggml_tensor * a, struct ggml_tensor * stat
     a->src[5] = cache;
 }
 
+void ggml_mul_mat_id_set_cache_score(struct ggml_tensor * a, struct ggml_tensor * score) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID && a->src[4]);
+    GGML_ASSERT(score->type == GGML_TYPE_I32 && ggml_is_contiguous(score) && ggml_nelements(score) == a->src[0]->ne[2]);
+    a->src[6] = score;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

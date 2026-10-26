@@ -776,6 +776,9 @@ struct llm_graph_moe_cache_layer {
     ggml_tensor * cache[3]     = {};
     ggml_tensor * state_gpu[3] = {};
     ggml_tensor * state_cpu[3] = {};
+    // usage scores (ggml_mul_mat_id_set_cache_score), null = LRU
+    ggml_tensor * score_gpu[3] = {};
+    ggml_tensor * score_cpu[3] = {};
 };
 
 struct llm_graph_params {
@@ -1063,6 +1066,9 @@ struct llm_graph_context {
     mutable int moe_gpu_e1 = 0;
     // GPU for that share (e.g. the layer's device with a layer split), null = the first backend
     mutable ggml_backend_t moe_gpu_backend = nullptr;
+    // larger batches only: a second GPU computes the experts [moe_gpu_e1, moe_gpu_e2) (then cleared)
+    mutable ggml_backend_t moe_gpu_backend2 = nullptr;
+    mutable int moe_gpu_e2 = 0;
     // its expert cache per layer (llm_graph_params::moe_cache)
     const std::vector<llm_graph_moe_cache_layer> * moe_cache = nullptr;
 

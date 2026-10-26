@@ -770,18 +770,28 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     static const int   gpu_kb      = getenv("LLAMA_MOE_GPU_KB")   ? atoi(getenv("LLAMA_MOE_GPU_KB"))   : gpu_k;
     static const float gpu_pp      = std::min(gpu_frac, getenv("LLAMA_MOE_GPU_PP") ? (float) atof(getenv("LLAMA_MOE_GPU_PP")) : 0.0f);
     static const float gpu_pp_half = getenv("LLAMA_MOE_GPU_PP_HALF") ? (float) atof(getenv("LLAMA_MOE_GPU_PP_HALF")) : 0.0f;
+    // LLAMA_MOE_GPU_PP2 = share of that fraction for a second GPU (prompt batches, two GPUs; 0 = off), e.g. 0.5
+    static const float gpu_pp2     = getenv("LLAMA_MOE_GPU_PP2") ? (float) atof(getenv("LLAMA_MOE_GPU_PP2")) : 0.0f;
     if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
         const float pp = gpu_pp_half > 0.0f ? std::min(gpu_pp, n_tokens/(n_tokens + gpu_pp_half)) : gpu_pp;
         const int   pp_e1 = (int) (pp * hparams.n_expert);
         moe_gpu_k  = n_tokens == 1 ? gpu_k : n_tokens <= 4 ? gpu_kb : pp_e1 > 0 ? (int) hparams.n_expert : 0;
         moe_gpu_e1 = n_tokens <= 4 ? (int) (gpu_frac * hparams.n_expert) : pp_e1;
-        // the share runs on the layer's GPU (layer split over several GPUs)
+        // the share runs on the layer's GPU (layer split over several GPUs); with PP2 another GPU takes part of it
         for (int i = 0; sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
             ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-            if (ggml_backend_get_device(b) == model.dev_layer(il)) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            if (dev == model.dev_layer(il)) {
                 moe_gpu_backend = b;
-                break;
+            } else if (n_tokens > 4 && gpu_pp2 > 0.0f && !moe_gpu_backend2 && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                moe_gpu_backend2 = b;
             }
+        }
+        if (moe_gpu_backend2 && pp_e1 > 0) {
+            moe_gpu_e2 = pp_e1;
+            moe_gpu_e1 = (int) ((1.0f - gpu_pp2) * pp_e1);
+        } else {
+            moe_gpu_backend2 = nullptr;
         }
     }
 

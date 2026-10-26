@@ -1591,7 +1591,7 @@ static inline bool ggml_mmid_slot_skipped(const struct ggml_tensor * w, int id, 
 // cache (ggml_mul_mat_id_set_cache, state = its I32 data, else NULL): the cached experts of the batch plus the first k
 // uncached ones, and the state is updated (the CUDA backend does the same, see mul_mat_id_cache_plan)
 static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct ggml_tensor * skip_w, int k, int e0, int e1,
-        int32_t * state, int n_slots, int32_t * taken) {
+        int32_t * state, int n_slots, int32_t * score, int n_as, int32_t * taken) {
     enum { MAX_SLOTS = 1024 };
     const int n_ids = ids->ne[0];
     GGML_ASSERT(n_ids*ids->ne[1] <= MAX_SLOTS);
@@ -1616,6 +1616,8 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
             uc[u]++;
         }
     }
+    int32_t ua[MAX_SLOTS]; // token count of every unique eligible expert (score update)
+    memcpy(ua, uc, nu*sizeof(int32_t));
     int n = 0;
     int32_t * se = state;            // expert per slot
     int32_t * sa = state + n_slots;  // last use per slot
@@ -1630,11 +1632,11 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
             }
         }
     }
-    // the first k uncached by count (descending), ties by first occurrence
+    // the first k uncached by (score,) count (descending), ties by first occurrence
     for (int r = 0; r < k; ++r) {
         int best = -1;
         for (int u = 0; u < nu; ++u) {
-            if (uc[u] > 0 && (best < 0 || uc[u] > uc[best])) {
+            if (uc[u] > 0 && (best < 0 || (score && score[ue[u]] != score[ue[best]] ? score[ue[u]] > score[ue[best]] : uc[u] > uc[best]))) {
                 best = u;
             }
         }
@@ -1644,9 +1646,25 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
         taken[n++] = ue[best];
         uc[best] = 0;
         if (state) {
+            // victim: a slot the batch does not use, LRU (with scores: lowest score, empty first, then LRU), lowest index
             int v = -1;
             for (int s = 0; s < n_slots; ++s) {
-                if (sa[s] < clock && (v < 0 || sa[s] < sa[v])) {
+                if (sa[s] >= clock) {
+                    continue;
+                }
+                if (v < 0) {
+                    v = s;
+                    continue;
+                }
+                if (score) {
+                    const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
+                    const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
+                    if (cs != cv) {
+                        v = cs < cv ? s : v;
+                        continue;
+                    }
+                }
+                if (sa[s] < sa[v]) {
                     v = s;
                 }
             }
@@ -1658,6 +1676,14 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
     }
     if (state) {
         state[2*n_slots] = clock + 1;
+    }
+    if (score) {
+        for (int e = 0; e < n_as; ++e) {
+            score[e] -= score[e] >> 3;
+        }
+        for (int u = 0; u < nu; ++u) {
+            score[ue[u]] += 256*ua[u];
+        }
     }
     return n;
 }
@@ -2028,8 +2054,10 @@ static void ggml_compute_forward_mul_mat_id(
         int     n_taken = 0;
         if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = dst->src[4];
+            const struct ggml_tensor * sc = dst->src[6];
             n_taken = ggml_mmid_split_taken(ids, skip_w, split_k, split_e0, split_e1,
-                cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0, taken);
+                cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
+                sc ? (int32_t *) sc->data : NULL, (int) src0->ne[2], taken);
         }
 
         // group rows by src0 matrix
@@ -3605,14 +3633,18 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
         int     n_taken = 0;
         if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = gate->src[4];
+            const struct ggml_tensor * sc = gate->src[6];
             n_taken = ggml_mmid_split_taken(ids, gate->src[3], split_k, split_e0, split_e1,
-                cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0, taken);
+                cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
+                sc ? (int32_t *) sc->data : NULL, (int) gate->src[0]->ne[2], taken);
             // the up node's copy of the cache state gets the same update
             const struct ggml_tensor * cs_up = up->src[4];
             if (cs_up) {
                 int32_t taken_up[1024];
+                const struct ggml_tensor * sc_up = up->src[6];
                 const int n_up = ggml_mmid_split_taken(ids, up->src[3], split_k, split_e0, split_e1,
-                    (int32_t *) cs_up->data, (int) (ggml_nelements(cs_up)/2), taken_up);
+                    (int32_t *) cs_up->data, (int) (ggml_nelements(cs_up)/2),
+                    sc_up ? (int32_t *) sc_up->data : NULL, (int) up->src[0]->ne[2], taken_up);
                 GGML_ASSERT(n_up == n_taken);
             }
         }
@@ -3760,7 +3792,7 @@ static int ggml_cpu_try_fuse_ops(
                 (n1->flags & GGML_TENSOR_FLAG_COMPUTE) && (glu->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                 ((glu->src[0] == node && glu->src[1] == n1) || (glu->src[0] == n1 && glu->src[1] == node)) &&
                 node->src[1] == n1->src[1] && node->src[2] == n1->src[2] && node->src[3] == n1->src[3] &&
-                (node->src[4] == NULL) == (n1->src[4] == NULL) && node->src[1]->type == GGML_TYPE_F32 &&
+                (node->src[4] == NULL) == (n1->src[4] == NULL) && (node->src[6] == NULL) == (n1->src[6] == NULL) && node->src[1]->type == GGML_TYPE_F32 &&
                 node->src[0]->type == n1->src[0]->type && ggml_are_same_shape(node->src[0], n1->src[0]) &&
                 memcmp(node->op_params, n1->op_params, 4*sizeof(int32_t)) == 0 &&
                 ggml_node_has_n_uses(cgraph, node_n, 1) && ggml_node_has_n_uses(cgraph, node_n + 1, 1) &&

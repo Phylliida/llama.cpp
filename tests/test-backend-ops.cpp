@@ -5404,8 +5404,9 @@ struct test_mul_mat_id_cache : public test_case {
     const int64_t m, n, k;
     const int split_k, e1, n_slots, n_steps;
     const bool skip;
+    const bool lfu; // usage scores (ggml_mul_mat_id_set_cache_score)
     std::string vars() override {
-        return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip);
+        return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip) + ",lfu=" + std::to_string(lfu);
     }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5414,9 +5415,9 @@ struct test_mul_mat_id_cache : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     test_mul_mat_id_cache(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_k, int e1,
-            int n_slots, int n_steps, bool skip)
+            int n_slots, int n_steps, bool skip, bool lfu = false)
         : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_k(split_k), e1(e1), n_slots(n_slots),
-          n_steps(n_steps), skip(skip) {}
+          n_steps(n_steps), skip(skip), lfu(lfu) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
@@ -5427,6 +5428,11 @@ struct test_mul_mat_id_cache : public test_case {
         ggml_tensor * cache = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (n_slots + split_k)*as->nb[2]);
         ggml_set_name(cache, "cache");
         ggml_tensor * sw = skip ? new_mmid_skip_w(ctx, n_used, n) : nullptr;
+        ggml_tensor * score = nullptr;
+        if (lfu) {
+            score = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_mats);
+            ggml_set_name(score, "cache_score");
+        }
         ggml_tensor * sum = nullptr;
         for (int s = 0; s < n_steps; ++s) {
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -5438,6 +5444,9 @@ struct test_mul_mat_id_cache : public test_case {
                 ggml_mul_mat_id_set_skip(out, sw);
             }
             ggml_mul_mat_id_set_cache(out, state, cache);
+            if (score) {
+                ggml_mul_mat_id_set_cache_score(out, score);
+            }
             sum = sum ? ggml_add(ctx, sum, out) : out;
         }
         ggml_set_name(sum, "out");
@@ -5453,6 +5462,13 @@ struct test_mul_mat_id_cache : public test_case {
                 as = strcmp(t->name, "as") == 0 ? t : as;
             } else if (strcmp(t->name, "cache_state") == 0) {
                 state = t;
+            } else if (strcmp(t->name, "cache_score") == 0) {
+                // scores that disagree with recency, so the policies pick different experts and victims
+                std::vector<int32_t> sc(t->ne[0]);
+                for (int64_t e = 0; e < t->ne[0]; ++e) {
+                    sc[e] = (int32_t) ((e*37) % 23)*256;
+                }
+                ggml_backend_tensor_set(t, sc.data(), 0, sc.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "cache") == 0) {
                 cache = t;
             } else if (strcmp(t->name, "ids") == 0) {
@@ -10346,6 +10362,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 8, 4, 64, n, 256, 3, 8, 1, 6, false));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false, true));
         }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {

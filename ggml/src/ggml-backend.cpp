@@ -1892,33 +1892,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     static const bool defer_enabled = getenv("GGML_SCHED_DEFER") == nullptr || atoi(getenv("GGML_SCHED_DEFER")) != 0;
-    int deferred_id = -1;
+    // consecutive deferred splits on different backends (e.g. one per GPU) are collected and launched together
+    enum { MAX_DEFERRED = 4 };
+    int deferred_ids[MAX_DEFERRED];
+    int n_deferred = 0;
+    auto deferred_on = [&](int backend_id) {
+        for (int i = 0; i < n_deferred; ++i) {
+            if (splits[deferred_ids[i]].backend_id == backend_id) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
 
-        // a deferred split is launched after the next split (on another backend) has copied its inputs,
+        // a deferred split is launched after the next non-deferred split (on another backend) has copied its inputs,
         // so it can run while that split computes. Nothing may run on its backend in between.
         // its own inputs are copied in order: the next split may reuse their (host) memory
-        if (defer_enabled && !sched->callback_eval && split->deferred && deferred_id < 0 && split_id + 1 < sched->n_splits &&
-                splits[split_id + 1].backend_id != split->backend_id) {
+        if (defer_enabled && !sched->callback_eval && split->deferred && n_deferred < MAX_DEFERRED && split_id + 1 < sched->n_splits &&
+                splits[split_id + 1].backend_id != split->backend_id && !deferred_on(split->backend_id) &&
+                !deferred_on(splits[split_id + 1].backend_id)) {
             copy_inputs(split_id);
-            deferred_id = split_id;
+            deferred_ids[n_deferred++] = split_id;
             continue;
         }
 
         copy_inputs(split_id);
 
-        if (deferred_id >= 0) {
+        for (int i = 0; i < n_deferred; ++i) {
             const int cur_prev = prev_backend_id;
-            prev_backend_id = splits[deferred_id].backend_id;
-            enum ggml_status ec = compute(deferred_id);
+            prev_backend_id = splits[deferred_ids[i]].backend_id;
+            enum ggml_status ec = compute(deferred_ids[i]);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
             prev_backend_id = cur_prev;
-            deferred_id = -1;
         }
+        n_deferred = 0;
 
         enum ggml_status ec = compute(split_id);
         if (ec != GGML_STATUS_SUCCESS) {

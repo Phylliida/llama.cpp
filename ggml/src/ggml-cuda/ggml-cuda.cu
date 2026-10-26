@@ -2014,9 +2014,11 @@ static __global__ void mul_mat_id_gather_experts(const int4 * src, int4 * dst, c
 // fill_e[c]/fill_s[c] (c < k) = expert to copy from src0 into weight slot fill_s[c] (-1: none)
 static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
         const int n_tokens, const int k, const int e0, const int e1, const char * skip_w, const size_t wnb0, const size_t wnb1,
-        int32_t * state, const int n_slots, const int n_out, int32_t * wslot, int32_t * slots, int32_t * fill_e, int32_t * fill_s) {
+        int32_t * state, const int n_slots, int32_t * score, const int n_as, const int n_out, int32_t * wslot, int32_t * slots,
+        int32_t * fill_e, int32_t * fill_s) {
     __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
     __shared__ int32_t s_cnt[1024];  // at an uncached expert's first slot: tokens selecting it, else 0
+    __shared__ int32_t s_all[1024];  // at an expert's first slot: tokens selecting it (score update), else 0
     __shared__ int32_t s_hit[1024];  // at an expert's first slot: its cache slot, else -1
     __shared__ int32_t s_rank[1024]; // at a taken expert's first slot: output index, else -1
     __shared__ int32_t s_ws[1024];   // at a taken expert's first slot: weight slot
@@ -2062,6 +2064,7 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
         }
         s_hit[i]  = hit;
         s_cnt[i]  = first == i && hit < 0 ? cnt : 0;
+        s_all[i]  = first == i ? cnt : 0;
         s_rank[i] = -1;
     }
     __syncthreads();
@@ -2082,7 +2085,8 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
         for (int c = 0; c < k; ++c) {
             int best = -1;
             for (int u = 0; u < n; ++u) {
-                if (s_cnt[u] > 0 && (best < 0 || s_cnt[u] > s_cnt[best])) {
+                if (s_cnt[u] > 0 && (best < 0 ||
+                        (score && score[s_e[u]] != score[s_e[best]] ? score[s_e[u]] > score[s_e[best]] : s_cnt[u] > s_cnt[best]))) {
                     best = u;
                 }
             }
@@ -2092,7 +2096,22 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
             s_cnt[best] = 0;
             int v = -1;
             for (int s = 0; s < n_slots; ++s) {
-                if (sa[s] < clock && (v < 0 || sa[s] < sa[v])) {
+                if (sa[s] >= clock) {
+                    continue;
+                }
+                if (v < 0) {
+                    v = s;
+                    continue;
+                }
+                if (score) {
+                    const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
+                    const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
+                    if (cs != cv) {
+                        v = cs < cv ? s : v;
+                        continue;
+                    }
+                }
+                if (sa[s] < sa[v]) {
                     v = s;
                 }
             }
@@ -2108,6 +2127,17 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
         state[2*n_slots] = clock + 1;
     }
     __syncthreads();
+
+    // usage scores (same update as ggml_mmid_split_taken): decay all, then the batch's experts gain 256 per token
+    if (score) {
+        for (int e = i; e < n_as; e += blockDim.x) {
+            score[e] -= score[e] >> 3;
+        }
+        __syncthreads();
+        if (i < n && s_all[i] > 0) {
+            score[s_e[i]] += 256*s_all[i];
+        }
+    }
 
     if (i < n && first >= 0 && s_rank[first] >= 0) {
         const int r = s_rank[first];
@@ -2290,7 +2320,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             int32_t * fill_s = fill_e + k;
             mul_mat_id_cache_plan<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
                 n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3), skip_d, skip_nb0, skip_nb1,
-                (int32_t *) dst->src[4]->data, n_slots, n_out, wslot, slots, fill_e, fill_s);
+                (int32_t *) dst->src[4]->data, n_slots, dst->src[6] ? (int32_t *) dst->src[6]->data : nullptr, (int) ne02, n_out,
+                wslot, slots, fill_e, fill_s);
             const dim3 grid((82*4 + k - 1)/k, k);
             mul_mat_id_cache_fill<<<grid, 256, 0, ctx.stream()>>>((const int4 *) src0->data, (int4 *) cache->data,
                 fill_e, fill_s, nb02/16);

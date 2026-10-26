@@ -1534,6 +1534,11 @@ extern "C" {
     // cache (optional, for backends that compute from it): at least [nb02, n_slots + k] bytes of src0 expert matrices,
     // slots n_slots.. are scratch for experts that are not admitted; backends that read src0 directly ignore it
     GGML_API void ggml_mul_mat_id_set_cache(struct ggml_tensor * a, struct ggml_tensor * state, struct ggml_tensor * cache);
+    // optional, after ggml_mul_mat_id_set_cache: usage scores (I32 [n_as], fixed point, initially 0) make the cache
+    // frequency based: the k streamed experts are the uncached ones with the highest score, and the victim is the slot
+    // (not used by the batch) with the lowest score; then every score decays (s -= s >> 3) and each expert of the batch
+    // gains 256 per token. Each node keeps its own copy (like the state)
+    GGML_API void ggml_mul_mat_id_set_cache_score(struct ggml_tensor * a, struct ggml_tensor * score);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
