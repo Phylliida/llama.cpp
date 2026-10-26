@@ -10331,6 +10331,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 2));
             }
         }
+        // range split of a large batch (prompt processing: k covers every expert of the range, no cache)
+        for (int mode : {1, 2}) {
+            for (int n : {16, 64, 129}) {
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, false, 64));
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, true, 64));
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 8));
+            }
+        }
         // expert cache: hits, admission, LRU eviction, scratch slots (more new experts than free slots)
         for (int n : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false));

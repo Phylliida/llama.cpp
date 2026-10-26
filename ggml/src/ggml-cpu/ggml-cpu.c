@@ -2022,9 +2022,11 @@ static void ggml_compute_forward_mul_mat_id(
         const struct ggml_tensor * skip_w = dst->src[3];
         const bool count_slots = strncmp(dst->name, "ffn_moe_down", 12) == 0;
 
+        // range split (k covers every expert in [e0, e1), no cache): the part is the range itself, for batches of any size
+        const bool split_range = split_mode != 0 && split_k >= split_e1 - split_e0 && dst->src[4] == NULL;
         int32_t taken[1024];
         int     n_taken = 0;
-        if (split_mode != 0) {
+        if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = dst->src[4];
             n_taken = ggml_mmid_split_taken(ids, skip_w, split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0, taken);
@@ -2049,7 +2051,8 @@ static void ggml_compute_forward_mul_mat_id(
                 }
 
                 if (split_mode != 0) {
-                    if (ggml_mmid_is_taken(taken, n_taken, i02) != (split_mode == 1)) {
+                    const bool is_taken = split_range ? i02 >= split_e0 && i02 < split_e1 : ggml_mmid_is_taken(taken, n_taken, i02);
+                    if (is_taken != (split_mode == 1)) {
                         memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                         continue;
                     }
@@ -3597,9 +3600,10 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
         const int32_t split_e0   = ggml_get_op_params_i32(gate, 2);
         const int32_t split_e1   = ggml_get_op_params_i32(gate, 3);
 
+        const bool split_range = split_mode != 0 && split_k >= split_e1 - split_e0 && gate->src[4] == NULL;
         int32_t taken[1024];
         int     n_taken = 0;
-        if (split_mode != 0) {
+        if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = gate->src[4];
             n_taken = ggml_mmid_split_taken(ids, gate->src[3], split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0, taken);
@@ -3622,7 +3626,8 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                     continue;
                 }
                 if (split_mode != 0) {
-                    if (ggml_mmid_is_taken(taken, n_taken, i02) != (split_mode == 1)) {
+                    const bool is_taken = split_range ? i02 >= split_e0 && i02 < split_e1 : ggml_mmid_is_taken(taken, n_taken, i02);
+                    if (is_taken != (split_mode == 1)) {
                         memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
                         continue;
                     }

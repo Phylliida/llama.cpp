@@ -2219,7 +2219,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     moe_gpu_k = 0;
     ggml_backend_t backend_gpu = moe_gpu_backend ? moe_gpu_backend : sched ? ggml_backend_sched_get_backend(sched, 0) : nullptr;
     moe_gpu_backend = nullptr;
-    const bool gpu_share = gpu_k > 0 && n_tokens <= 4 && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
+    // 1-4 tokens: the GPU takes k experts per batch (+ the expert cache); larger batches (prompt processing): a range split,
+    // the GPU takes every expert in [0, e1) (gpu_k = n_expert)
+    const bool gpu_share = gpu_k > 0 && (n_tokens <= 4 || gpu_k >= n_expert) && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn &&
         backend_gpu && backend_gpu != backend_cpu;
     ggml_tensor * experts_gpu = nullptr;
@@ -2228,7 +2230,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, gate_exps, cur, selected_experts);
         ggml_tensor * act_g  = ggml_situ_split(ctx0, gate_g, up_g, hparams.situ_beta, hparams.situ_linear_beta);
         experts_gpu = ggml_mul_mat_id(ctx0, down_exps, act_g, selected_experts);
-        const llm_graph_moe_cache_layer * mc = moe_cache && il >= 0 && il < (int) moe_cache->size() &&
+        const llm_graph_moe_cache_layer * mc = n_tokens <= 4 && moe_cache && il >= 0 && il < (int) moe_cache->size() &&
             (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
         int x = 0;
         for (ggml_tensor * t : {up_g, gate_g, experts_gpu}) {
@@ -2250,7 +2252,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, experts_gpu);
     }
     // the CPU nodes skip the slots taken by the GPU (x = 0/1/2: up/gate/down, for the expert cache)
-    const llm_graph_moe_cache_layer * mc_cpu = gpu_share && moe_cache && il >= 0 && il < (int) moe_cache->size() &&
+    const llm_graph_moe_cache_layer * mc_cpu = gpu_share && n_tokens <= 4 && moe_cache && il >= 0 && il < (int) moe_cache->size() &&
         (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
     auto set_cpu_part = [&](ggml_tensor * t, int x) {
         if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {

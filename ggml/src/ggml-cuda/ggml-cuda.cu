@@ -2132,6 +2132,80 @@ static __global__ void mul_mat_id_cache_fill(const int4 * src, int4 * cache, con
     }
 }
 
+// range split of a large batch: copy a chunk of consecutive experts (host memory: wide loads over PCIe) into VRAM
+static __global__ void mul_mat_id_range_copy(const int4 * src, int4 * dst, const int64_t n16) {
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n16; i += (int64_t) gridDim.x*blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// ids of the batch relative to the chunk [c0, c0 + nc); slots outside it or skipped get INT_MAX (never matched)
+static __global__ void mul_mat_id_range_ids(const char * ids, const size_t ids_nb0, const size_t ids_nb1,
+        const char * skip_d, const size_t skip_nb0, const size_t skip_nb1, const int n_ids, const int n_tokens,
+        const int c0, const int nc, int32_t * ids_c) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_ids*n_tokens) {
+        return;
+    }
+    const int j = i % n_ids;
+    const int t = i / n_ids;
+    const int32_t e = *(const int32_t *) (ids + t*ids_nb1 + j*ids_nb0);
+    const bool skipped = skip_d && *(const float *) (skip_d + j*skip_nb0 + t*skip_nb1) == 0.0f;
+    ids_c[i] = !skipped && e >= c0 && e < c0 + nc ? e - c0 : INT_MAX;
+}
+
+// range split of a large batch (prompt processing, ggml_mul_mat_id_set_split with k >= e1 - e0 and no cache): the part
+// is the experts [e0, e1) (mode 1) or the others (mode 2). Chunks of the part's experts are staged in VRAM (src0 is
+// usually host memory read over PCIe) and each chunk runs the batched kernel on the slots that select it
+static void ggml_cuda_mul_mat_id_range(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int mode, const int e0, const int e1) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * skip = dst->src[3];
+    cudaStream_t stream = ctx.stream();
+
+    const int n_as     = src0->ne[2];
+    const int n_ids    = ids->ne[0];
+    const int n_tokens = ids->ne[1];
+    const size_t nb02  = src0->nb[2];
+    GGML_ASSERT(nb02 % sizeof(int4) == 0 && (uintptr_t) src0->data % sizeof(int4) == 0);
+
+    static const int chunk = getenv("GGML_CUDA_MMID_RANGE_CHUNK") ? atoi(getenv("GGML_CUDA_MMID_RANGE_CHUNK")) : 64;
+    ggml_cuda_pool_alloc<char>    stage(ctx.pool(), (size_t) chunk*nb02);
+    ggml_cuda_pool_alloc<int32_t> ids_c(ctx.pool(), (size_t) n_ids*n_tokens);
+
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    // the split parameters share op_params with MUL_MAT_ID's precision (index 3): the batched kernel gets a clean copy
+    ggml_tensor dst_c = *dst;
+    memset(dst_c.op_params, 0, sizeof(dst_c.op_params));
+
+    const int ranges[2][2] = { { mode == 1 ? e0 : 0, mode == 1 ? e1 : e0 }, { mode == 1 ? e1 : e1, n_as } };
+    for (int r = 0; r < (mode == 1 ? 1 : 2); ++r) {
+        for (int c0 = ranges[r][0]; c0 < ranges[r][1]; c0 += chunk) {
+            const int nc = std::min(chunk, ranges[r][1] - c0);
+            mul_mat_id_range_copy<<<4*ggml_cuda_info().devices[ctx.device].nsm, 256, 0, stream>>>(
+                (const int4 *) ((const char *) src0->data + c0*nb02), (int4 *) stage.get(), nc*nb02/sizeof(int4));
+            mul_mat_id_range_ids<<<(n_ids*n_tokens + 255)/256, 256, 0, stream>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                skip ? (const char *) skip->data : nullptr, skip ? skip->nb[0] : 0, skip ? skip->nb[1] : 0, n_ids, n_tokens, c0, nc,
+                ids_c.get());
+            CUDA_CHECK(cudaGetLastError());
+
+            ggml_tensor src0_c = *src0;
+            src0_c.data   = stage.get();
+            src0_c.buffer = dst->buffer;
+            src0_c.ne[2]  = nc;
+            src0_c.nb[3]  = nc*nb02;
+            ggml_tensor ids_t = *ids;
+            ids_t.data  = ids_c.get();
+            ids_t.nb[0] = sizeof(int32_t);
+            ids_t.nb[1] = n_ids*sizeof(int32_t);
+            ids_t.nb[2] = ids_t.nb[3] = n_ids*n_tokens*sizeof(int32_t);
+            ggml_cuda_mul_mat_q(ctx, &src0_c, src1, &ids_t, &dst_c, /*ids_partial=*/true);
+        }
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2151,6 +2225,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (split_mode == 0 && dst->src[3] && ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
         split_mode = 2;
         split_k    = 0;
+    }
+    if (split_mode != 0 && ne2 > get_mmvq_mmid_max_batch(src0->type, cc)) {
+        // large batch: only the range split (prompt processing)
+        const int e0 = ggml_get_op_params_i32(dst, 2);
+        const int e1 = ggml_get_op_params_i32(dst, 3);
+        GGML_ASSERT(split_k >= e1 - e0 && !dst->src[4] && ggml_cuda_should_use_mmq(src0->type, cc, ne12, ne02));
+        ggml_cuda_mul_mat_id_range(ctx, dst, split_mode, e0, e1);
+        return;
     }
     if (split_mode != 0) {
         GGML_ASSERT(ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc));

@@ -133,7 +133,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        bool ids_partial) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -243,6 +244,13 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    if (ids_partial) {
+        // the helper writes only the matched slots: the gather map must stay a valid row (0), the inverse map marks
+        // unmatched token slots (-1, skipped by the scatter quantization)
+        GGML_ASSERT(!use_native_fp4);
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));

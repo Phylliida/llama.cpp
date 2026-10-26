@@ -761,13 +761,20 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
 
     // optional GPU share of the routed experts: LLAMA_MOE_GPU_FRAC = fraction of expert ids (from 0) the GPU may take,
     // LLAMA_MOE_GPU_K = max experts on the GPU at one token, LLAMA_MOE_GPU_KB at 2-4 tokens (speculative verify;
-    // default K). Needs HMM for the host-resident expert weights
-    static const float gpu_frac = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
-    static const int   gpu_k    = getenv("LLAMA_MOE_GPU_K")    ? atoi(getenv("LLAMA_MOE_GPU_K"))    : 3;
-    static const int   gpu_kb   = getenv("LLAMA_MOE_GPU_KB")   ? atoi(getenv("LLAMA_MOE_GPU_KB"))   : gpu_k;
+    // default K), LLAMA_MOE_GPU_PP = fraction of the experts (from 0) the GPU computes for larger batches (prompt
+    // processing, <= FRAC; 0 = CPU only). With LLAMA_MOE_GPU_PP_HALF = h the fraction is n/(n + h), at most PP: the GPU
+    // streams its share once per batch while the CPU's cost grows with the tokens, so small batches give it less (h =
+    // the batch size where both take half). Needs HMM for the host-resident expert weights
+    static const float gpu_frac    = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
+    static const int   gpu_k       = getenv("LLAMA_MOE_GPU_K")    ? atoi(getenv("LLAMA_MOE_GPU_K"))    : 3;
+    static const int   gpu_kb      = getenv("LLAMA_MOE_GPU_KB")   ? atoi(getenv("LLAMA_MOE_GPU_KB"))   : gpu_k;
+    static const float gpu_pp      = std::min(gpu_frac, getenv("LLAMA_MOE_GPU_PP") ? (float) atof(getenv("LLAMA_MOE_GPU_PP")) : 0.0f);
+    static const float gpu_pp_half = getenv("LLAMA_MOE_GPU_PP_HALF") ? (float) atof(getenv("LLAMA_MOE_GPU_PP_HALF")) : 0.0f;
     if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
-        moe_gpu_k  = n_tokens == 1 ? gpu_k : gpu_kb;
-        moe_gpu_e1 = (int) (gpu_frac * hparams.n_expert);
+        const float pp = gpu_pp_half > 0.0f ? std::min(gpu_pp, n_tokens/(n_tokens + gpu_pp_half)) : gpu_pp;
+        const int   pp_e1 = (int) (pp * hparams.n_expert);
+        moe_gpu_k  = n_tokens == 1 ? gpu_k : n_tokens <= 4 ? gpu_kb : pp_e1 > 0 ? (int) hparams.n_expert : 0;
+        moe_gpu_e1 = n_tokens <= 4 ? (int) (gpu_frac * hparams.n_expert) : pp_e1;
         // the share runs on the layer's GPU (layer split over several GPUs)
         for (int i = 0; sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
             ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
