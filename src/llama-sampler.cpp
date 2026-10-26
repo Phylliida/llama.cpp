@@ -189,6 +189,36 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
     std::partial_sort(ptr, ptr + npartial - ndone, ptr + histo[ib], comp);
 }
 
+// upper bound of the number of top tokens that top-p keeps: whole logit buckets (as in the partial sort above) from the
+// top until their probability mass reaches p. Needs the probabilities of cur (softmax). The bucket sums can round
+// differently from a running sum in sorted order, so callers keep a full sort as the fallback.
+static size_t llama_token_data_array_top_p_bound(const llama_token_data_array & cur, float p, size_t min_keep) {
+    constexpr int   nbuckets     = 128;
+    constexpr float bucket_low   = -10.0f;
+    constexpr float bucket_high  =  10.0f;
+    constexpr float bucket_scale = nbuckets/(bucket_high - bucket_low);
+    constexpr float bucket_inter = -bucket_low * bucket_scale;
+
+    std::vector<size_t> histo(nbuckets, 0);
+    std::vector<double> mass(nbuckets, 0.0);
+    for (size_t i = 0; i < cur.size; ++i) {
+        int ib = int(bucket_scale * cur.data[i].logit + bucket_inter);
+        ib = std::max(0, std::min(nbuckets - 1, ib));
+        ++histo[ib];
+        mass[ib] += cur.data[i].p;
+    }
+    size_t n   = 0;
+    double cum = 0.0;
+    for (int ib = nbuckets - 1; ib >= 0; --ib) {
+        n   += histo[ib];
+        cum += mass[ib];
+        if (cum >= p && n >= min_keep) {
+            break;
+        }
+    }
+    return n;
+}
+
 // reduces the size of cur_p to npartial, keeping only the top npartial elements
 static void llama_token_data_array_partial_sort_inplace(llama_token_data_array * cur_p, int npartial) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
@@ -1573,6 +1603,7 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
     // Compute the cumulative probabilities
     float cum_sum = 0.0f;
     size_t last_idx = cur_p->size;
+    bool bounded = false;
 
     for (size_t i = 0; i < cur_p->size; ++i) {
         cum_sum += pdata[i].p;
@@ -1584,9 +1615,12 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
             break;
         }
 
-        // we exceeded the current top-k heuristic -> increase k and continue
+        // we exceeded the current top-k heuristic -> increase k and continue: first to the bucket bound (sorting the
+        // whole vocab costs ~15 ms at 160k tokens), then, if rounding still leaves the sum short, to all tokens
         if (!cur_p->sorted && i == k - 1) {
-            k = cur_p->size;
+            const size_t k_bound = bounded ? 0 : llama_token_data_array_top_p_bound(*cur_p, ctx->p, ctx->min_keep);
+            bounded = true;
+            k = k_bound > k ? std::min(k_bound, cur_p->size) : cur_p->size;
             llama_token_data_array_partial_sort(*cur_p, k, buf_sort);
             pdata = buf_sort.data();
         }

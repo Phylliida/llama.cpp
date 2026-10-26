@@ -5,6 +5,7 @@
 #include "common.h"
 
 #include <string>
+#include <random>
 #include <vector>
 
 // common_sampler extends llama_sampler with additional functionality:
@@ -88,7 +89,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// stochastic verification (speculative sampling): draft[i] was sampled from draft_probs[i] (id, p). It is accepted with
+// probability min(1, p_target/p_draft) under the target's sampling distribution, else a token is sampled from
+// max(0, p_target - p_draft) and verification stops. The accepted tokens are distributed exactly as plain sampling from
+// the target, with more accepted drafts than exact matching when the target is uncertain.
+// Falls back to exact matching when draft_probs does not cover the draft or a grammar / reasoning budget is active.
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs, std::mt19937 & rng);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+
+// TEMP experiment (LLAMA_SPEC_RS_STATS=<file>): the drafter registers its top candidates (id, logit) per draft
+// position; common_sampler_sample_and_accept_n then logs, per verified position, the target probability of the draft
+// token (acceptance of exact-match verification) and sum_x min(p(x), q_tau(x)) for draft temperatures tau (acceptance
+// of rejection sampling with a sampled draft)
+void common_sampler_temp_set_draft_cands(int pos, const llama_token_data_array * cands);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);

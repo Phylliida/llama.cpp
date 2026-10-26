@@ -258,6 +258,8 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
+    std::vector<std::vector<llama_token_data>> spec_draft_probs; // proposal distributions of sampled drafts
+    std::mt19937 spec_rs_rng;                                    // stochastic verification
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -382,6 +384,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_probs.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -1835,6 +1838,9 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+            if (spec) {
+                slot.spec_rs_rng.seed(task.params.sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : task.params.sampling.seed + 1);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3050,13 +3056,22 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // sampled drafts with stochastic verification: sampling requests only, and only when a rejected
+                        // draft can be removed from the context (no checkpoint replay)
+                        const bool use_draft_probs = slot.task->params.sampling.temp > 0.0f &&
+                            (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                             (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                              common_speculative_n_max(spec.get()) <= (int32_t) llama_n_rs_seq(ctx_tgt))) &&
+                            common_speculative_get_synth_probs(spec.get()).empty();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting     = */ true,
+                            /* .n_max        = */ n_draft_max,
+                            /* .pos0         = */ slot.prompt.tokens.pos_next(),
+                            /* .id_last      = */ slot.sampled,
+                            /* .prompt       = */ &slot.spec_prompt,
+                            /* .result       = */ &slot.spec_draft,
+                            /* .result_probs = */ use_draft_probs ? &slot.spec_draft_probs : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -3937,12 +3952,16 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : !slot.spec_draft_probs.empty()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_probs, slot.spec_rs_rng)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+                slot.spec_draft_probs.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 

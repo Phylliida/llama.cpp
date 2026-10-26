@@ -675,6 +675,53 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// TEMP experiment (LLAMA_SPEC_RS_STATS), see sampling.h
+static std::vector<std::vector<llama_token_data>> g_temp_draft_cands;
+
+void common_sampler_temp_set_draft_cands(int pos, const llama_token_data_array * cands) {
+    if (!getenv("LLAMA_SPEC_RS_STATS")) {
+        return;
+    }
+    if ((int) g_temp_draft_cands.size() <= pos) {
+        g_temp_draft_cands.resize(pos + 1);
+    }
+    g_temp_draft_cands[pos].assign(cands->data, cands->data + std::min<size_t>(cands->size, 10));
+}
+
+static void common_sampler_temp_rs_log(const llama_token_data_array * cur_p, int pos, llama_token draft_id, bool accepted) {
+    static FILE * f = getenv("LLAMA_SPEC_RS_STATS") ? fopen(getenv("LLAMA_SPEC_RS_STATS"), "a") : nullptr;
+    if (!f || pos >= (int) g_temp_draft_cands.size() || g_temp_draft_cands[pos].empty()) {
+        return;
+    }
+    const auto & q = g_temp_draft_cands[pos];
+    auto p_of = [&](llama_token id) {
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == id) {
+                return cur_p->data[k].p;
+            }
+        }
+        return 0.0f;
+    };
+    std::vector<float> pq(q.size());
+    for (size_t k = 0; k < q.size(); ++k) {
+        pq[k] = p_of(q[k].id);
+    }
+    fprintf(f, "%d %d %.5f %.5f", pos, accepted ? 1 : 0, p_of(draft_id), q[0].id == draft_id ? 1.0f : 0.0f);
+    fprintf(f, " %.5f %.5f", q[0].p, pq[0]); // draft top-1 prob (tau 1), target prob of the draft top-1
+    for (float tau : {0.5f, 0.7f, 1.0f, 1.3f}) {
+        float mx = q[0].logit, z = 0.0f;
+        for (const auto & c : q) { mx = std::max(mx, c.logit); }
+        for (const auto & c : q) { z += expf((c.logit - mx)/tau); }
+        float ov = 0.0f;
+        for (size_t k = 0; k < q.size(); ++k) {
+            ov += std::min(pq[k], expf((q[k].logit - mx)/tau)/z);
+        }
+        fprintf(f, " %.5f", ov);
+    }
+    fprintf(f, "\n");
+    fflush(f);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
@@ -684,6 +731,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_temp_rs_log(&gsmpl->cur_p, (int) i, draft[i], draft[i] == id);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -701,6 +750,85 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
     }
+
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs, std::mt19937 & rng) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    if (draft_probs.size() < draft.size() || gsmpl->grmr || gsmpl->rbudget) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, false);
+    }
+
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], false);
+
+        // the target's sampling distribution: candidates after the chain, p normalized by the final sampler
+        const llama_token_data_array & cur_p = gsmpl->cur_p;
+        const auto & q = draft_probs[i];
+        auto q_of = [&](llama_token t) {
+            for (const auto & c : q) {
+                if (c.id == t) {
+                    return c.p;
+                }
+            }
+            return 0.0f;
+        };
+
+        float p_draft = 0.0f;
+        for (size_t k = 0; k < cur_p.size; ++k) {
+            if (cur_p.data[k].id == draft[i]) {
+                p_draft = cur_p.data[k].p;
+                break;
+            }
+        }
+        const float q_draft = q_of(draft[i]);
+
+        const bool accept = q_draft > 0.0f && uniform(rng)*q_draft < p_draft;
+
+        common_sampler_temp_rs_log(&cur_p, (int) i, draft[i], accept); // TEMP experiment (LLAMA_SPEC_RS_STATS)
+
+        if (accept) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: sample from the residual max(0, p - q) (the target's own draw if it is empty by rounding)
+        llama_token tok = id;
+        double sum = 0.0;
+        for (size_t k = 0; k < cur_p.size; ++k) {
+            sum += std::max(0.0f, cur_p.data[k].p - q_of(cur_p.data[k].id));
+        }
+        if (sum > 0.0) {
+            const double target = uniform(rng)*sum;
+            double cum = 0.0;
+            for (size_t k = 0; k < cur_p.size; ++k) {
+                cum += std::max(0.0f, cur_p.data[k].p - q_of(cur_p.data[k].id));
+                if (cum >= target) {
+                    tok = cur_p.data[k].id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, tok, true);
+        result.push_back(tok);
+
+        return result;
+    }
+
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], false);
+
+    common_sampler_accept(gsmpl, id, true);
+    result.push_back(id);
 
     return result;
 }

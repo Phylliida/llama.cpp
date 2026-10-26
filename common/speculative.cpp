@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -936,6 +937,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // block-internal attention
     bool causal_attn = false;
 
+    // sampled drafts for stochastic verification (LLAMA_SPEC_RS_TAU > 0): draft from the top candidates at temperature
+    // rs_tau, greedily where the top candidate has p >= rs_greedy_above (at temperature 1)
+    float        rs_tau          = 0.0f;
+    float        rs_greedy_above = 2.0f;
+    std::mt19937 rs_rng{1234};
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1045,6 +1052,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        if (const char * e = getenv("LLAMA_SPEC_RS_TAU")) {
+            rs_tau = (float) atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_RS_GREEDY_ABOVE")) {
+            rs_greedy_above = (float) atof(e);
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1071,6 +1085,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        rs_rng.seed(1234 + seq_id); // same draws for the same request
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1231,6 +1247,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            auto * result_probs = rs_tau > 0.0f ? dp.result_probs : nullptr;
+            if (dp.result_probs) {
+                dp.result_probs->clear();
+            }
+
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
@@ -1302,10 +1323,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id = cur_p->data[0].id;
+
+                    common_sampler_temp_set_draft_cands(i - 1, cur_p); // TEMP experiment (LLAMA_SPEC_RS_STATS)
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;
+                    }
+
+                    if (result_probs) {
+                        id = draft_sample(cur_p, result_probs->emplace_back());
                     }
 
                     common_sampler_accept(smpl, id, true);
@@ -1316,12 +1343,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.result_probs) {
+                    dp.result_probs->clear();
+                }
             }
         }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
+    }
+
+    // sample a draft token from the candidates (sorted, raw logits) at temperature rs_tau, or take the top one if it
+    // is confident; probs receives the distribution it was drawn from
+    llama_token draft_sample(const llama_token_data_array * cur_p, std::vector<llama_token_data> & probs) {
+        if (cur_p->size == 1 || cur_p->data[0].p >= rs_greedy_above) {
+            probs.assign(1, { cur_p->data[0].id, cur_p->data[0].logit, 1.0f });
+            return cur_p->data[0].id;
+        }
+        probs.assign(cur_p->data, cur_p->data + cur_p->size);
+        double sum = 0.0;
+        for (auto & c : probs) {
+            c.p = expf((c.logit - cur_p->data[0].logit)/rs_tau);
+            sum += c.p;
+        }
+        for (auto & c : probs) {
+            c.p = (float) (c.p/sum);
+        }
+        const float u = std::uniform_real_distribution<float>(0.0f, 1.0f)(rs_rng);
+        float cum = 0.0f;
+        for (const auto & c : probs) {
+            cum += c.p;
+            if (u < cum) {
+                return c.id;
+            }
+        }
+        return probs.back().id;
     }
 };
 
