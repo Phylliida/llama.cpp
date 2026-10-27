@@ -2040,10 +2040,10 @@ static void ggml_compute_forward_mul_mat_id(
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
         // split mode (ggml_mul_mat_id_set_split)
-        const int32_t split_mode = ggml_get_op_params_i32(dst, 0);
-        const int32_t split_k    = ggml_get_op_params_i32(dst, 1);
-        const int32_t split_e0   = ggml_get_op_params_i32(dst, 2);
-        const int32_t split_e1   = ggml_get_op_params_i32(dst, 3);
+        const int32_t split_mode = ggml_get_op_params_i32(dst, 4);
+        const int32_t split_k    = ggml_get_op_params_i32(dst, 5);
+        const int32_t split_e0   = ggml_get_op_params_i32(dst, 6);
+        const int32_t split_e1   = ggml_get_op_params_i32(dst, 7);
 
         const struct ggml_tensor * skip_w = dst->src[3];
         const bool count_slots = strncmp(dst->name, "ffn_moe_down", 12) == 0;
@@ -3623,10 +3623,10 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     if (ith == 0) {
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
-        const int32_t split_mode = ggml_get_op_params_i32(gate, 0);
-        const int32_t split_k    = ggml_get_op_params_i32(gate, 1);
-        const int32_t split_e0   = ggml_get_op_params_i32(gate, 2);
-        const int32_t split_e1   = ggml_get_op_params_i32(gate, 3);
+        const int32_t split_mode = ggml_get_op_params_i32(gate, 4);
+        const int32_t split_k    = ggml_get_op_params_i32(gate, 5);
+        const int32_t split_e0   = ggml_get_op_params_i32(gate, 6);
+        const int32_t split_e1   = ggml_get_op_params_i32(gate, 7);
 
         const bool split_range = split_mode != 0 && split_k >= split_e1 - split_e0 && gate->src[4] == NULL;
         int32_t taken[1024];
@@ -3794,7 +3794,7 @@ static int ggml_cpu_try_fuse_ops(
                 node->src[1] == n1->src[1] && node->src[2] == n1->src[2] && node->src[3] == n1->src[3] &&
                 (node->src[4] == NULL) == (n1->src[4] == NULL) && (node->src[6] == NULL) == (n1->src[6] == NULL) && node->src[1]->type == GGML_TYPE_F32 &&
                 node->src[0]->type == n1->src[0]->type && ggml_are_same_shape(node->src[0], n1->src[0]) &&
-                memcmp(node->op_params, n1->op_params, 4*sizeof(int32_t)) == 0 &&
+                memcmp(node->op_params, n1->op_params, 8*sizeof(int32_t)) == 0 &&
                 ggml_node_has_n_uses(cgraph, node_n, 1) && ggml_node_has_n_uses(cgraph, node_n + 1, 1) &&
                 ggml_is_contiguous(glu) && ggml_are_same_shape(glu, node) &&
                 node->src[2]->ne[1] <= 4 && !ggml_is_numa() && ggml_mmid_dynamic_enabled()) {

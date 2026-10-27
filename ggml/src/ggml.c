@@ -3407,8 +3407,11 @@ void ggml_mul_mat_set_hint(
 void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1) {
     GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
     GGML_ASSERT(mode >= 0 && mode <= 2);
-    const int32_t params[] = { mode, k, e0, e1 };
-    ggml_set_op_params(a, params, sizeof(params));
+    // op_params 4-7: 0-3 hold MUL_MAT_ID's precision settings and hint
+    ggml_set_op_params_i32(a, 4, mode);
+    ggml_set_op_params_i32(a, 5, k);
+    ggml_set_op_params_i32(a, 6, e0);
+    ggml_set_op_params_i32(a, 7, e1);
 }
 
 void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w) {

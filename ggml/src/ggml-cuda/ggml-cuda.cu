@@ -2206,10 +2206,6 @@ static void ggml_cuda_mul_mat_id_range(ggml_backend_cuda_context & ctx, ggml_ten
 
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    // the split parameters share op_params with MUL_MAT_ID's precision (index 3): the batched kernel gets a clean copy
-    ggml_tensor dst_c = *dst;
-    memset(dst_c.op_params, 0, sizeof(dst_c.op_params));
-
     const int ranges[2][2] = { { mode == 1 ? e0 : 0, mode == 1 ? e1 : e0 }, { mode == 1 ? e1 : e1, n_as } };
     for (int r = 0; r < (mode == 1 ? 1 : 2); ++r) {
         for (int c0 = ranges[r][0]; c0 < ranges[r][1]; c0 += chunk) {
@@ -2231,7 +2227,7 @@ static void ggml_cuda_mul_mat_id_range(ggml_backend_cuda_context & ctx, ggml_ten
             ids_t.nb[0] = sizeof(int32_t);
             ids_t.nb[1] = n_ids*sizeof(int32_t);
             ids_t.nb[2] = ids_t.nb[3] = n_ids*n_tokens*sizeof(int32_t);
-            ggml_cuda_mul_mat_q(ctx, &src0_c, src1, &ids_t, &dst_c, /*ids_partial=*/true);
+            ggml_cuda_mul_mat_q(ctx, &src0_c, src1, &ids_t, dst, /*ids_partial=*/true);
         }
     }
 }
@@ -2250,16 +2246,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // split mode: only mmvq handles the -1 ids (it writes zeros for them)
     // skipped slots without a split: "mode 2 with k = 0" computes every slot that is not skipped
-    int split_mode = ggml_get_op_params_i32(dst, 0);
-    int split_k    = ggml_get_op_params_i32(dst, 1);
+    int split_mode = ggml_get_op_params_i32(dst, 4);
+    int split_k    = ggml_get_op_params_i32(dst, 5);
     if (split_mode == 0 && dst->src[3] && ggml_is_quantized(src0->type) && ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
         split_mode = 2;
         split_k    = 0;
     }
     if (split_mode != 0 && ne2 > get_mmvq_mmid_max_batch(src0->type, cc)) {
         // large batch: only the range split (prompt processing)
-        const int e0 = ggml_get_op_params_i32(dst, 2);
-        const int e1 = ggml_get_op_params_i32(dst, 3);
+        const int e0 = ggml_get_op_params_i32(dst, 6);
+        const int e1 = ggml_get_op_params_i32(dst, 7);
         GGML_ASSERT(split_k >= e1 - e0 && !dst->src[4] && ggml_cuda_should_use_mmq(src0->type, cc, ne12, ne02));
         ggml_cuda_mul_mat_id_range(ctx, dst, split_mode, e0, e1);
         return;
@@ -2278,7 +2274,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids + k);
             int32_t * experts = ids_split.get() + n_ids;
             mul_mat_id_split_compact<<<1, 32, 0, ctx.stream()>>>((const char *) ids->data, ids_split.get(), experts,
-                n_ids, ids->nb[0], k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3));
+                n_ids, ids->nb[0], k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7));
 
             ggml_cuda_pool_alloc<char> src0_g(ctx.pool(), k*nb02);
             const int64_t n16 = nb02/16;
@@ -2319,7 +2315,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             int32_t * fill_e = slots + n_out*n_tokens;
             int32_t * fill_s = fill_e + k;
             mul_mat_id_cache_plan<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
-                n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3), skip_d, skip_nb0, skip_nb1,
+                n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7), skip_d, skip_nb0, skip_nb1,
                 (int32_t *) dst->src[4]->data, n_slots, dst->src[6] ? (int32_t *) dst->src[6]->data : nullptr, (int) ne02, n_out,
                 wslot, slots, fill_e, fill_s);
             const dim3 grid((82*4 + k - 1)/k, k);
@@ -2344,7 +2340,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             int32_t * experts = take.get();
             int32_t * slots   = take.get() + k;
             mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
-                n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
+                n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
                 skip_d, skip_nb0, skip_nb1, nullptr, experts, slots);
             CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
             ggml_cuda_mul_mat_vec_q_moe_xm(ctx, src0, src1, experts, slots, k, dst);
@@ -2353,7 +2349,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids*n_tokens);
         mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
-            n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3),
+            n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
             skip_d, skip_nb0, skip_nb1, ids_split.get(), nullptr, nullptr);
         ggml_tensor ids_t = *ids;
         ids_t.data  = ids_split.get();

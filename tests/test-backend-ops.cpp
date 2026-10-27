@@ -5368,17 +5368,18 @@ struct test_mul_mat_id_split : public test_mul_mat_id {
     const int mode;
     const bool skip;
     const int split_k;
+    const int e0; // the split range is [e0, e0 + n_mats/2)
     test_mul_mat_id_split(ggml_type type_a, int mode, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool skip = false,
-            int split_k = 3)
-        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode), skip(skip), split_k(split_k) {}
+            int split_k = 3, int e0 = 0)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode), skip(skip), split_k(split_k), e0(e0) {}
     std::string vars() override {
         return test_mul_mat_id::vars() + ",mode=" + std::to_string(mode) + ",skip=" + std::to_string(skip) +
-            ",split_k=" + std::to_string(split_k);
+            ",split_k=" + std::to_string(split_k) + (e0 ? ",e0=" + std::to_string(e0) : "");
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
         if (mode != 0) {
-            ggml_mul_mat_id_set_split(out, mode, split_k, 0, n_mats/2);
+            ggml_mul_mat_id_set_split(out, mode, split_k, e0, e0 + n_mats/2);
         }
         if (skip) {
             ggml_mul_mat_id_set_skip(out, new_mmid_skip_w(ctx, n_used, n));
@@ -10353,6 +10354,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, false, 64));
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, true, 64));
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 8));
+                // a range that starts above 0 (second GPU's part) and one that ends at the last expert
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, true, 64, 13));
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, false, 64, 32));
             }
         }
         // expert cache: hits, admission, LRU eviction, scratch slots (more new experts than free slots)
