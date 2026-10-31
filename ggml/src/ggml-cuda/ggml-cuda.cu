@@ -646,6 +646,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
+            // TEMP: GGML_CUDA_POOL_LOG=1 logs each growth of a VMM pool (which allocations hold the VRAM)
+            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (pool_log) {
+                GGML_LOG_INFO("cuda pool[%d] %p: %zu MiB (+%zu MiB for a %zu MiB allocation)\n", device, (void *) this,
+                    pool_size >> 20, reserve_size >> 20, size >> 20);
+            }
+
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
             //       (unsigned long long) (reserve_size/1024/1024));
@@ -5059,7 +5066,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // nodes reading host weights (GGML_TENSOR_FLAG_HOST_SRC, PCIe bound) and their dependents run on a
                 // second stream, so they overlap with the other (VRAM bound) work of the graph
                 if (host_src_stream && !is_concurrent_event_active) {
-                    bool side = (node->flags & GGML_TENSOR_FLAG_HOST_SRC) != 0;
+                    // not the fused prompt-batch MoE: nothing to overlap with in its split, and on the main stream its
+                    // temporaries share the main pool (each stream has its own)
+                    bool side = (node->flags & GGML_TENSOR_FLAG_HOST_SRC) != 0 && node->op != GGML_OP_MOE_FFN_RANGE;
                     for (int j = 0; j < GGML_MAX_SRC && !side; ++j) {
                         const ggml_tensor * src = node->src[j];
                         side = src && (side_nodes.count(src) || (src->view_src && side_nodes.count(src->view_src)));
