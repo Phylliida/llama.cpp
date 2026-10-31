@@ -672,6 +672,57 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        // TEMP experiment (precision study): LLAMA_TENSOR_SOURCE=<first split of another GGUF of the same model> with
+        // LLAMA_TENSOR_SOURCE_RE=<regex>: the tensors whose names match are read from that model instead, e.g. some
+        // dense tensors at their original precision. Shapes must match; types may differ
+        if (const char * src = getenv("LLAMA_TENSOR_SOURCE")) {
+            const std::regex re(getenv("LLAMA_TENSOR_SOURCE_RE") ? getenv("LLAMA_TENSOR_SOURCE_RE") : "$^");
+            std::vector<std::string> src_splits = { src };
+            {
+                gguf_init_params p = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
+                gguf_context_ptr g { gguf_init_from_file(src, p) };
+                if (!g) {
+                    throw std::runtime_error(format("%s: failed to load tensor source %s", __func__, src));
+                }
+                const int kid = gguf_find_key(g.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str());
+                const uint16_t n_src = kid < 0 ? 1 : gguf_get_val_u16(g.get(), kid);
+                if (n_src > 1) {
+                    src_splits = llama_get_list_splits(src, 0, n_src);
+                }
+            }
+            int n_replaced = 0;
+            size_t bytes_old = 0, bytes_new = 0;
+            for (const std::string & fname_src : src_splits) {
+                struct ggml_context * ctx_src = NULL;
+                gguf_init_params p = { /*.no_alloc = */ true, /*.ctx = */ &ctx_src };
+                gguf_context_ptr g { gguf_init_from_file(fname_src.c_str(), p) };
+                if (!g) {
+                    throw std::runtime_error(format("%s: failed to load tensor source split %s", __func__, fname_src.c_str()));
+                }
+                files.emplace_back(new llama_file(fname_src.c_str(), "rb", use_direct_io));
+                contexts.emplace_back(ctx_src);
+                const uint16_t file_idx = files.size() - 1;
+                for (ggml_tensor * cur = ggml_get_first_tensor(ctx_src); cur; cur = ggml_get_next_tensor(ctx_src, cur)) {
+                    const std::string name = cur->name;
+                    auto it = weights_map.find(name);
+                    if (it == weights_map.end() || !std::regex_search(name, re)) {
+                        continue;
+                    }
+                    if (!ggml_are_same_shape(it->second.tensor, cur)) {
+                        throw std::runtime_error(format("%s: tensor source: '%s' has a different shape", __func__, name.c_str()));
+                    }
+                    bytes_old += ggml_nbytes(it->second.tensor);
+                    bytes_new += ggml_nbytes(cur);
+                    n_bytes += ggml_nbytes(cur) - ggml_nbytes(it->second.tensor);
+                    weights_map.erase(it);
+                    weights_map.emplace(name, llama_tensor_weight(files.back().get(), file_idx, g.get(), cur));
+                    n_replaced++;
+                }
+            }
+            LLAMA_LOG_INFO("%s: tensor source %s: %d tensors replaced (%.2f -> %.2f GiB)\n", __func__, src, n_replaced,
+                bytes_old/1073741824.0, bytes_new/1073741824.0);
+        }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
