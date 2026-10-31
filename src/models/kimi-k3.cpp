@@ -770,7 +770,9 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
     static const int   gpu_kb      = getenv("LLAMA_MOE_GPU_KB")   ? atoi(getenv("LLAMA_MOE_GPU_KB"))   : gpu_k;
     static const float gpu_pp      = std::min(gpu_frac, getenv("LLAMA_MOE_GPU_PP") ? (float) atof(getenv("LLAMA_MOE_GPU_PP")) : 0.0f);
     static const float gpu_pp_half = getenv("LLAMA_MOE_GPU_PP_HALF") ? (float) atof(getenv("LLAMA_MOE_GPU_PP_HALF")) : 0.0f;
-    // LLAMA_MOE_GPU_PP2 = share of that fraction for a second GPU (prompt batches, two GPUs; 0 = off), e.g. 0.5
+    // LLAMA_MOE_GPU_PP2 = share of that fraction for a second GPU (prompt batches, two GPUs; 0 = off), e.g. 0.5. It takes
+    // the experts from the top ([n_expert - its share, n_expert)), so it only reads (and maps) a fixed part of the
+    // other GPU's layers whatever the batch size; the CPU takes the experts in between
     static const float gpu_pp2     = getenv("LLAMA_MOE_GPU_PP2") ? (float) atof(getenv("LLAMA_MOE_GPU_PP2")) : 0.0f;
     if (gpu_frac > 0.0f && layer.ffn_up_exps && layer.ffn_up_exps->buffer && ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer)) {
         const float pp = gpu_pp_half > 0.0f ? std::min(gpu_pp, n_tokens/(n_tokens + gpu_pp_half)) : gpu_pp;
@@ -788,8 +790,8 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
             }
         }
         if (moe_gpu_backend2 && pp_e1 > 0) {
-            moe_gpu_e2 = pp_e1;
             moe_gpu_e1 = (int) ((1.0f - gpu_pp2) * pp_e1);
+            moe_gpu_e2 = (int) hparams.n_expert - (pp_e1 - moe_gpu_e1);
         } else {
             moe_gpu_backend2 = nullptr;
         }

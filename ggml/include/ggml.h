@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_FFN_RANGE,
+
         GGML_OP_COUNT,
     };
 
@@ -1520,6 +1522,27 @@ extern "C" {
     // (at one token: the first k eligible slots). at most 1024 slots (n_expert_used*n_tokens)
     // mode 1 computes only the taken slots, mode 2 all other slots, skipped slots are written as zeros
     GGML_API void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1);
+
+    // routed experts of a range of expert ids, weighted and summed (Kimi-K3 SiTU experts; prompt batches with
+    // host-resident experts, so a backend can stream the range's experts once per batch without materializing the
+    // per-slot intermediates):
+    //   out[:, t] = sum over the slots j of token t with ids[j, t] in [e0, e1) (and skip[j, t] != 0) of
+    //               weights[j, t] * down_e(situ(gate_e(x[:, t]), up_e(x[:, t])))   (e = ids[j, t], situ as in ggml_situ_split)
+    // up, gate: [n_in, n_ff, n_expert]   down: [n_ff, n_out, n_expert]   x: [n_in, n_tokens] (f32)
+    // ids: [n_used, n_tokens] (i32)   weights, skip (optional): [n_used, n_tokens] (f32)   out: [n_out, n_tokens] (f32)
+    GGML_API struct ggml_tensor * ggml_moe_ffn_range(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * skip,
+            int                   e0,
+            int                   e1,
+            float                 beta,
+            float                 linear_beta);
 
     // skip the slots whose weight in w ([n_expert_used, n_tokens] F32, same layout as ids) is exactly 0:
     // they are written as zeros and do not count towards a split's k. backends may also compute them,

@@ -559,9 +559,14 @@ llama_context::llama_context(
         auto * prefetch_fn = (prefetch_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_prefetch_host");
         if (prefetch_fn) {
             const double frac = atof(moe_gpu_frac);
-            moe_prefetch_thread = std::thread([this, prefetch_fn, frac]() {
+            // a second GPU's prompt share (LLAMA_MOE_GPU_PP2, kimi-k3.cpp) reads the top experts of the other GPUs' layers
+            const char * pp_env  = getenv("LLAMA_MOE_GPU_PP");
+            const char * pp2_env = getenv("LLAMA_MOE_GPU_PP2");
+            const double frac2 = pp_env && pp2_env ? std::min(frac, atof(pp_env)) * atof(pp2_env) : 0.0;
+            moe_prefetch_thread = std::thread([this, prefetch_fn, frac, frac2]() {
                 const int64_t t0 = ggml_time_us();
-                // ranges per GPU: the one that computes the layer's share (its device with a layer split)
+                // ranges per GPU: the one that computes the layer's share (its device with a layer split): the experts
+                // [0, frac*n); with PP2 the other GPUs also map [n - frac2*n, n)
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(this->model.devices[0].dev);
                 std::vector<std::vector<std::pair<const void *, size_t>>> ranges(ggml_backend_reg_dev_count(reg));
                 size_t total = 0;
@@ -575,6 +580,11 @@ llama_context::llama_context(
                         if (ggml_backend_reg_dev_get(reg, i) == this->model.dev_layer(il)) {
                             const size_t size = std::min(ggml_nbytes(t), (size_t) (frac * t->ne[2]) * t->nb[2]);
                             ranges[i].emplace_back(t->data, size);
+                            total += size;
+                        } else if (frac2 > 0.0) {
+                            const int64_t n2   = std::min(t->ne[2], (int64_t) (frac2 * t->ne[2]) + 1);
+                            const size_t  size = n2 * t->nb[2];
+                            ranges[i].emplace_back((const char *) t->data + ggml_nbytes(t) - size, size);
                             total += size;
                         }
                     }

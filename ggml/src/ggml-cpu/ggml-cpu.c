@@ -2222,6 +2222,105 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// GGML_OP_MOE_FFN_RANGE: reference implementation (the backends with host-resident experts implement the streaming
+// version), tokens split over the threads, one weight row at a time
+
+static size_t ggml_moe_ffn_range_wsize(const struct ggml_tensor * node) {
+    const struct ggml_tensor * up   = node->src[0];
+    const struct ggml_tensor * gate = node->src[1];
+    const struct ggml_tensor * down = node->src[2];
+    const int64_t n_in  = up->ne[0];
+    const int64_t n_ff  = up->ne[1];
+    const int64_t n_out = down->ne[1];
+    return GGML_PAD(ggml_row_size(type_traits_cpu[up->type].vec_dot_type,   n_in), CACHE_LINE_SIZE) +
+           GGML_PAD(ggml_row_size(type_traits_cpu[gate->type].vec_dot_type, n_in), CACHE_LINE_SIZE) +
+           GGML_PAD(ggml_row_size(type_traits_cpu[down->type].vec_dot_type, n_ff), CACHE_LINE_SIZE) +
+           GGML_PAD((3*n_ff + n_out)*sizeof(float), CACHE_LINE_SIZE);
+}
+
+// row x (f32) in the dot type of t: the converted copy in q, or x itself for f32
+static const void * ggml_moe_ffn_range_conv(const struct ggml_tensor * t, const float * x, void * q, int64_t n) {
+    const enum ggml_type vdt = type_traits_cpu[t->type].vec_dot_type;
+    if (vdt == GGML_TYPE_F32) {
+        return x;
+    }
+    type_traits_cpu[vdt].from_float(x, q, n);
+    return q;
+}
+
+static void ggml_compute_forward_moe_ffn_range(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * up   = dst->src[0];
+    const struct ggml_tensor * gate = dst->src[1];
+    const struct ggml_tensor * down = dst->src[2];
+    const struct ggml_tensor * x    = dst->src[3];
+    const struct ggml_tensor * ids  = dst->src[4];
+    const struct ggml_tensor * w    = dst->src[5];
+    const struct ggml_tensor * skip = dst->src[6];
+
+    const int32_t e0   = ggml_get_op_params_i32(dst, 0);
+    const int32_t e1   = ggml_get_op_params_i32(dst, 1);
+    const float   beta = ggml_get_op_params_f32(dst, 2);
+    const float   lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t n_in     = up->ne[0];
+    const int64_t n_ff     = up->ne[1];
+    const int64_t n_out    = down->ne[1];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+
+    const ggml_vec_dot_t dot_up   = type_traits_cpu[up->type].vec_dot;
+    const ggml_vec_dot_t dot_gate = type_traits_cpu[gate->type].vec_dot;
+    const ggml_vec_dot_t dot_down = type_traits_cpu[down->type].vec_dot;
+
+    char * wdata = (char *) params->wdata + params->ith*ggml_moe_ffn_range_wsize(dst);
+    void * q_up   = wdata;
+    void * q_gate = (char *) q_up   + GGML_PAD(ggml_row_size(type_traits_cpu[up->type].vec_dot_type,   n_in), CACHE_LINE_SIZE);
+    void * q_act  = (char *) q_gate + GGML_PAD(ggml_row_size(type_traits_cpu[gate->type].vec_dot_type, n_in), CACHE_LINE_SIZE);
+    float * f_up   = (float *) ((char *) q_act + GGML_PAD(ggml_row_size(type_traits_cpu[down->type].vec_dot_type, n_ff), CACHE_LINE_SIZE));
+    float * f_gate = f_up   + n_ff;
+    float * f_act  = f_gate + n_ff;
+    float * f_out  = f_act  + n_ff;
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        float       * out = (float       *) ((char       *) dst->data + t*dst->nb[1]);
+        const float * xt  = (const float *) ((const char *) x->data   + t*x->nb[1]);
+        memset(out, 0, n_out*sizeof(float));
+
+        const void * x_up   = NULL;
+        const void * x_gate = NULL;
+        for (int64_t j = 0; j < n_used; ++j) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            if (e < e0 || e >= e1 ||
+                    (skip && *(const float *) ((const char *) skip->data + t*skip->nb[1] + j*skip->nb[0]) == 0.0f)) {
+                continue;
+            }
+            if (!x_up) {
+                x_up   = ggml_moe_ffn_range_conv(up,   xt, q_up,   n_in);
+                x_gate = ggml_moe_ffn_range_conv(gate, xt, q_gate, n_in);
+            }
+            const char * up_e   = (const char *) up->data   + e*up->nb[2];
+            const char * gate_e = (const char *) gate->data + e*gate->nb[2];
+            const char * down_e = (const char *) down->data + e*down->nb[2];
+            for (int64_t i = 0; i < n_ff; ++i) {
+                dot_up  ((int) n_in, &f_up[i],   0, up_e   + i*up->nb[1],   0, x_up,   0, 1);
+                dot_gate((int) n_in, &f_gate[i], 0, gate_e + i*gate->nb[1], 0, x_gate, 0, 1);
+            }
+            ggml_vec_situ_f32((int) n_ff, f_act, f_gate, f_up, beta, lb);
+            const void * a = ggml_moe_ffn_range_conv(down, f_act, q_act, n_ff);
+            for (int64_t i = 0; i < n_out; ++i) {
+                dot_down((int) n_ff, &f_out[i], 0, down_e + i*down->nb[1], 0, a, 0, 1);
+            }
+            const float wt = ((const float *) w->data)[t*n_used + j];
+            for (int64_t i = 0; i < n_out; ++i) {
+                out[i] += wt*f_out[i];
+            }
+        }
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2356,6 +2455,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MOE_FFN_RANGE:
+            {
+                ggml_compute_forward_moe_ffn_range(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2847,6 +2950,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MOE_FFN_RANGE:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -3399,6 +3503,10 @@ struct ggml_cplan ggml_graph_plan(
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
+                    } break;
+                case GGML_OP_MOE_FFN_RANGE:
+                    {
+                        cur = n_tasks*ggml_moe_ffn_range_wsize(node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

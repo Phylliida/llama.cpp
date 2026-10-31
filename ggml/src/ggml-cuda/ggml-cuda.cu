@@ -2232,6 +2232,214 @@ static void ggml_cuda_mul_mat_id_range(ggml_backend_cuda_context & ctx, ggml_ten
     }
 }
 
+// GGML_OP_MOE_FFN_RANGE (ggml_moe_ffn_range): the range's experts are streamed once per batch in chunks (the weights are
+// usually host memory read over PCIe); each chunk computes only the rows (token, slot) routed to its experts, gathered
+// into compact buffers of at most GGML_CUDA_MOE_RANGE_ROWS rows, and adds them weighted to dst. So the memory is
+// O(chunk + rows) instead of the [n_ff, n_used, n_tokens] intermediates of separate MUL_MAT_ID nodes. The routing is
+// planned on the host (one copy of ids/skip and one synchronization per call)
+
+// compact rows: x of the rows' tokens and their expert ids relative to the chunk's first expert
+static __global__ void moe_ffn_range_gather(const char * x, const size_t x_nb1, const int32_t * row_tok, const int32_t * row_exp,
+        const int e_first, const int64_t n_in, float * xc, int32_t * ids_c) {
+    const int r = blockIdx.x;
+    const float * xt = (const float *) (x + row_tok[r]*x_nb1);
+    for (int64_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        xc[r*n_in + i] = xt[i];
+    }
+    if (threadIdx.x == 0) {
+        ids_c[r] = row_exp[r] - e_first;
+    }
+}
+
+// u = situ(g, u), the formula of the SITU GLU kernel
+static __global__ void moe_ffn_range_situ(const float * g, float * u, const int64_t n, const float beta, const float lb) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float gi = g[i];
+    const float ui = u[i];
+    const float a  = (tanhf(gi*(1.0f/beta))*beta) * (1.0f/(1.0f + expf(-gi)));
+    const float v  = lb > 0.0f ? tanhf(ui*(1.0f/lb))*lb : ui;
+    u[i] = a*v;
+}
+
+// dst[:, token] += weight * row (several rows of a token can be in one chunk: atomics)
+static __global__ void moe_ffn_range_scatter(const float * rows, const int32_t * row_tok, const int32_t * row_slot,
+        const float * w, const int n_used, const int64_t n_out, char * dst, const size_t dst_nb1) {
+    const int r = blockIdx.y;
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= n_out) {
+        return;
+    }
+    const int t = row_tok[r];
+    atomicAdd((float *) (dst + t*dst_nb1) + i, w[t*n_used + row_slot[r]] * rows[r*n_out + i]);
+}
+
+static void ggml_cuda_moe_ffn_range(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * up   = dst->src[0];
+    const ggml_tensor * gate = dst->src[1];
+    const ggml_tensor * down = dst->src[2];
+    const ggml_tensor * x    = dst->src[3];
+    const ggml_tensor * ids  = dst->src[4];
+    const ggml_tensor * w    = dst->src[5];
+    const ggml_tensor * skip = dst->src[6];
+
+    const int   e0   = ggml_get_op_params_i32(dst, 0);
+    const int   e1   = ggml_get_op_params_i32(dst, 1);
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t n_in     = up->ne[0];
+    const int64_t n_ff     = up->ne[1];
+    const int64_t n_out    = down->ne[1];
+    const int     n_used   = ids->ne[0];
+    const int     n_tokens = ids->ne[1];
+
+    cudaStream_t stream = ctx.stream();
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+    if (e1 <= e0 || n_tokens == 0) {
+        return;
+    }
+
+    // plan: the rows sorted by expert (counting sort, token order within an expert); off[e - e0] = first row of e
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t) && (!skip || skip->nb[0] == sizeof(float)));
+    std::vector<int32_t> h_ids((size_t) n_used*n_tokens);
+    std::vector<float>   h_skip(skip ? (size_t) n_used*n_tokens : 0);
+    CUDA_CHECK(cudaMemcpy2DAsync(h_ids.data(), n_used*sizeof(int32_t), ids->data, ids->nb[1], n_used*sizeof(int32_t), n_tokens,
+        cudaMemcpyDeviceToHost, stream));
+    if (skip) {
+        CUDA_CHECK(cudaMemcpy2DAsync(h_skip.data(), n_used*sizeof(float), skip->data, skip->nb[1], n_used*sizeof(float), n_tokens,
+            cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int n_range = e1 - e0;
+    auto row_valid = [&](size_t k) {
+        return h_ids[k] >= e0 && h_ids[k] < e1 && (!skip || h_skip[k] != 0.0f);
+    };
+    std::vector<int32_t> off(n_range + 1, 0);
+    for (size_t k = 0; k < h_ids.size(); ++k) {
+        if (row_valid(k)) {
+            off[h_ids[k] - e0 + 1]++;
+        }
+    }
+    for (int i = 0; i < n_range; ++i) {
+        off[i + 1] += off[i];
+    }
+    const int n_rows = off[n_range];
+    if (n_rows == 0) {
+        return;
+    }
+    std::vector<int32_t> plan(3*(size_t) n_rows); // token, slot, expert of each row
+    {
+        std::vector<int32_t> pos(off.begin(), off.end() - 1);
+        for (size_t k = 0; k < h_ids.size(); ++k) {
+            if (row_valid(k)) {
+                const int p = pos[h_ids[k] - e0]++;
+                plan[p]              = k / n_used;
+                plan[n_rows + p]     = k % n_used;
+                plan[2*n_rows + p]   = h_ids[k];
+            }
+        }
+    }
+    ggml_cuda_pool_alloc<int32_t> d_plan(ctx.pool(), plan.size());
+    // from pageable memory: returns once the data is staged, so plan may go out of scope
+    CUDA_CHECK(cudaMemcpyAsync(d_plan.get(), plan.data(), plan.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    const int32_t * row_tok  = d_plan.get();
+    const int32_t * row_slot = d_plan.get() + n_rows;
+    const int32_t * row_exp  = d_plan.get() + 2*n_rows;
+
+    static const int chunk   = getenv("GGML_CUDA_MOE_RANGE_CHUNK") ? atoi(getenv("GGML_CUDA_MOE_RANGE_CHUNK")) : 16;
+    static const int row_cap = getenv("GGML_CUDA_MOE_RANGE_ROWS")  ? atoi(getenv("GGML_CUDA_MOE_RANGE_ROWS"))  : 2048;
+    const ggml_tensor * mats[3] = { up, gate, down };
+    for (const ggml_tensor * m : mats) {
+        GGML_ASSERT(m->nb[2] % sizeof(int4) == 0 && (uintptr_t) m->data % sizeof(int4) == 0);
+    }
+    ggml_cuda_pool_alloc<char> stage[3] = {
+        ggml_cuda_pool_alloc<char>(ctx.pool(), (size_t) chunk*up->nb[2]),
+        ggml_cuda_pool_alloc<char>(ctx.pool(), (size_t) chunk*gate->nb[2]),
+        ggml_cuda_pool_alloc<char>(ctx.pool(), (size_t) chunk*down->nb[2]),
+    };
+    // the batched kernel may read the last row up to MATRIX_ROW_PADDING values on (multiplied by zero-padded
+    // activations): keep the staged bytes finite when the rows are not a multiple of it
+    if (n_in % MATRIX_ROW_PADDING != 0 || n_ff % MATRIX_ROW_PADDING != 0) {
+        for (int k = 0; k < 3; ++k) {
+            CUDA_CHECK(cudaMemsetAsync(stage[k].get(), 0, (size_t) chunk*mats[k]->nb[2], stream));
+        }
+    }
+    const int nr_max = std::min(row_cap, n_rows);
+    ggml_cuda_pool_alloc<float>   xc   (ctx.pool(), (size_t) nr_max*n_in);
+    ggml_cuda_pool_alloc<int32_t> ids_c(ctx.pool(), nr_max);
+    ggml_cuda_pool_alloc<float>   up_c (ctx.pool(), (size_t) nr_max*n_ff);
+    ggml_cuda_pool_alloc<float>   gt_c (ctx.pool(), (size_t) nr_max*n_ff);
+    ggml_cuda_pool_alloc<float>   dn_c (ctx.pool(), (size_t) nr_max*n_out);
+
+    auto f32_rows = [&](void * data, int64_t ne0, int64_t nr) {
+        ggml_tensor t = {};
+        t.type   = GGML_TYPE_F32;
+        t.buffer = dst->buffer;
+        t.data   = data;
+        t.ne[0] = ne0; t.ne[1] = 1; t.ne[2] = nr; t.ne[3] = 1;
+        t.nb[0] = sizeof(float); t.nb[1] = t.nb[2] = ne0*sizeof(float); t.nb[3] = nr*ne0*sizeof(float);
+        return t;
+    };
+    const int copy_blocks = 4*ggml_cuda_info().devices[ctx.device].nsm;
+
+    for (int c0 = e0; c0 < e1; c0 += chunk) {
+        // the chunk's experts that have rows: [cf, cl)
+        int cf = c0;
+        int cl = std::min(c0 + chunk, e1);
+        while (cf < cl && off[cf - e0] == off[cf - e0 + 1]) {
+            cf++;
+        }
+        while (cl > cf && off[cl - 1 - e0] == off[cl - e0]) {
+            cl--;
+        }
+        if (cf == cl) {
+            continue;
+        }
+        const int nc = cl - cf;
+        ggml_tensor m_c[3];
+        for (int k = 0; k < 3; ++k) {
+            mul_mat_id_range_copy<<<copy_blocks, 256, 0, stream>>>((const int4 *) ((const char *) mats[k]->data + cf*mats[k]->nb[2]),
+                (int4 *) stage[k].get(), nc*mats[k]->nb[2]/sizeof(int4));
+            m_c[k] = *mats[k];
+            m_c[k].data  = stage[k].get();
+            m_c[k].ne[2] = nc;
+            m_c[k].nb[3] = nc*mats[k]->nb[2];
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        for (int r0 = off[cf - e0]; r0 < off[cl - e0]; r0 += row_cap) {
+            const int nr = std::min(row_cap, off[cl - e0] - r0);
+            moe_ffn_range_gather<<<nr, 256, 0, stream>>>((const char *) x->data, x->nb[1], row_tok + r0, row_exp + r0, cf, n_in,
+                xc.get(), ids_c.get());
+            CUDA_CHECK(cudaGetLastError());
+
+            ggml_tensor ids_t = {};
+            ids_t.type = GGML_TYPE_I32;
+            ids_t.buffer = dst->buffer;
+            ids_t.data = ids_c.get();
+            ids_t.ne[0] = 1; ids_t.ne[1] = nr; ids_t.ne[2] = 1; ids_t.ne[3] = 1;
+            ids_t.nb[0] = ids_t.nb[1] = sizeof(int32_t); ids_t.nb[2] = ids_t.nb[3] = nr*sizeof(int32_t);
+
+            ggml_tensor x_t  = f32_rows(xc.get(),   n_in,  nr);
+            ggml_tensor up_t = f32_rows(up_c.get(), n_ff,  nr);
+            ggml_tensor gt_t = f32_rows(gt_c.get(), n_ff,  nr);
+            ggml_tensor dn_t = f32_rows(dn_c.get(), n_out, nr);
+            ggml_cuda_mul_mat_q(ctx, &m_c[0], &x_t, &ids_t, &up_t);
+            ggml_cuda_mul_mat_q(ctx, &m_c[1], &x_t, &ids_t, &gt_t);
+            const int64_t n_act = (int64_t) nr*n_ff;
+            moe_ffn_range_situ<<<(n_act + 255)/256, 256, 0, stream>>>(gt_c.get(), up_c.get(), n_act, beta, lb);
+            ggml_cuda_mul_mat_q(ctx, &m_c[2], &up_t, &ids_t, &dn_t);
+            moe_ffn_range_scatter<<<dim3((n_out + 255)/256, nr), 256, 0, stream>>>(dn_c.get(), row_tok + r0, row_slot + r0,
+                (const float *) w->data, n_used, n_out, (char *) dst->data, dst->nb[1]);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2707,6 +2915,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MOE_FFN_RANGE:
+            ggml_cuda_moe_ffn_range(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -3013,6 +3224,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        if (node->op == GGML_OP_MOE_FFN_RANGE) {
+            use_cuda_graph = false; // plans the routing on the host (stream synchronization)
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -5787,6 +6002,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_MOE_FFN_RANGE:
+            {
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                for (int k = 0; k < 3; ++k) {
+                    const ggml_tensor * m = op->src[k];
+                    if (!ggml_is_quantized(m->type) || !ggml_cuda_should_use_mmq(m->type, cc, 512, m->ne[2]) ||
+                            m->nb[2] % 16 != 0 || !ggml_is_contiguous(m)) {
+                        return false;
+                    }
+                }
+                return op->src[3]->nb[0] == sizeof(float) && op->src[4]->nb[0] == sizeof(int32_t) &&
+                    (!op->src[6] || op->src[6]->nb[0] == sizeof(float));
+            }
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

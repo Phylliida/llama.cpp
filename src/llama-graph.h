@@ -1066,7 +1066,7 @@ struct llm_graph_context {
     mutable int moe_gpu_e1 = 0;
     // GPU for that share (e.g. the layer's device with a layer split), null = the first backend
     mutable ggml_backend_t moe_gpu_backend = nullptr;
-    // larger batches only: a second GPU computes the experts [moe_gpu_e1, moe_gpu_e2) (then cleared)
+    // larger batches only: a second GPU computes the experts [moe_gpu_e2, n_expert) (then cleared)
     mutable ggml_backend_t moe_gpu_backend2 = nullptr;
     mutable int moe_gpu_e2 = 0;
     // its expert cache per layer (llm_graph_params::moe_cache)

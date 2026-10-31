@@ -5396,6 +5396,47 @@ struct test_mul_mat_id_split : public test_mul_mat_id {
     }
 };
 
+// routed experts of an expert range, weighted and summed (ggml_moe_ffn_range)
+struct test_moe_ffn_range : public test_case {
+    const ggml_type type_a;
+    const int n_mats, n_used;
+    const int64_t n_in, n_ff, n_out, n;
+    const int e0, e1;
+    const bool skip;
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, n_mats, n_used, n_in, n_ff, n_out, n, e0, e1, skip);
+    }
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+    test_moe_ffn_range(ggml_type type_a, int n_mats, int n_used, int64_t n_in, int64_t n_ff, int64_t n_out, int64_t n,
+            int e0, int e1, bool skip)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_in(n_in), n_ff(n_ff), n_out(n_out), n(n), e0(e0), e1(e1),
+          skip(skip) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * up   = ggml_new_tensor_3d(ctx, type_a, n_in, n_ff,  n_mats);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_a, n_in, n_ff,  n_mats);
+        ggml_tensor * down = ggml_new_tensor_3d(ctx, type_a, n_ff, n_out, n_mats);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n);
+        ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_used, n);
+        ggml_tensor * out  = ggml_moe_ffn_range(ctx, up, gate, down, x, ids, w, skip ? new_mmid_skip_w(ctx, n_used, n) : nullptr,
+            e0, e1, 3.0f, 2.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mmid_skip_w(ctx);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_RANGE";
+    }
+};
+
 // expert cache of the GPU part of a split MUL_MAT_ID (ggml_mul_mat_id_set_cache): n_steps evaluations chained on one
 // cache state and memory (output = their sum), so a difference in the state update between backends changes later steps.
 // The cache starts with all slots but the last filled
@@ -10359,6 +10400,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, false, 64, 32));
             }
         }
+        // fused range MoE (prompt batches): one range or the whole set, few to many tokens (several chunks and row
+        // batches with GGML_CUDA_MOE_RANGE_CHUNK / GGML_CUDA_MOE_RANGE_ROWS), skipped slots, an empty range
+        for (int n : {1, 7, 64, 129}) {
+            test_cases.emplace_back(new test_moe_ffn_range(type_a, 64, 16, 256, 512, 256, n, 0, 64, false));
+            test_cases.emplace_back(new test_moe_ffn_range(type_a, 64, 16, 256, 512, 256, n, 13, 47, true));
+            test_cases.emplace_back(new test_moe_ffn_range(type_a, 64, 16, 512, 256, 512, n, 40, 64, true));
+            test_cases.emplace_back(new test_moe_ffn_range(type_a, 8, 4, 256, 256, 256, n, 0, 3, false));
+        }
+        test_cases.emplace_back(new test_moe_ffn_range(type_a, 64, 16, 256, 256, 256, 32, 20, 20, false));
         // expert cache: hits, admission, LRU eviction, scratch slots (more new experts than free slots)
         for (int n : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false));

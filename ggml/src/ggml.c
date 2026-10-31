@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_FFN_RANGE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_ffn_range(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3412,6 +3416,46 @@ void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, 
     ggml_set_op_params_i32(a, 5, k);
     ggml_set_op_params_i32(a, 6, e0);
     ggml_set_op_params_i32(a, 7, e1);
+}
+
+struct ggml_tensor * ggml_moe_ffn_range(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * skip,
+        int                   e0,
+        int                   e1,
+        float                 beta,
+        float                 linear_beta) {
+    GGML_ASSERT(ggml_are_same_shape(up, gate) && up->ne[3] == 1);
+    GGML_ASSERT(down->ne[0] == up->ne[1] && down->ne[2] == up->ne[2] && down->ne[3] == 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[0] == up->ne[0] && ggml_nrows(x) == x->ne[1]);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == x->ne[1] && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) && ggml_nelements(weights) == ggml_nelements(ids));
+    GGML_ASSERT(!skip || (skip->type == GGML_TYPE_F32 && ggml_are_same_shape(skip, ids)));
+    GGML_ASSERT(0 <= e0 && e0 <= e1 && e1 <= up->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, down->ne[1], x->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, e0);
+    ggml_set_op_params_i32(result, 1, e1);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, linear_beta);
+
+    result->op     = GGML_OP_MOE_FFN_RANGE;
+    result->src[0] = up;
+    result->src[1] = gate;
+    result->src[2] = down;
+    result->src[3] = x;
+    result->src[4] = ids;
+    result->src[5] = weights;
+    result->src[6] = skip;
+
+    return result;
 }
 
 void ggml_mul_mat_id_set_skip(struct ggml_tensor * a, struct ggml_tensor * w) {
