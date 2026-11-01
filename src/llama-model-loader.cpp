@@ -676,8 +676,14 @@ llama_model_loader::llama_model_loader(
         // TEMP experiment (precision study): LLAMA_TENSOR_SOURCE=<first split of another GGUF of the same model> with
         // LLAMA_TENSOR_SOURCE_RE=<regex>: the tensors whose names match are read from that model instead, e.g. some
         // dense tensors at their original precision. Shapes must match; types may differ
-        if (const char * src = getenv("LLAMA_TENSOR_SOURCE")) {
-            const std::regex re(getenv("LLAMA_TENSOR_SOURCE_RE") ? getenv("LLAMA_TENSOR_SOURCE_RE") : "$^");
+        // LLAMA_TENSOR_SOURCE2 / LLAMA_TENSOR_SOURCE2_RE: a second source, applied after the first
+        for (const std::string var : { "LLAMA_TENSOR_SOURCE", "LLAMA_TENSOR_SOURCE2" }) {
+            const char * src = getenv(var.c_str());
+            if (!src) {
+                continue;
+            }
+            const char * re_env = getenv((var + "_RE").c_str());
+            const std::regex re(re_env ? re_env : "$^");
             std::vector<std::string> src_splits = { src };
             bool same_arch = true;
             {
@@ -703,7 +709,7 @@ llama_model_loader::llama_model_loader(
             size_t bytes_old = 0, bytes_new = 0;
             // only a few tensors are read from these files: map them without prefetch (populating a whole other
             // model would read it all from disk and push the main model out of the page cache)
-            n_files_prefetch = files.size();
+            n_files_prefetch = std::min(n_files_prefetch, files.size());
             for (const std::string & fname_src : src_splits) {
                 struct ggml_context * ctx_src = NULL;
                 gguf_init_params p = { /*.no_alloc = */ true, /*.ctx = */ &ctx_src };
