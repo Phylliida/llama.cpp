@@ -1851,6 +1851,7 @@ bool ggml_cuda_mul_mat_vec_q_moe_xm_supported(const ggml_tensor * src0, const gg
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_MXFP4:
             break;
         default:
             return false;
@@ -1903,6 +1904,7 @@ void ggml_cuda_mul_mat_vec_q_moe_xm(ggml_backend_cuda_context & ctx, const ggml_
         XM_CASE(GGML_TYPE_IQ2_XS)
         XM_CASE(GGML_TYPE_IQ2_S)
         XM_CASE(GGML_TYPE_IQ3_XXS)
+        XM_CASE(GGML_TYPE_MXFP4)
         default: GGML_ABORT("unsupported type");
     }
 #undef XM_CASE

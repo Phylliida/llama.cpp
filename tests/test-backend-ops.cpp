@@ -10369,7 +10369,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
-    for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {
+    for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0, GGML_TYPE_MXFP4}) {
         for (int mode : {1, 2}) {
             for (int n : {1, 2}) {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256));
