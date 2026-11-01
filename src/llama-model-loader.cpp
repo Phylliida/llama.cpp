@@ -693,6 +693,9 @@ llama_model_loader::llama_model_loader(
             }
             int n_replaced = 0;
             size_t bytes_old = 0, bytes_new = 0;
+            // only a few tensors are read from these files: map them without prefetch (populating a whole other
+            // model would read it all from disk and push the main model out of the page cache)
+            n_files_prefetch = files.size();
             for (const std::string & fname_src : src_splits) {
                 struct ggml_context * ctx_src = NULL;
                 gguf_init_params p = { /*.no_alloc = */ true, /*.ctx = */ &ctx_src };
@@ -1477,7 +1480,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const size_t prefetch_size = prefetch && use_mmap && idx < n_files_prefetch ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));

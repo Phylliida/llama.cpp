@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <set>
@@ -124,6 +125,7 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    size_t n_files_prefetch = SIZE_MAX; // files after this are mapped without prefetch (LLAMA_TENSOR_SOURCE files)
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
