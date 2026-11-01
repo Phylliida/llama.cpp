@@ -679,15 +679,23 @@ llama_model_loader::llama_model_loader(
         if (const char * src = getenv("LLAMA_TENSOR_SOURCE")) {
             const std::regex re(getenv("LLAMA_TENSOR_SOURCE_RE") ? getenv("LLAMA_TENSOR_SOURCE_RE") : "$^");
             std::vector<std::string> src_splits = { src };
+            bool same_arch = true;
             {
                 gguf_init_params p = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
                 gguf_context_ptr g { gguf_init_from_file(src, p) };
                 if (!g) {
                     throw std::runtime_error(format("%s: failed to load tensor source %s", __func__, src));
                 }
+                // only for models of the source's architecture (e.g. not a draft model loaded by the same process)
+                const int kid_arch = gguf_find_key(g.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str());
+                same_arch = kid_arch >= 0 && arch_name == gguf_get_val_str(g.get(), kid_arch);
+                if (!same_arch) {
+                    src_splits.clear();
+                    LLAMA_LOG_INFO("%s: tensor source %s skipped (architecture %s)\n", __func__, src, arch_name.c_str());
+                }
                 const int kid = gguf_find_key(g.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str());
                 const uint16_t n_src = kid < 0 ? 1 : gguf_get_val_u16(g.get(), kid);
-                if (n_src > 1) {
+                if (same_arch && n_src > 1) {
                     src_splits = llama_get_list_splits(src, 0, n_src);
                 }
             }
