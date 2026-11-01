@@ -1025,7 +1025,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // make a list of weights
     std::vector<const llama_model_loader::llama_tensor_weight *> tensors;
     tensors.reserve(ml.weights_map.size());
+    // TEMP experiment: LLAMA_QUANT_ONLY=<regex> writes only the matching tensors (an overlay for LLAMA_TENSOR_SOURCE,
+    // e.g. some dense tensors requantized from a higher-precision copy of the model)
+    const char * only_env = getenv("LLAMA_QUANT_ONLY");
+    const std::regex only_re(only_env ? only_env : "");
     for (const auto & it : ml.weights_map) {
+        if (only_env && !std::regex_search(it.first, only_re)) {
+            continue;
+        }
         const std::string remapped_name(remap_layer(it.first, prune_list, mapped, blk_id));
         if (remapped_name.empty()) {
             LLAMA_LOG_DEBUG("%s: pruning tensor %s\n", __func__, it.first.c_str());
