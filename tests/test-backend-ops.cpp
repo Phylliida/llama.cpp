@@ -11626,6 +11626,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TEMP: persistent IQ2_S/IQ3_XXS mat-vec (CUDA) at 1-4 columns, 1-4 y units per thread (k up to 16384)
+    for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+        for (int n = 1; n <= 4; ++n) {
+            for (int64_t k : {3584, 6144, 7168, 12288, 16384}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -11823,6 +11832,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{12288, 7168}, {6144, 7168}, {3584, 7168}, {7168, 3584}, {7168, 12288}, {7168, 6144}}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+    // TEMP K3 (dense-v2) decode: 1-4 tokens (a draft verify step is 3), {type, m, k} of the serial GPU path
+    struct k3_mv { ggml_type type; int64_t m, k; };
+    for (const k3_mv & c : std::vector<k3_mv>{
+            {GGML_TYPE_IQ2_S, 12288, 7168},   // KDA q/k/v
+            {GGML_TYPE_IQ3_XXS, 12288, 7168}, // MLA q
+            {GGML_TYPE_IQ3_XXS, 7168, 6144},  // shared expert down
+            {GGML_TYPE_Q5_K, 7168, 12288},    // attn_output (overlay)
+            {GGML_TYPE_Q6_K, 3584, 7168},     // latent projections (overlay)
+            {GGML_TYPE_Q6_K, 7168, 3584},
+            {GGML_TYPE_Q4_K, 6144, 7168},     // shared expert gate/up (overlay)
+            {GGML_TYPE_Q8_0, 896, 7168}}) {   // router (overlay)
+        for (int n = 1; n <= 4; ++n) {
+            test_cases.emplace_back(new test_mul_mat(c.type, GGML_TYPE_F32, c.m, n, c.k, {1, 1}, {1, 1}));
         }
     }
 
