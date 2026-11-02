@@ -4873,7 +4873,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 // TEMP per-op GPU profiler: GGML_CUDA_OP_PROFILE=1 together with GGML_CUDA_DISABLE_GRAPHS=1
 struct ggml_cuda_op_prof {
-    std::vector<cudaEvent_t> ev;
+    std::vector<cudaEvent_t> ev[GGML_CUDA_MAX_DEVICES]; // events belong to the device they were created on
     std::vector<std::string> keys;
     std::map<std::string, std::pair<double, long>> acc;
     ~ggml_cuda_op_prof() {
@@ -4887,7 +4887,7 @@ struct ggml_cuda_op_prof {
             tot += e.second.first;
         }
         fprintf(stderr, "op-prof: total %.3f ms\n", tot);
-        for (size_t i = 0; i < v.size() && i < 60; ++i) {
+        for (size_t i = 0; i < v.size() && i < 120; ++i) {
             fprintf(stderr, "op-prof: %10.3f ms %8ld calls %8.2f us/call  %s\n", v[i].second.first, v[i].second.second,
                     1000.0*v[i].second.first/v[i].second.second, v[i].first.c_str());
         }
@@ -5065,7 +5065,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // nodes reading host weights (GGML_TENSOR_FLAG_HOST_SRC, PCIe bound) and their dependents run on a
                 // second stream, so they overlap with the other (VRAM bound) work of the graph
-                if (host_src_stream && !is_concurrent_event_active) {
+                // (not with the op profiler: its events are recorded on the main stream)
+                if (host_src_stream && !is_concurrent_event_active && !ggml_cuda_op_prof_enabled()) {
                     // not the fused prompt-batch MoE: nothing to overlap with in its split, and on the main stream its
                     // temporaries share the main pool (each stream has its own)
                     bool side = (node->flags & GGML_TENSOR_FLAG_HOST_SRC) != 0 && node->op != GGML_OP_MOE_FFN_RANGE;
@@ -5088,13 +5089,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 size_t op_prof_idx = 0;
                 if (op_prof) {
                     op_prof_idx = g_op_prof.keys.size();
-                    if (g_op_prof.ev.size() <= op_prof_idx) {
+                    auto & ev = g_op_prof.ev[cuda_ctx->device];
+                    if (ev.size() <= op_prof_idx) {
                         cudaEvent_t e;
                         CUDA_CHECK(cudaEventCreate(&e));
-                        g_op_prof.ev.push_back(e);
+                        ev.push_back(e);
                     }
-                    CUDA_CHECK(cudaEventRecord(g_op_prof.ev[op_prof_idx], cuda_ctx->stream()));
-                    g_op_prof.keys.push_back(ggml_cuda_op_prof_key(node));
+                    CUDA_CHECK(cudaEventRecord(ev[op_prof_idx], cuda_ctx->stream()));
+                    g_op_prof.keys.push_back("d" + std::to_string(cuda_ctx->device) + " " + ggml_cuda_op_prof_key(node));
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
@@ -5147,16 +5149,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             if (ggml_cuda_op_prof_enabled() && !use_cuda_graph && !g_op_prof.keys.empty()) {
                 const size_t n = g_op_prof.keys.size();
-                if (g_op_prof.ev.size() <= n) {
+                auto & ev = g_op_prof.ev[cuda_ctx->device];
+                if (ev.size() <= n) {
                     cudaEvent_t e;
                     CUDA_CHECK(cudaEventCreate(&e));
-                    g_op_prof.ev.push_back(e);
+                    ev.push_back(e);
                 }
-                CUDA_CHECK(cudaEventRecord(g_op_prof.ev[n], cuda_ctx->stream()));
-                CUDA_CHECK(cudaEventSynchronize(g_op_prof.ev[n]));
+                CUDA_CHECK(cudaEventRecord(ev[n], cuda_ctx->stream()));
+                CUDA_CHECK(cudaEventSynchronize(ev[n]));
                 for (size_t k = 0; k < n; ++k) {
                     float ms = 0.0f;
-                    CUDA_CHECK(cudaEventElapsedTime(&ms, g_op_prof.ev[k], g_op_prof.ev[k + 1]));
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, ev[k], ev[k + 1]));
                     auto & a = g_op_prof.acc[g_op_prof.keys[k]];
                     a.first += ms;
                     a.second += 1;

@@ -1669,13 +1669,30 @@ static bool sched_timing_enabled() {
 static double sched_now_us() {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// per scheduler (e.g. the target model's and the draft's), plus the wall time inside and between compute calls
+struct sched_timing_set {
+    ggml_backend_sched_t sched = nullptr;
+    sched_timing tm[GGML_SCHED_MAX_BACKENDS];
+    long   calls  = 0;
+    double inside = 0, between = 0, t_end = 0;
+};
+static sched_timing_set * sched_timing_get(ggml_backend_sched_t sched) {
+    static sched_timing_set sets[4];
+    for (auto & s : sets) { if (s.sched == sched) { return &s; } }
+    for (auto & s : sets) { if (s.sched == nullptr) { s.sched = sched; return &s; } }
+    return &sets[3];
+}
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
-    static sched_timing tm[GGML_SCHED_MAX_BACKENDS];
-    static long tm_calls = 0;
     const bool timing = sched_timing_enabled();
+    sched_timing_set * ts = timing ? sched_timing_get(sched) : nullptr;
+    sched_timing * tm = timing ? ts->tm : nullptr;
+    const double t_call0 = timing ? sched_now_us() : 0;
+    if (timing && ts->t_end > 0) {
+        ts->between += t_call0 - ts->t_end;
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1938,14 +1955,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    if (timing && ++tm_calls % 32 == 0) {
+    if (timing) {
+        ts->t_end   = sched_now_us();
+        ts->inside += ts->t_end - t_call0;
+    }
+    // stderr: llama-server drops ggml INFO logs at its default verbosity
+    if (timing && ++ts->calls % 32 == 0) {
+        fprintf(stderr, "sched timing [%p, %d splits]: per call: inside %8.1f us, between calls %8.1f us\n",
+            (void *) sched, sched->n_splits, ts->inside / 32, ts->between / 32);
         for (int b = 0; b < sched->n_backends; b++) {
             if (tm[b].n == 0) continue;
-            GGML_LOG_INFO("sched timing: %-6s splits/call %5.1f | per call: copy %8.1f us, compute %8.1f us | per split: copy %6.1f us, compute %7.1f us\n",
+            fprintf(stderr, "sched timing: %-6s splits/call %5.1f | per call: copy %8.1f us, compute %8.1f us | per split: copy %6.1f us, compute %7.1f us\n",
                 ggml_backend_name(sched->backends[b]), (double) tm[b].n / 32,
                 tm[b].copy / 32, tm[b].compute / 32, tm[b].copy / tm[b].n, tm[b].compute / tm[b].n);
             tm[b] = sched_timing();
         }
+        ts->inside = ts->between = 0;
     }
 
     return GGML_STATUS_SUCCESS;
