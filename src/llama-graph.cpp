@@ -2168,11 +2168,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // LLAMA_MOE_SKIP_UNION=1: in a batch (e.g. speculative verify) an expert another token also selected is read
     // anyway, so only skip the low-weight experts no other token of the batch needs
     static const bool  skip_union  = getenv("LLAMA_MOE_SKIP_UNION") && atoi(getenv("LLAMA_MOE_SKIP_UNION")) != 0;
+    // LLAMA_MOE_SKIP_LAYERS=a-b:tau[,a-b:tau...]: a different tau for layers a..b (0 = no skip there); later ranges win
+    struct skip_range { int a, b; float tau; };
+    static const std::vector<skip_range> skip_ranges = [] {
+        std::vector<skip_range> r;
+        const char * s = getenv("LLAMA_MOE_SKIP_LAYERS");
+        int a, b, n; float t;
+        while (s && sscanf(s, "%d-%d:%f%n", &a, &b, &t, &n) == 3) {
+            r.push_back({a, b, t});
+            s += n;
+            s = *s == ',' ? s + 1 : nullptr;
+        }
+        return r;
+    }();
+    float tau = skip_tau;
+    for (const auto & r : skip_ranges) {
+        if (il >= r.a && il <= r.b) {
+            tau = r.tau;
+        }
+    }
     ggml_tensor * skip_w = nullptr;
-    if (skip_tau > 0.0f && norm_w && !weight_before_ffn) {
+    if (tau > 0.0f && norm_w && !weight_before_ffn) {
         ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
-        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -skip_tau));
+        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -tau));
         if (skip_union && n_tokens > 1) {
             // tokens per expert: scatter a one-hot selection mask [1, n_expert, n_tokens] and sum over tokens
             ggml_tensor * ones = ggml_fill(ctx0, weights, 1.0f);                                  // [1, n_used, n_tokens]
