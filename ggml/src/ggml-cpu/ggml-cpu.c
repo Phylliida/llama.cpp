@@ -1587,11 +1587,46 @@ static inline bool ggml_mmid_slot_skipped(const struct ggml_tensor * w, int id, 
     return w != NULL && *(const float *) ((const char *) w->data + id*w->nb[0] + t*w->nb[1]) == 0.0f;
 }
 
+// admit expert e to an expert cache (ggml_mul_mat_id_set_cache): victim = a slot the batch does not use, LRU (with
+// scores: lowest score, empty first, then LRU), lowest index; none: not admitted
+static void ggml_mmid_cache_admit(int32_t * state, int n_slots, const int32_t * score, int32_t e) {
+    int32_t * se = state;
+    int32_t * sa = state + n_slots;
+    const int32_t clock = state[2*n_slots];
+    int v = -1;
+    for (int s = 0; s < n_slots; ++s) {
+        if (sa[s] >= clock) {
+            continue;
+        }
+        if (v < 0) {
+            v = s;
+            continue;
+        }
+        if (score) {
+            const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
+            const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
+            if (cs != cv) {
+                v = cs < cv ? s : v;
+                continue;
+            }
+        }
+        if (sa[s] < sa[v]) {
+            v = s;
+        }
+    }
+    if (v >= 0) {
+        se[v] = e;
+        sa[v] = clock;
+    }
+}
+
 // experts taken by a split MUL_MAT_ID (ggml_mul_mat_id_set_split) over the batch, returns their number. With an expert
-// cache (ggml_mul_mat_id_set_cache, state = its I32 data, else NULL): the cached experts of the batch plus the first k
-// uncached ones, and the state is updated (the CUDA backend does the same, see mul_mat_id_cache_plan)
+// cache (ggml_mul_mat_id_set_cache, state = its I32 data, else NULL): the cached experts of the batch, the staged ones
+// (ggml_mul_mat_id_set_staged, else NULL) and the first k others, and the state is updated (the CUDA backend does the
+// same, see mul_mat_id_cache_plan)
 static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct ggml_tensor * skip_w, int k, int e0, int e1,
-        int32_t * state, int n_slots, int32_t * score, int n_as, int32_t * taken) {
+        int32_t * state, int n_slots, int32_t * score, int n_as, const struct ggml_tensor * staged, bool admit_staged,
+        int32_t * taken) {
     enum { MAX_SLOTS = 1024 };
     const int n_ids = ids->ne[0];
     GGML_ASSERT(n_ids*ids->ne[1] <= MAX_SLOTS);
@@ -1632,6 +1667,20 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
             }
         }
     }
+    // staged experts (ggml_mul_mat_id_set_staged) the batch selects: taken, not ranked; admitted if the node says so
+    for (int64_t p = 0; staged && p < ggml_nelements(staged); ++p) {
+        const int32_t e = ((const int32_t *) staged->data)[p];
+        for (int u = 0; e >= 0 && u < nu; ++u) {
+            if (uc[u] > 0 && ue[u] == e) {
+                taken[n++] = e;
+                uc[u] = 0;
+                if (state && admit_staged) {
+                    ggml_mmid_cache_admit(state, n_slots, score, e);
+                }
+                break;
+            }
+        }
+    }
     // the first k uncached by (score,) count (descending), ties by first occurrence
     for (int r = 0; r < k; ++r) {
         int best = -1;
@@ -1646,32 +1695,7 @@ static int ggml_mmid_split_taken(const struct ggml_tensor * ids, const struct gg
         taken[n++] = ue[best];
         uc[best] = 0;
         if (state) {
-            // victim: a slot the batch does not use, LRU (with scores: lowest score, empty first, then LRU), lowest index
-            int v = -1;
-            for (int s = 0; s < n_slots; ++s) {
-                if (sa[s] >= clock) {
-                    continue;
-                }
-                if (v < 0) {
-                    v = s;
-                    continue;
-                }
-                if (score) {
-                    const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
-                    const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
-                    if (cs != cv) {
-                        v = cs < cv ? s : v;
-                        continue;
-                    }
-                }
-                if (sa[s] < sa[v]) {
-                    v = s;
-                }
-            }
-            if (v >= 0) {
-                se[v] = ue[best];
-                sa[v] = clock;
-            }
+            ggml_mmid_cache_admit(state, n_slots, score, ue[best]);
         }
     }
     if (state) {
@@ -1760,6 +1784,7 @@ static int64_t g_fused_calls, g_fused_slots, g_fused_skipped, g_fused_gpu, g_fus
 static int64_t g_mmid_slots_total;
 static int64_t g_mmid_slots_skipped;
 static int64_t g_mmid_calls;     // down projections seen, and the experts they read (batch union)
+static int64_t g_pf_calls, g_pf_listed, g_pf_used; // TEMP: decode gate/up calls with staged experts, listed / used
 static int64_t g_mmid_experts;
 
 // GGML_MMID_DYN=0 disables the pooled decode path in mul_mat_id (A/B testing)
@@ -2118,7 +2143,7 @@ static void ggml_compute_forward_mul_mat_id(
             const struct ggml_tensor * sc = dst->src[6];
             n_taken = ggml_mmid_split_taken(ids, skip_w, split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
-                sc ? (int32_t *) sc->data : NULL, (int) src0->ne[2], taken);
+                sc ? (int32_t *) sc->data : NULL, (int) src0->ne[2], dst->src[7], ggml_get_op_params_i32(dst, 12) != 0, taken);
             const int32_t split_k2 = ggml_get_op_params_i32(dst, 8);
             if (split_k2 > 0) {
                 n_taken2 = ggml_mmid_split_taken2(ids, skip_w, split_k2, ggml_get_op_params_i32(dst, 9),
@@ -2310,6 +2335,80 @@ static const void * ggml_moe_ffn_range_conv(const struct ggml_tensor * t, const 
     }
     type_traits_cpu[vdt].from_float(x, q, n);
     return q;
+}
+
+// ggml_moe_prefetch_plan / ggml_moe_prefetch_copy (the CPU reads expert weights in place: a reference implementation)
+static void ggml_compute_forward_moe_prefetch(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 0) == 0) {
+        const struct ggml_tensor * scores = dst->src[0];
+        const struct ggml_tensor * ids    = dst->src[1];
+        const int32_t * state   = (const int32_t *) dst->src[2]->data;
+        const int       n_slots = (int) (ggml_nelements(dst->src[2])/2);
+        const int       e0      = ggml_get_op_params_i32(dst, 1);
+        const int       e1      = ggml_get_op_params_i32(dst, 2);
+        const int       n_list  = (int) ggml_nelements(dst);
+        int32_t * list = (int32_t *) dst->data;
+        enum { MAX_SLOTS = 1024 };
+        // predicted experts (eligible, uncached) in order of first occurrence, tokens predicting them, summed score
+        int32_t ue[MAX_SLOTS];
+        int32_t uc[MAX_SLOTS];
+        float   us[MAX_SLOTS];
+        int     nu = 0;
+        for (int64_t t = 0; t < ids->ne[1]; ++t) {
+            for (int64_t j = 0; j < ids->ne[0]; ++j) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+                bool cached = false;
+                for (int s = 0; s < n_slots && !cached; ++s) {
+                    cached = state[s] == e;
+                }
+                if (e < e0 || e >= e1 || cached) {
+                    continue;
+                }
+                int u = 0;
+                while (u < nu && ue[u] != e) {
+                    u++;
+                }
+                if (u == nu) {
+                    ue[nu]   = e;
+                    uc[nu]   = 0;
+                    us[nu++] = 0.0f;
+                }
+                uc[u]++;
+                us[u] += *(const float *) ((const char *) scores->data + t*scores->nb[1] + e*scores->nb[0]);
+            }
+        }
+        for (int r = 0; r < n_list; ++r) {
+            int best = -1;
+            for (int u = 0; u < nu; ++u) {
+                if (uc[u] > 0 && (best < 0 || uc[u] > uc[best] || (uc[u] == uc[best] &&
+                        (us[u] > us[best] || (us[u] == us[best] && ue[u] < ue[best]))))) {
+                    best = u;
+                }
+            }
+            list[r] = best >= 0 ? ue[best] : -1;
+            if (best >= 0) {
+                uc[best] = 0;
+            }
+        }
+    } else {
+        const int32_t * list = (const int32_t *) dst->src[0]->data;
+        const int64_t n_list = ggml_nelements(dst->src[0]);
+        char * out = (char *) dst->data;
+        for (int m = 0; m < 3; ++m) {
+            const struct ggml_tensor * w = dst->src[1 + m];
+            for (int64_t p = 0; p < n_list; ++p) {
+                if (list[p] >= 0) {
+                    memcpy(out + p*w->nb[2], (const char *) w->data + list[p]*w->nb[2], w->nb[2]);
+                }
+            }
+            out += n_list*w->nb[2];
+        }
+    }
 }
 
 static void ggml_compute_forward_moe_ffn_range(
@@ -2523,6 +2622,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MOE_FFN_RANGE:
             {
                 ggml_compute_forward_moe_ffn_range(params, tensor);
+            } break;
+        case GGML_OP_MOE_PREFETCH:
+            {
+                ggml_compute_forward_moe_prefetch(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -3035,6 +3138,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TRANSPOSE:
         case GGML_OP_GET_ROWS_BACK:
         case GGML_OP_DIAG:
+        case GGML_OP_MOE_PREFETCH:
             {
                 n_tasks = 1;
             } break;
@@ -3810,7 +3914,7 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
             const struct ggml_tensor * sc = gate->src[6];
             n_taken = ggml_mmid_split_taken(ids, gate->src[3], split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
-                sc ? (int32_t *) sc->data : NULL, (int) gate->src[0]->ne[2], taken);
+                sc ? (int32_t *) sc->data : NULL, (int) gate->src[0]->ne[2], gate->src[7], ggml_get_op_params_i32(gate, 12) != 0, taken);
             const int32_t split_k2 = ggml_get_op_params_i32(gate, 8);
             if (split_k2 > 0) {
                 n_taken2 = ggml_mmid_split_taken2(ids, gate->src[3], split_k2, ggml_get_op_params_i32(gate, 9),
@@ -3823,7 +3927,7 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                 const struct ggml_tensor * sc_up = up->src[6];
                 const int n_up = ggml_mmid_split_taken(ids, up->src[3], split_k, split_e0, split_e1,
                     (int32_t *) cs_up->data, (int) (ggml_nelements(cs_up)/2),
-                    sc_up ? (int32_t *) sc_up->data : NULL, (int) up->src[0]->ne[2], taken_up);
+                    sc_up ? (int32_t *) sc_up->data : NULL, (int) up->src[0]->ne[2], up->src[7], ggml_get_op_params_i32(up, 12) != 0, taken_up);
                 GGML_ASSERT(n_up == n_taken);
             }
         }
@@ -3844,6 +3948,14 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                 }
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+        if (gate->src[7]) {
+            g_pf_calls++;
+            for (int64_t p = 0; p < ggml_nelements(gate->src[7]); ++p) {
+                const int32_t e = ((const int32_t *) gate->src[7]->data)[p];
+                g_pf_listed += e >= 0;
+                g_pf_used   += e >= 0 && ggml_mmid_is_taken(taken, n_taken, e);
             }
         }
         if (ids->ne[1] <= 4) {
@@ -4032,12 +4144,18 @@ static void ggml_cpu_prof_print(void) {
                 100.0*g_mmid_slots_skipped/g_mmid_slots_total, 16.0*(1.0 - (double) g_mmid_slots_skipped/g_mmid_slots_total));
         fprintf(stderr, "cpu-prof: moe down calls %lld, experts read per call %.2f\n",
                 (long long) g_mmid_calls, g_mmid_calls ? (double) g_mmid_experts/g_mmid_calls : 0.0);
+
     }
     if (g_fused_calls > 0) {
         fprintf(stderr, "cpu-prof: decode gate/up calls %lld: per call %.2f slots, %.2f skipped, %.2f on GPU, %.2f experts read\n",
                 (long long) g_fused_calls, (double) g_fused_slots/g_fused_calls, (double) g_fused_skipped/g_fused_calls,
                 (double) g_fused_gpu/g_fused_calls, (double) g_fused_experts/g_fused_calls);
         g_fused_calls = g_fused_slots = g_fused_skipped = g_fused_gpu = g_fused_experts = 0;
+    }
+    if (g_pf_calls > 0) {
+        fprintf(stderr, "cpu-prof: staged experts per decode gate/up call (%lld calls): listed %.2f, used %.2f\n",
+                (long long) g_pf_calls, (double) g_pf_listed/g_pf_calls, (double) g_pf_used/g_pf_calls);
+        g_pf_calls = g_pf_listed = g_pf_used = 0;
     }
     for (int i = 0; i < GGML_OP_COUNT + 2; ++i) {
         if (g_cpu_prof_n[i] == 0) continue;

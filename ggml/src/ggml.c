@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MOE_FFN_RANGE",
+    "MOE_PREFETCH",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,9 +1219,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "moe_ffn_range(x)",
+    "moe_prefetch(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3489,6 +3491,81 @@ void ggml_mul_mat_id_set_cache_score(struct ggml_tensor * a, struct ggml_tensor 
     GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID && a->src[4]);
     GGML_ASSERT(score->type == GGML_TYPE_I32 && ggml_is_contiguous(score) && ggml_nelements(score) == a->src[0]->ne[2]);
     a->src[6] = score;
+}
+
+struct ggml_tensor * ggml_moe_prefetch_plan(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * list,
+        int                   e0,
+        int                   e1,
+        int                   slot) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && scores->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == scores->ne[1] && ids->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(ids->ne[0]*ids->ne[1] <= 1024 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(state->type == GGML_TYPE_I32 && ggml_is_contiguous(state) && ggml_nelements(state) % 2 == 1);
+    GGML_ASSERT(list->type == GGML_TYPE_I32 && ggml_is_contiguous(list) && ggml_nelements(list) <= 32);
+    GGML_ASSERT(0 <= e0 && e0 <= e1 && e1 <= scores->ne[0] && slot >= 0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, list);
+
+    ggml_set_op_params_i32(result, 0, 0); // mode: plan
+    ggml_set_op_params_i32(result, 1, e0);
+    ggml_set_op_params_i32(result, 2, e1);
+    ggml_set_op_params_i32(result, 3, slot);
+
+    result->op     = GGML_OP_MOE_PREFETCH;
+    result->src[0] = scores;
+    result->src[1] = ids;
+    result->src[2] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_prefetch_copy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * list,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * down,
+        struct ggml_tensor  * staging,
+        int                   slot) {
+    GGML_ASSERT(list->type == GGML_TYPE_I32 && ggml_is_contiguous(list));
+    GGML_ASSERT(up->ne[2] == gate->ne[2] && up->ne[2] == down->ne[2]);
+    GGML_ASSERT(ggml_is_contiguous(staging));
+    const int64_t n_list = ggml_nelements(list);
+    GGML_ASSERT(ggml_nbytes(staging) >= (size_t) n_list*(up->nb[2] + gate->nb[2] + down->nb[2]));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, staging);
+
+    ggml_set_op_params_i32(result, 0, 1); // mode: copy
+    ggml_set_op_params_i32(result, 1, slot);
+
+    result->op     = GGML_OP_MOE_PREFETCH;
+    if (slot >= 0) {
+        result->flags |= GGML_TENSOR_FLAG_PREFETCH;
+    }
+    result->src[0] = list;
+    result->src[1] = up;
+    result->src[2] = gate;
+    result->src[3] = down;
+
+    return result;
+}
+
+void ggml_mul_mat_id_set_staged(struct ggml_tensor * a, struct ggml_tensor * list, struct ggml_tensor * staging, int slot,
+        bool admit) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID && a->src[4]);
+    GGML_ASSERT(list->type == GGML_TYPE_I32 && ggml_is_contiguous(list));
+    GGML_ASSERT(!staging || ggml_nbytes(staging) >= (size_t) ggml_nelements(list)*a->src[0]->nb[2]);
+    GGML_ASSERT(slot >= -1);
+    // src 7-8, op_params 11: slot + 1 (0: none), 12: admit
+    a->src[7] = list;
+    a->src[8] = staging;
+    ggml_set_op_params_i32(a, 11, slot + 1);
+    ggml_set_op_params_i32(a, 12, admit ? 1 : 0);
 }
 
 struct ggml_tensor * ggml_mul_mat_id(

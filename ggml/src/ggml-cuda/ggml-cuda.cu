@@ -2038,16 +2038,50 @@ static __global__ void mul_mat_id_gather_experts(const int4 * src, int4 * dst, c
 // the cache of the r-th taken expert (-1 past the last, r < n_out), slots[r*n_tokens + t] = slot of token t for it or -1,
 // fill_e[c]/fill_s[c] (c < k) = expert to copy from src0 into weight slot fill_s[c] (-1: none)
 // taken_out (optional, per slot): the expert if this share takes the slot, else -1 (for the second share of a split)
+// victim for admitting an expert to the cache (same rule as ggml_mmid_cache_admit, ggml-cpu.c): a slot the batch does not
+// use (last use < clock), LRU (with scores: lowest score, empty first, then LRU), lowest index; -1: none
+static __device__ int mul_mat_id_cache_victim(const int32_t * se, const int32_t * sa, const int n_slots, const int32_t clock,
+        const int32_t * score) {
+    int v = -1;
+    for (int s = 0; s < n_slots; ++s) {
+        if (sa[s] >= clock) {
+            continue;
+        }
+        if (v < 0) {
+            v = s;
+            continue;
+        }
+        if (score) {
+            const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
+            const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
+            if (cs != cv) {
+                v = cs < cv ? s : v;
+                continue;
+            }
+        }
+        if (sa[s] < sa[v]) {
+            v = s;
+        }
+    }
+    return v;
+}
+
+// staged (optional, ggml_mul_mat_id_set_staged): experts in staging (-1: none), taken after the hits:
+// pws[p] = p if the batch uses staged[p] (else -1), pslots[p*n_tokens + t] = slot of token t for it or -1; with
+// admit_staged a used one is admitted to the cache: pfill[p] = its cache slot (copy it there from staging) or -1
 static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
         const int n_tokens, const int k, const int e0, const int e1, const char * skip_w, const size_t wnb0, const size_t wnb1,
         int32_t * state, const int n_slots, int32_t * score, const int n_as, const int n_out, int32_t * wslot, int32_t * slots,
-        int32_t * fill_e, int32_t * fill_s, int32_t * taken_out = nullptr) {
+        int32_t * fill_e, int32_t * fill_s, int32_t * taken_out = nullptr,
+        const int32_t * staged = nullptr, const int n_staged = 0, int32_t * pws = nullptr, int32_t * pslots = nullptr,
+        const bool admit_staged = false, int32_t * pfill = nullptr) {
     __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
     __shared__ int32_t s_cnt[1024];  // at an uncached expert's first slot: tokens selecting it, else 0
     __shared__ int32_t s_all[1024];  // at an expert's first slot: tokens selecting it (score update), else 0
     __shared__ int32_t s_hit[1024];  // at an expert's first slot: its cache slot, else -1
     __shared__ int32_t s_rank[1024]; // at a taken expert's first slot: output index, else -1
     __shared__ int32_t s_ws[1024];   // at a taken expert's first slot: weight slot
+    __shared__ int32_t s_pr[1024];   // at a staged expert's first slot: its staging slot, else -1
     const int n = n_ids*n_tokens;
     const int i = threadIdx.x;
     const int t = i / n_ids;
@@ -2067,6 +2101,15 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
     for (int c = i; c < k; c += blockDim.x) {
         fill_e[c] = -1;
         fill_s[c] = -1;
+    }
+    for (int c = i; c < n_staged; c += blockDim.x) {
+        pws[c] = -1;
+        if (pfill) {
+            pfill[c] = -1;
+        }
+    }
+    for (int c = i; c < n_staged*n_tokens; c += blockDim.x) {
+        pslots[c] = -1;
     }
     __syncthreads();
 
@@ -2092,6 +2135,7 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
         s_cnt[i]  = first == i && hit < 0 ? cnt : 0;
         s_all[i]  = first == i ? cnt : 0;
         s_rank[i] = -1;
+        s_pr[i]   = -1;
     }
     __syncthreads();
 
@@ -2108,6 +2152,24 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
                 s_ws[u]   = s_hit[u];
             }
         }
+        for (int p = 0; p < n_staged; ++p) {
+            const int32_t e = staged[p];
+            for (int u = 0; e >= 0 && u < n; ++u) {
+                if (s_cnt[u] > 0 && s_e[u] == e) {
+                    s_cnt[u] = 0;
+                    s_pr[u]  = p;
+                    if (admit_staged) {
+                        const int v = mul_mat_id_cache_victim(se, sa, n_slots, clock, score);
+                        if (v >= 0) {
+                            se[v] = e;
+                            sa[v] = clock;
+                        }
+                        pfill[p] = v;
+                    }
+                    break;
+                }
+            }
+        }
         for (int c = 0; c < k; ++c) {
             int best = -1;
             for (int u = 0; u < n; ++u) {
@@ -2120,27 +2182,7 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
                 break;
             }
             s_cnt[best] = 0;
-            int v = -1;
-            for (int s = 0; s < n_slots; ++s) {
-                if (sa[s] >= clock) {
-                    continue;
-                }
-                if (v < 0) {
-                    v = s;
-                    continue;
-                }
-                if (score) {
-                    const int32_t cs = se[s] < 0 ? -1 : score[se[s]];
-                    const int32_t cv = se[v] < 0 ? -1 : score[se[v]];
-                    if (cs != cv) {
-                        v = cs < cv ? s : v;
-                        continue;
-                    }
-                }
-                if (sa[s] < sa[v]) {
-                    v = s;
-                }
-            }
+            const int v = mul_mat_id_cache_victim(se, sa, n_slots, clock, score);
             if (v >= 0) {
                 se[v] = s_e[best];
                 sa[v] = clock;
@@ -2172,8 +2214,15 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
         }
         slots[r*n_tokens + t] = j;
     }
+    if (i < n && first >= 0 && s_pr[first] >= 0) {
+        const int p = s_pr[first];
+        if (first == i) {
+            pws[p] = p;
+        }
+        pslots[p*n_tokens + t] = j;
+    }
     if (taken_out && i < n) {
-        taken_out[i] = first >= 0 && s_rank[first] >= 0 ? s_e[i] : -1;
+        taken_out[i] = first >= 0 && (s_rank[first] >= 0 || s_pr[first] >= 0) ? s_e[i] : -1;
     }
 }
 
@@ -2186,6 +2235,19 @@ static __global__ void mul_mat_id_cache_fill(const int4 * src, int4 * cache, con
     }
     const int4 * s = src   + e*n16_per_expert;
     int4       * d = cache + fill_s[blockIdx.y]*n16_per_expert;
+    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n16_per_expert; i += (int64_t) gridDim.x*blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
+// staged experts admitted by mul_mat_id_cache_plan: copy staging slot p into cache slot pfill[p] (VRAM to VRAM)
+static __global__ void mul_mat_id_cache_admit(const int4 * staging, int4 * cache, const int32_t * pfill, const int64_t n16_per_expert) {
+    const int32_t v = pfill[blockIdx.y];
+    if (v < 0) {
+        return;
+    }
+    const int4 * s = staging + blockIdx.y*n16_per_expert;
+    int4       * d = cache   + v*n16_per_expert;
     for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n16_per_expert; i += (int64_t) gridDim.x*blockDim.x) {
         d[i] = s[i];
     }
@@ -2469,6 +2531,442 @@ static void ggml_cuda_moe_ffn_range(ggml_backend_cuda_context & ctx, ggml_tensor
     }
 }
 
+// cross-layer expert prefetch (ggml_moe_prefetch_plan / _copy, ggml_mul_mat_id_set_staged). The copy's split is never
+// captured in a CUDA graph and the copy runs on a stream of its own, so it overlaps the next layers' splits: it waits for
+// the split of its plan (an event recorded after that split, see ggml_backend_cuda_graph_compute), and the consumers
+// wait for the copy (an external event node in their captured graph)
+#define GGML_CUDA_PF_MAX_SLOTS 8
+struct ggml_cuda_pf_sync {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  plan[GGML_CUDA_PF_MAX_SLOTS] = {};
+    cudaEvent_t  copy[GGML_CUDA_PF_MAX_SLOTS] = {};
+};
+
+// the current device must be `device`
+static ggml_cuda_pf_sync & ggml_cuda_pf(const int device) {
+    static ggml_cuda_pf_sync pf[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_pf_sync & p = pf[device];
+    if (p.stream == nullptr) {
+        // high priority: its few blocks start without waiting for the big grids of the main stream
+        int lo, hi;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&p.stream, cudaStreamNonBlocking, hi));
+        for (int i = 0; i < GGML_CUDA_PF_MAX_SLOTS; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&p.plan[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&p.copy[i], cudaEventDisableTiming));
+        }
+    }
+    return p;
+}
+
+// ggml_moe_prefetch_plan: one block with a thread per predicted slot (ids [k, n_tokens]); same order as the CPU (tokens
+// predicting an expert, then its score summed in token order, then the lower id)
+static __global__ void moe_prefetch_plan_kernel(const char * scores, const size_t snb0, const size_t snb1, const char * ids,
+        const size_t inb0, const size_t inb1, const int k, const int n_tokens, const int32_t * state, const int n_slots,
+        const int e0, const int e1, int32_t * list, const int n_list) {
+    __shared__ int32_t s_e[1024];   // predicted expert if eligible and uncached, else -1
+    __shared__ int32_t s_cnt[1024]; // at an expert's first slot: tokens predicting it, else 0
+    __shared__ float   s_sum[1024]; // at an expert's first slot: its summed score
+    const int n = k*n_tokens;
+    const int i = threadIdx.x;
+    if (i < n) {
+        const int32_t e = *(const int32_t *) (ids + (i / k)*inb1 + (i % k)*inb0);
+        bool ok = e >= e0 && e < e1;
+        for (int s = 0; ok && s < n_slots; ++s) {
+            ok = state[s] != e;
+        }
+        s_e[i] = ok ? e : -1;
+    }
+    for (int c = i; c < n_list; c += blockDim.x) {
+        list[c] = -1;
+    }
+    __syncthreads();
+    if (i < n) {
+        int   cnt   = 0;
+        int   first = -1;
+        float sum   = 0.0f;
+        if (s_e[i] >= 0) {
+            for (int i2 = 0; i2 < n; ++i2) {
+                if (s_e[i2] == s_e[i]) {
+                    first = first < 0 ? i2 : first;
+                    cnt++;
+                    sum += *(const float *) (scores + (i2 / k)*snb1 + s_e[i]*snb0);
+                }
+            }
+        }
+        s_cnt[i] = first == i ? cnt : 0;
+        s_sum[i] = sum;
+    }
+    __syncthreads();
+    if (i < n && s_cnt[i] > 0) {
+        int rank = 0;
+        for (int i2 = 0; i2 < n; ++i2) {
+            rank += s_cnt[i2] > 0 && (s_cnt[i2] > s_cnt[i] || (s_cnt[i2] == s_cnt[i] &&
+                (s_sum[i2] > s_sum[i] || (s_sum[i2] == s_sum[i] && s_e[i2] < s_e[i]))));
+        }
+        if (rank < n_list) {
+            list[rank] = s_e[i];
+        }
+    }
+}
+
+struct moe_prefetch_copy_args {
+    const char * src[3]; // up, gate, down expert matrices (host memory: read over PCIe)
+    int64_t      nb2[3]; // bytes per expert
+    int64_t      off[3]; // offset of each part in staging
+};
+
+// ggml_moe_prefetch_copy: grid (bx, 3*n_list), slice blockIdx.y = m*n_list + p (matrix m, list slot p), 16 byte loads
+// with 4 in flight per thread (a few blocks per slice reach the full PCIe rate)
+static __global__ void moe_prefetch_copy_kernel(const moe_prefetch_copy_args a, const int32_t * list, const int n_list,
+        char * staging) {
+    const int     m = blockIdx.y / n_list;
+    const int     p = blockIdx.y % n_list;
+    const int32_t e = list[p];
+    if (e < 0) {
+        return;
+    }
+    const int4 * src = (const int4 *) (a.src[m] + e*a.nb2[m]);
+    int4       * dst = (int4 *) (staging + a.off[m] + p*a.nb2[m]);
+    const int64_t n16 = a.nb2[m]/16;
+    constexpr int U = 4;
+    for (int64_t i0 = (int64_t) blockIdx.x*blockDim.x*U + threadIdx.x; i0 < n16; i0 += (int64_t) gridDim.x*blockDim.x*U) {
+        int4 v[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int64_t i = i0 + u*blockDim.x;
+            if (i < n16) {
+                v[u] = src[i];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int64_t i = i0 + u*blockDim.x;
+            if (i < n16) {
+                dst[i] = v[u];
+            }
+        }
+    }
+}
+
+// TEMP (GGML_CUDA_PF_TIMING=1): GPU timestamps per layer: [0] copy start, [1] copy end, [2 + 2m] consumer m (up, gate,
+// down) before its wait for the copy, [3 + 2m] after it; averaged and printed every 256 copies of layer 10
+static bool ggml_cuda_pf_timing() {
+    static const bool t = getenv("GGML_CUDA_PF_TIMING") && atoi(getenv("GGML_CUDA_PF_TIMING")) != 0;
+    return t;
+}
+static __global__ void ggml_cuda_pf_ts_kernel(uint64_t * p) {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *p = t;
+}
+static uint64_t * ggml_cuda_pf_ts(int device) {
+    static uint64_t * ts[GGML_CUDA_MAX_DEVICES] = {};
+    if (!ts[device]) {
+        CUDA_CHECK(cudaMalloc(&ts[device], 256*8*sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(ts[device], 0, 256*8*sizeof(uint64_t)));
+    }
+    return ts[device];
+}
+static int ggml_cuda_pf_layer(const char * name) {
+    const char * d = strrchr(name, '-');
+    return d ? atoi(d + 1) : -1;
+}
+static void ggml_cuda_pf_timing_report(int device, int il) {
+    static double acc[GGML_CUDA_MAX_DEVICES][6];
+    static int    n[GGML_CUDA_MAX_DEVICES], calls[GGML_CUDA_MAX_DEVICES];
+    if (++calls[device] % 4 != 0) {
+        return;
+    }
+    // a consistent sample: the copy of this layer from a previous step is long done (we are 2 layers before it)
+    uint64_t t[256*8];
+    CUDA_CHECK(cudaMemcpy(t, ggml_cuda_pf_ts(device), sizeof(t), cudaMemcpyDeviceToHost));
+    for (int l = 0; l < 256; ++l) {
+        const uint64_t * r = t + 8*l;
+        if (l == il + 1 || l == il || r[0] == 0 || r[1] < r[0] || r[2] < r[0] || r[3] < r[2] || r[2] - r[0] > 50000000) {
+            continue; // in flight, never seen, or from different steps
+        }
+        acc[device][0] += (r[1] - r[0])*1e-3;                      // copy duration
+        acc[device][1] += ((double) r[2] - (double) r[1])*1e-3;    // slack: consumer arrival - copy end
+        acc[device][2] += (r[3] - r[2])*1e-3;                      // wait of the first consumer
+        acc[device][3] += (r[2] - r[0])*1e-3;                      // copy start -> consumer
+        acc[device][4] += r[2] < r[1] ? 1.0 : 0.0;                 // consumer waited
+        n[device]++;
+    }
+    if (calls[device] % 256 == 0 && n[device] > 0) {
+        fprintf(stderr, "pf timing dev %d (%d layer samples): copy %.0f us, slack %.0f us, wait %.0f us, copy start -> use %.0f us, "
+            "late %.0f%%\n", device, n[device], acc[device][0]/n[device], acc[device][1]/n[device], acc[device][2]/n[device],
+            acc[device][3]/n[device], 100.0*acc[device][4]/n[device]);
+        memset(acc[device], 0, sizeof(acc[device]));
+        n[device] = 0;
+    }
+}
+
+// abortable in-order copy (slot -1, GGML_CUDA_PF_ABORT=1 default): it fills the time the GPU would otherwise idle while
+// the CPU computes the experts, and stops when the next split needs the GPU: ggml_backend_cuda_synchronize (the scheduler
+// waits for the GPU before it copies the CPU's results in) bumps an epoch in pinned host memory first. Experts are copied
+// in list order, each by all blocks; a block checks the epoch before each expert. Experts not completed by every block
+// are removed from the list (-1), which the consumers (GPU and CPU) read afterwards
+struct ggml_cuda_pf_abort_state {
+    int * stop  = nullptr; // pinned host memory, mapped: the epoch
+    int * state = nullptr; // device: [0] epoch at the copy's start, [1 + p] blocks done with expert p
+};
+static ggml_cuda_pf_abort_state * g_pf_abort[GGML_CUDA_MAX_DEVICES] = {};
+
+// GGML_CUDA_PF_ABORT: 1 (default), 0 = plain in-order copy, 2 = the abortable kernels but never stopped (tests: a
+// synchronize while a graph runs would stop copies, which the CPU reference does not)
+static int ggml_cuda_pf_abort_mode() {
+    static const int a = getenv("GGML_CUDA_PF_ABORT") ? atoi(getenv("GGML_CUDA_PF_ABORT")) : 1;
+    return a;
+}
+static bool ggml_cuda_pf_abortable() {
+    return ggml_cuda_pf_abort_mode() != 0;
+}
+
+// the current device must be `device`
+static ggml_cuda_pf_abort_state & ggml_cuda_pf_abort(const int device) {
+    if (!g_pf_abort[device]) {
+        ggml_cuda_pf_abort_state * a = new ggml_cuda_pf_abort_state;
+        CUDA_CHECK(cudaHostAlloc((void **) &a->stop, 64, cudaHostAllocMapped));
+        *(volatile int *) a->stop = 0;
+        CUDA_CHECK(cudaMalloc(&a->state, 64*sizeof(int)));
+        g_pf_abort[device] = a;
+    }
+    return *g_pf_abort[device];
+}
+
+// the GPU is needed now: stop an in-order prefetch copy
+static void ggml_cuda_pf_stop(const int device) {
+    if (g_pf_abort[device] && ggml_cuda_pf_abort_mode() == 1) {
+        volatile int * stop = g_pf_abort[device]->stop;
+        *stop = *stop + 1;
+    }
+}
+
+static __global__ void moe_prefetch_begin_kernel(const volatile int * stop, int * state, const int n_list) {
+    if (threadIdx.x == 0) {
+        state[0] = *stop;
+        *(unsigned long long *) (state + 62) = 0;
+    }
+    for (int p = threadIdx.x; p < n_list; p += blockDim.x) {
+        state[1 + p] = 0;
+    }
+}
+
+// grid (bx, 3): blockIdx.y = matrix (up, gate, down), the bx blocks split each expert's slice. The stop is checked before
+// each expert and every 4 iterations within it (~64 KiB per block); every barrier is reached by all threads of a block
+// (block-uniform loop bounds, the flag copied to a register between two barriers)
+static __global__ void moe_prefetch_copy_abortable_kernel(const moe_prefetch_copy_args a, const int32_t * list, const int n_list,
+        char * staging, const volatile int * stop, int * state) {
+    __shared__ int s_go;
+    const int     m      = blockIdx.y;
+    const int64_t n16    = a.nb2[m]/16;
+    constexpr int U = 4;
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x*U;
+    auto check = [&]() {
+        if (threadIdx.x == 0) {
+            s_go = *stop == state[0];
+            if (!s_go) {
+                uint64_t t;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                atomicCAS((unsigned long long *) (state + 62), 0ull, (unsigned long long) t); // TEMP timing: first stop seen
+            }
+        }
+        __syncthreads();
+        const bool go = s_go;
+        __syncthreads();
+        return go;
+    };
+    for (int p = 0; p < n_list; ++p) {
+        const int32_t e = list[p];
+        if (e < 0 || !check()) {
+            break;
+        }
+        const int4 * src = (const int4 *) (a.src[m] + e*a.nb2[m]);
+        int4       * dst = (int4 *) (staging + a.off[m] + p*a.nb2[m]);
+        bool go = true;
+        int  it = 0;
+        for (int64_t b0 = (int64_t) blockIdx.x*blockDim.x*U; b0 < n16; b0 += stride) {
+            if (++it % 4 == 0 && !check()) {
+                go = false;
+                break;
+            }
+            int4 v[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int64_t i = b0 + u*blockDim.x + threadIdx.x;
+                if (i < n16) {
+                    v[u] = src[i];
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int64_t i = b0 + u*blockDim.x + threadIdx.x;
+                if (i < n16) {
+                    dst[i] = v[u];
+                }
+            }
+        }
+        if (!go) {
+            break;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence();
+            atomicAdd(&state[1 + p], 1);
+        }
+    }
+}
+
+static __global__ void moe_prefetch_end_kernel(int32_t * list, const int n_list, const int * state, const int n_blocks,
+        uint64_t * ts = nullptr) {
+    for (int p = threadIdx.x; p < n_list; p += blockDim.x) {
+        if (state[1 + p] < n_blocks) {
+            list[p] = -1;
+        }
+    }
+    if (ts && threadIdx.x == 0) { // TEMP timing: [1] end, [2] first stop seen (0: none), [3] experts completed
+        uint64_t t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        int done = 0;
+        while (done < n_list && state[1 + done] >= n_blocks) {
+            done++;
+        }
+        ts[1] = t;
+        ts[2] = *(const unsigned long long *) (state + 62);
+        ts[3] = done;
+    }
+}
+
+// TEMP (GGML_CUDA_PF_TIMING=1, in-order copies): [0] copy begin, [1] end, [2] stop seen, [3] experts done, [6] GPU share
+// start (up plan), [7] GPU share end (down compute)
+static void ggml_cuda_pf_inline_report(int device, int il) {
+    static double acc[GGML_CUDA_MAX_DEVICES][8];
+    static int    n[GGML_CUDA_MAX_DEVICES], calls[GGML_CUDA_MAX_DEVICES];
+    if (++calls[device] % 8 != 0) {
+        return;
+    }
+    uint64_t t[256*8];
+    CUDA_CHECK(cudaMemcpy(t, ggml_cuda_pf_ts(device), sizeof(t), cudaMemcpyDeviceToHost));
+    for (int l = 0; l < 256; ++l) {
+        const uint64_t * r = t + 8*l;
+        // complete and from one step: share start < share end <= copy begin < copy end
+        if (l == il || r[6] == 0 || r[7] < r[6] || r[0] < r[7] || r[1] < r[0] || r[1] - r[6] > 20000000) {
+            continue;
+        }
+        acc[device][7] += r[5] && r[6] > r[5] && r[6] - r[5] < 20000000 ? (r[6] - r[5])*1e-3 : 0.0; // split start -> share
+        acc[device][0] += (r[7] - r[6])*1e-3;              // GPU share
+        acc[device][1] += (r[0] - r[7])*1e-3;              // share end -> copy begin
+        acc[device][2] += (r[1] - r[0])*1e-3;              // copy
+        acc[device][3] += r[3];                            // experts done
+        if (r[2] >= r[0] && r[2] <= r[1]) {
+            acc[device][4] += 1;                           // stopped
+            acc[device][5] += (r[1] - r[2])*1e-3;          // stop seen -> copy end
+            acc[device][6] += (r[2] - r[0])*1e-3;          // copy begin -> stop seen
+        }
+        n[device]++;
+    }
+    if (calls[device] % 512 == 0 && n[device] > 0) {
+        const double ns = std::max(1.0, acc[device][4]);
+        fprintf(stderr, "pf inline dev %d (%d samples): split start -> share %.0f us, share %.0f us, gap %.0f us, copy %.0f us, "
+            "%.2f experts, stopped %.0f%% (after %.0f us, then %.0f us to end)\n", device, n[device], acc[device][7]/n[device],
+            acc[device][0]/n[device], acc[device][1]/n[device],
+            acc[device][2]/n[device], acc[device][3]/n[device], 100.0*acc[device][4]/n[device], acc[device][6]/ns, acc[device][5]/ns);
+        memset(acc[device], 0, sizeof(acc[device]));
+        n[device] = 0;
+    }
+}
+
+static void ggml_cuda_moe_prefetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == 0) {
+        const ggml_tensor * scores = dst->src[0];
+        const ggml_tensor * ids    = dst->src[1];
+        const ggml_tensor * state  = dst->src[2];
+        const int n = (int) (ids->ne[0]*ids->ne[1]);
+        GGML_ASSERT(n <= 1024);
+        moe_prefetch_plan_kernel<<<1, GGML_PAD(n, WARP_SIZE), 0, ctx.stream()>>>((const char *) scores->data,
+            scores->nb[0], scores->nb[1], (const char *) ids->data, ids->nb[0], ids->nb[1], (int) ids->ne[0], (int) ids->ne[1],
+            (const int32_t *) state->data, (int) (ggml_nelements(state)/2), ggml_get_op_params_i32(dst, 1),
+            ggml_get_op_params_i32(dst, 2), (int32_t *) dst->data, (int) ggml_nelements(dst));
+        CUDA_CHECK(cudaGetLastError());
+        // evaluated directly (not captured): the copy may follow in the same graph, so mark the plan done here too
+        // (captured: the event is recorded after the graph, see ggml_backend_cuda_graph_compute)
+        cudaStreamCaptureStatus capture;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            const int slot = ggml_get_op_params_i32(dst, 3);
+            GGML_ASSERT(slot < GGML_CUDA_PF_MAX_SLOTS);
+            CUDA_CHECK(cudaEventRecord(ggml_cuda_pf(ctx.device).plan[slot], ctx.stream()));
+        }
+        return;
+    }
+    const int slot = ggml_get_op_params_i32(dst, 1); // -1: in order on the current stream (e.g. at the end of a split)
+    GGML_ASSERT(slot < GGML_CUDA_PF_MAX_SLOTS);
+    const ggml_tensor * list = dst->src[0];
+    const int n_list = (int) ggml_nelements(list);
+    moe_prefetch_copy_args a;
+    int64_t off = 0;
+    for (int m = 0; m < 3; ++m) {
+        const ggml_tensor * w = dst->src[1 + m];
+        GGML_ASSERT(w->nb[2] % 16 == 0 && (uintptr_t) w->data % 16 == 0);
+        a.src[m] = (const char *) w->data;
+        a.nb2[m] = w->nb[2];
+        a.off[m] = off;
+        off += n_list*w->nb[2];
+    }
+    GGML_ASSERT((uintptr_t) dst->data % 16 == 0 && (size_t) off <= ggml_nbytes(dst));
+    static const int bx = getenv("GGML_CUDA_PF_BLOCKS") ? atoi(getenv("GGML_CUDA_PF_BLOCKS")) : 2;
+    if (slot < 0 && ctx.curr_stream_no != 0) {
+        // on the side stream of the split (after the GPU share): the plan may have run on the main stream after the fork
+        static cudaEvent_t plan_done[GGML_CUDA_MAX_DEVICES] = {};
+        if (!plan_done[ctx.device]) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&plan_done[ctx.device], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(plan_done[ctx.device], ctx.stream(ctx.device, 0)));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), plan_done[ctx.device]));
+    }
+    if (slot < 0 && ggml_cuda_pf_abortable()) {
+        GGML_ASSERT(n_list <= 63);
+        static const int bxa = getenv("GGML_CUDA_PF_BLOCKS") ? atoi(getenv("GGML_CUDA_PF_BLOCKS")) : 4;
+        ggml_cuda_pf_abort_state & ab = ggml_cuda_pf_abort(ctx.device);
+        int32_t * l = (int32_t *) list->data; // the plan's result: incomplete experts are removed from it
+        // TEMP timing, recorded under the layer whose split runs the copy (target - 2, the default LLAMA_MOE_GPU_PREFETCH_AHEAD)
+        const int til = ggml_cuda_pf_timing() ? ggml_cuda_pf_layer(dst->name) - 2 : -1;
+        uint64_t * ts = til >= 0 && til < 256 ? ggml_cuda_pf_ts(ctx.device) + 8*til : nullptr;
+        if (ts) {
+            ggml_cuda_pf_inline_report(ctx.device, til);
+        }
+        moe_prefetch_begin_kernel<<<1, 64, 0, ctx.stream()>>>(ab.stop, ab.state, n_list);
+        if (ts) {
+            ggml_cuda_pf_ts_kernel<<<1, 1, 0, ctx.stream()>>>(ts + 0);
+        }
+        moe_prefetch_copy_abortable_kernel<<<dim3(bxa, 3), 256, 0, ctx.stream()>>>(a, l, n_list, (char *) dst->data, ab.stop, ab.state);
+        moe_prefetch_end_kernel<<<1, 64, 0, ctx.stream()>>>(l, n_list, ab.state, 3*bxa, ts);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (slot < 0) {
+        moe_prefetch_copy_kernel<<<dim3(bx, 3*n_list), 256, 0, ctx.stream()>>>(a, (const int32_t *) list->data, n_list,
+            (char *) dst->data);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    ggml_cuda_pf_sync & pf = ggml_cuda_pf(ctx.device);
+    CUDA_CHECK(cudaStreamWaitEvent(pf.stream, pf.plan[slot]));
+    const int il = ggml_cuda_pf_timing() ? ggml_cuda_pf_layer(dst->name) : -1;
+    if (il >= 0 && il < 256) {
+        ggml_cuda_pf_timing_report(ctx.device, il);
+        ggml_cuda_pf_ts_kernel<<<1, 1, 0, pf.stream>>>(ggml_cuda_pf_ts(ctx.device) + 8*il + 0);
+    }
+    moe_prefetch_copy_kernel<<<dim3(bx, 3*n_list), 256, 0, pf.stream>>>(a, (const int32_t *) list->data, n_list,
+        (char *) dst->data);
+    CUDA_CHECK(cudaGetLastError());
+    if (il >= 0 && il < 256) {
+        ggml_cuda_pf_ts_kernel<<<1, 1, 0, pf.stream>>>(ggml_cuda_pf_ts(ctx.device) + 8*il + 1);
+    }
+    CUDA_CHECK(cudaEventRecord(pf.copy[slot], pf.stream));
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2542,6 +3040,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // state, or without a cache) to find the slots it takes, then take the first k2 of the remaining eligible experts
         // in [e2, e3) and compute them expert-major, reading src0 in place (host memory: over this GPU's own link)
         if (mode == 3) {
+            GGML_ASSERT(!dst->src[7] && "staged experts: not with a second share");
             const int k2 = ggml_get_op_params_i32(dst, 8);
             const int e2 = ggml_get_op_params_i32(dst, 9);
             const int e3 = ggml_get_op_params_i32(dst, 10);
@@ -2576,20 +3075,39 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // the GPU part with an expert cache: copy the k newly taken experts into their slots, then compute all taken
         // experts (cached + new) from the cache, expert-major
         if (mode == 1 && dst->src[4] && dst->src[5] && k > 0 && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst)) {
-            const ggml_tensor * cache = dst->src[5];
-            const int n_slots = (int) (ggml_nelements(dst->src[4])/2);
-            const int n_out   = std::min(n_slots + k, n_ids*n_tokens);
+            const ggml_tensor * cache   = dst->src[5];
+            const ggml_tensor * staged  = dst->src[7]; // ggml_mul_mat_id_set_staged
+            const ggml_tensor * staging = dst->src[8];
+            GGML_ASSERT(!staged == !staging);
+            const int n_staged = staged ? (int) ggml_nelements(staged) : 0;
+            const int n_slots  = (int) (ggml_nelements(dst->src[4])/2);
+            const int n_out    = std::min(n_slots + k, n_ids*n_tokens);
             GGML_ASSERT(ggml_is_contiguous(src0) && nb02 % 16 == 0 && (uintptr_t) src0->data % 16 == 0 &&
                 ggml_nbytes(cache) >= (size_t) (n_slots + k)*nb02);
-            ggml_cuda_pool_alloc<int32_t> plan(ctx.pool(), n_out + n_out*n_tokens + 2*k);
+            const bool admit_staged = n_staged > 0 && ggml_get_op_params_i32(dst, 12) != 0;
+            ggml_cuda_pool_alloc<int32_t> plan(ctx.pool(), n_out + n_out*n_tokens + 2*k + 2*n_staged + n_staged*n_tokens);
             int32_t * wslot  = plan.get();
             int32_t * slots  = wslot + n_out;
             int32_t * fill_e = slots + n_out*n_tokens;
             int32_t * fill_s = fill_e + k;
+            int32_t * pws    = fill_s + k;
+            int32_t * pslots = pws + n_staged;
+            int32_t * pfill  = pslots + n_staged*n_tokens;
+            // TEMP timing: GPU share start (up) / end (down) of layer il, from the weight name blk.<il>.ffn_*_exps
+            int share_il = -1;
+            bool share_up = false, share_down = false;
+            if (ggml_cuda_pf_timing() && sscanf(src0->name, "blk.%d.", &share_il) == 1 && share_il >= 0 && share_il < 256) {
+                share_up   = strstr(src0->name, "ffn_up_exps") != nullptr;
+                share_down = strstr(src0->name, "ffn_down_exps") != nullptr;
+            }
+            if (share_up) {
+                ggml_cuda_pf_ts_kernel<<<1, 1, 0, ctx.stream()>>>(ggml_cuda_pf_ts(ctx.device) + 8*share_il + 6);
+            }
             mul_mat_id_cache_plan<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
                 n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7), skip_d, skip_nb0, skip_nb1,
                 (int32_t *) dst->src[4]->data, n_slots, dst->src[6] ? (int32_t *) dst->src[6]->data : nullptr, (int) ne02, n_out,
-                wslot, slots, fill_e, fill_s);
+                wslot, slots, fill_e, fill_s, nullptr, staged ? (const int32_t *) staged->data : nullptr, n_staged, pws, pslots,
+                admit_staged, pfill);
             const dim3 grid((82*4 + k - 1)/k, k);
             mul_mat_id_cache_fill<<<grid, 256, 0, ctx.stream()>>>((const int4 *) src0->data, (int4 *) cache->data,
                 fill_e, fill_s, nb02/16);
@@ -2601,8 +3119,42 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             src0_t.nb[3]  = nb02*(n_slots + k);
             CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
             ggml_cuda_mul_mat_vec_q_moe_xm(ctx, &src0_t, src1, wslot, slots, n_out, dst);
+            if (n_staged > 0) {
+                // the staged experts, once their copy (another stream, an earlier split) is done
+                const int pf_slot = ggml_get_op_params_i32(dst, 11) - 1; // -1: copied in order, no wait
+                GGML_ASSERT(pf_slot < GGML_CUDA_PF_MAX_SLOTS && ggml_nbytes(staging) >= (size_t) n_staged*nb02);
+                cudaStreamCaptureStatus capture;
+                CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+                const int pf_il = ggml_cuda_pf_timing() ? ggml_cuda_pf_layer(staged->name) : -1;
+                const int pf_m  = staging->view_src ? (int) (staging->view_offs/((size_t) n_staged*nb02)) : 0;
+                if (pf_il >= 0 && pf_il < 256 && pf_m < 3) {
+                    ggml_cuda_pf_ts_kernel<<<1, 1, 0, ctx.stream()>>>(ggml_cuda_pf_ts(ctx.device) + 8*pf_il + 2 + 2*pf_m);
+                }
+                if (pf_slot >= 0) {
+                    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ggml_cuda_pf(ctx.device).copy[pf_slot],
+                        capture == cudaStreamCaptureStatusActive ? cudaEventWaitExternal : cudaEventWaitDefault));
+                }
+                if (pf_il >= 0 && pf_il < 256 && pf_m < 3) {
+                    ggml_cuda_pf_ts_kernel<<<1, 1, 0, ctx.stream()>>>(ggml_cuda_pf_ts(ctx.device) + 8*pf_il + 3 + 2*pf_m);
+                }
+                ggml_tensor src0_s = *src0;
+                src0_s.data   = staging->data;
+                src0_s.buffer = staging->buffer;
+                src0_s.ne[2]  = n_staged;
+                src0_s.nb[3]  = nb02*n_staged;
+                ggml_cuda_mul_mat_vec_q_moe_xm(ctx, &src0_s, src1, pws, pslots, n_staged, dst);
+                if (admit_staged) {
+                    // into victim slots: neither this batch's hits nor its new experts read them
+                    mul_mat_id_cache_admit<<<dim3(32, n_staged), 256, 0, ctx.stream()>>>((const int4 *) staging->data,
+                        (int4 *) cache->data, pfill, nb02/16);
+                }
+            }
+            if (share_down) {
+                ggml_cuda_pf_ts_kernel<<<1, 1, 0, ctx.stream()>>>(ggml_cuda_pf_ts(ctx.device) + 8*share_il + 7);
+            }
             return;
         }
+        GGML_ASSERT(!dst->src[7] && "staged experts: needs mode 1 with the expert cache");
         // the other paths would not update the cache state (the other part of the split would diverge)
         GGML_ASSERT(!dst->src[4] && "expert cache: needs mode 1, cache memory and an mmvq-xm type");
 
@@ -2997,6 +3549,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_FFN_RANGE:
             ggml_cuda_moe_ffn_range(ctx, dst);
             break;
+        case GGML_OP_MOE_PREFETCH:
+            ggml_cuda_moe_prefetch(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -3282,6 +3837,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_pf_stop(cuda_ctx->device); // whoever waits for the GPU needs it: stop an in-order expert prefetch
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -3307,6 +3863,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (node->op == GGML_OP_MOE_FFN_RANGE) {
             use_cuda_graph = false; // plans the routing on the host (stream synchronization)
+        }
+        if (node->op == GGML_OP_MOE_PREFETCH && ggml_get_op_params_i32(node, 0) == 1 && ggml_get_op_params_i32(node, 1) >= 0) {
+            use_cuda_graph = false; // the copy runs on its own stream, past the end of the split
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -5141,7 +5700,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (host_src_stream && !is_concurrent_event_active && !ggml_cuda_op_prof_enabled()) {
                     // not the fused prompt-batch MoE: nothing to overlap with in its split, and on the main stream its
                     // temporaries share the main pool (each stream has its own)
-                    bool side = (node->flags & GGML_TENSOR_FLAG_HOST_SRC) != 0 && node->op != GGML_OP_MOE_FFN_RANGE;
+                    bool side = (node->flags & GGML_TENSOR_FLAG_HOST_SRC) != 0 && node->op != GGML_OP_MOE_FFN_RANGE &&
+                        !(node->op == GGML_OP_MOE_PREFETCH && ggml_get_op_params_i32(node, 1) >= 0);
                     for (int j = 0; j < GGML_MAX_SRC && !side; ++j) {
                         const ggml_tensor * src = node->src[j];
                         side = src && (side_nodes.count(src) || (src->view_src && side_nodes.count(src->view_src)));
@@ -5348,7 +5908,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    if (ggml_cuda_pf_timing()) { // TEMP timing: [5] start of the split that plans (indexed like the inline copy: target - 2)
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MOE_PREFETCH && ggml_get_op_params_i32(node, 0) == 0) {
+                const int il = ggml_cuda_pf_layer(node->name) - 2;
+                if (il >= 0 && il < 256) {
+                    ggml_cuda_pf_ts_kernel<<<1, 1, 0, cuda_ctx->stream(cuda_ctx->device, 0)>>>(ggml_cuda_pf_ts(cuda_ctx->device) + 8*il + 5);
+                }
+            }
+        }
+    }
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // expert prefetch plans in this graph: their copies (a later split, own stream) start after this point
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MOE_PREFETCH && ggml_get_op_params_i32(node, 0) == 0) {
+            const int slot = ggml_get_op_params_i32(node, 3);
+            GGML_ASSERT(slot < GGML_CUDA_PF_MAX_SLOTS);
+            CUDA_CHECK(cudaEventRecord(ggml_cuda_pf(cuda_ctx->device).plan[slot], cuda_ctx->stream(cuda_ctx->device, 0)));
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6086,6 +6667,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_MOE_PREFETCH:
+            if (ggml_get_op_params_i32(op, 0) == 0) {
+                return op->src[1]->ne[0]*op->src[1]->ne[1] <= 1024 && ggml_nelements(op) <= 32 &&
+                    ggml_get_op_params_i32(op, 3) < GGML_CUDA_PF_MAX_SLOTS;
+            }
+            return op->src[1]->nb[2] % 16 == 0 && op->src[2]->nb[2] % 16 == 0 && op->src[3]->nb[2] % 16 == 0 &&
+                ggml_get_op_params_i32(op, 1) < GGML_CUDA_PF_MAX_SLOTS;
         case GGML_OP_MOE_FFN_RANGE:
             {
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;

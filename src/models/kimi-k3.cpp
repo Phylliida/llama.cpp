@@ -435,6 +435,71 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         if (k3_pred_dump_path() && use_attn_res && !pred_ahead.empty()) {
             pred_ahead_dump(prefix_sum, 20);
         }
+
+        // cross-layer expert prefetch (LLAMA_MOE_GPU_PREFETCH=<n>, decode with the GPU share's expert cache): predict the
+        // routing of layer il + LLAMA_MOE_GPU_PREFETCH_AHEAD (2) from this stream through that layer's own ffn-side mix,
+        // norm and router, and plan which n of its uncached experts to stage in VRAM. The plan is expanded with this layer's
+        // deferred split (runs on the GPU while the CPU computes the experts), the copy in its own split after the next
+        // layer's router, and that layer's GPU share computes the staged experts it selects (see build_moe_ffn)
+        {
+            static const int   pf_ahead = getenv("LLAMA_MOE_GPU_PREFETCH_AHEAD") ? atoi(getenv("LLAMA_MOE_GPU_PREFETCH_AHEAD")) : 2;
+            static const float pf_frac  = getenv("LLAMA_MOE_GPU_FRAC") ? atof(getenv("LLAMA_MOE_GPU_FRAC")) : 0.0f;
+            static const int   pf_k     = getenv("LLAMA_MOE_GPU_K") ? atoi(getenv("LLAMA_MOE_GPU_K")) : 3;
+            static const int   pf_kb    = getenv("LLAMA_MOE_GPU_KB") ? atoi(getenv("LLAMA_MOE_GPU_KB")) : pf_k;
+            // LLAMA_MOE_GPU_PREFETCH_ASYNC=1: the copy on its own stream from the next layer on (overlaps attention and
+            // the fills: its HMM reads slow them down, 2026-11-03); default: at the end of this layer's deferred split
+            static const bool  pf_inline = !getenv("LLAMA_MOE_GPU_PREFETCH_ASYNC") || atoi(getenv("LLAMA_MOE_GPU_PREFETCH_ASYNC")) == 0;
+            const int lt = il + pf_ahead;
+            const llm_graph_moe_cache_layer * mc = moe_cache && n_tokens <= 4 && (n_tokens == 1 ? pf_k : pf_kb) > 0 &&
+                pf_ahead >= 1 && lt < n_layer && lt < (int) moe_cache->size() ? &(*moe_cache)[lt] : nullptr;
+            // (the plan is expanded by this layer's build_moe_ffn: an MoE layer)
+            if (mc && mc->pf_list && use_attn_res && (uint32_t) il >= hparams.n_layer_dense_lead &&
+                    model.layers[lt].ffn_gate_inp && model.dev_layer(lt) == model.dev_layer(il)) {
+                const auto & lay = model.layers[lt];
+                ggml_tensor * x = res_mix(prefix_sum, lay.ffn_res_score, n_tokens, lt);
+                x = build_norm(x, lay.ffn_norm, NULL, LLM_NORM_RMS, lt);
+                ggml_tensor * sc  = ggml_add(ctx0, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, lay.ffn_gate_inp, x)), lay.ffn_exp_probs_b);
+                ggml_tensor * top = ggml_top_k(ctx0, sc, hparams.n_expert_used());
+                ggml_tensor * plan = ggml_moe_prefetch_plan(ctx0, sc, top, mc->state_gpu[0], mc->pf_list, 0,
+                    (int) (pf_frac*hparams.n_expert), mc->pf_slot);
+                cb(plan, "ffn_moe_pf_plan", lt);
+                moe_pf_list.resize(n_layer, nullptr);
+                moe_pf_copy.resize(n_layer, nullptr);
+                moe_pf_list[lt] = plan;
+                moe_pf_plan = plan;
+                if (pf_inline) {
+                    // in order at the end of this layer's deferred split (after the GPU share: the link and the GPU are
+                    // idle until the CPU finishes), no synchronization needed
+                    ggml_tensor * cp = ggml_moe_prefetch_copy(ctx0, plan, lay.ffn_up_exps, lay.ffn_gate_exps, lay.ffn_down_exps,
+                        mc->pf_staging, -1);
+                    cp->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+                    cb(cp, "ffn_moe_pf_copy", lt);
+                    moe_pf_copy[lt] = cp;
+                    moe_pf_copy_inline = cp;
+                }
+            }
+            // the copy for the next layer (planned before), expanded after this layer's router (build_moe_ffn)
+            // TEMP diagnosis: LLAMA_MOE_GPU_PREFETCH_MODE 1 = plan only, 2 = plan + copy (staged experts not used), 3 = all
+            static const int pf_mode = getenv("LLAMA_MOE_GPU_PREFETCH_MODE") ? atoi(getenv("LLAMA_MOE_GPU_PREFETCH_MODE")) : 3;
+            ggml_tensor * pf_list_next = !pf_inline && pf_mode >= 2 && pf_ahead >= 2 && il + 1 < (int) moe_pf_list.size() ?
+                moe_pf_list[il + 1] : nullptr;
+            if (pf_list_next) {
+                const auto & nx = model.layers[il + 1];
+                const llm_graph_moe_cache_layer & mn = (*moe_cache)[il + 1];
+                ggml_tensor * cp = ggml_moe_prefetch_copy(ctx0, pf_list_next, nx.ffn_up_exps, nx.ffn_gate_exps, nx.ffn_down_exps,
+                    mn.pf_staging, mn.pf_slot);
+                cp->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+                for (int i = 0; sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                    if (ggml_backend_get_device(b) == model.dev_layer(il + 1)) {
+                        ggml_backend_sched_set_tensor_backend(sched, cp, b);
+                    }
+                }
+                cb(cp, "ffn_moe_pf_copy", il + 1);
+                moe_pf_copy[il + 1] = cp;
+                moe_pf_copy_pending = cp;
+            }
+        }
         cb(prefix_sum, "prefix_sum_attn", il);
 
         cur = use_attn_res ? res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il)

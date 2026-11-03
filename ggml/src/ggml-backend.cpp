@@ -778,6 +778,7 @@ struct ggml_backend_sched_split {
     int i_start;
     int i_end;
     bool deferred; // nodes have GGML_TENSOR_FLAG_DEFER
+    bool prefetch; // nodes have GGML_TENSOR_FLAG_PREFETCH
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
@@ -1314,6 +1315,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (!ggml_is_view_op(node->op)) {
                 split->backend_id = tensor_backend_id(node);
                 split->deferred   = (node->flags & GGML_TENSOR_FLAG_DEFER) != 0;
+                split->prefetch   = (node->flags & GGML_TENSOR_FLAG_PREFETCH) != 0;
                 break;
             }
         }
@@ -1333,7 +1335,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && ((node->flags & GGML_TENSOR_FLAG_DEFER) != 0) != split->deferred) {
+            if (node_backend_id == cur_backend_id && (((node->flags & GGML_TENSOR_FLAG_DEFER) != 0) != split->deferred ||
+                    ((node->flags & GGML_TENSOR_FLAG_PREFETCH) != 0) != split->prefetch)) {
                 need_new_split = true;
             }
             if (!need_new_split && node_backend_id == cur_backend_id && split->n_inputs > 0) {
@@ -1371,6 +1374,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split = &sched->splits[i_split];
                 split->backend_id = node_backend_id;
                 split->deferred   = (node->flags & GGML_TENSOR_FLAG_DEFER) != 0;
+                split->prefetch   = (node->flags & GGML_TENSOR_FLAG_PREFETCH) != 0;
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;

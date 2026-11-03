@@ -5456,9 +5456,14 @@ struct test_mul_mat_id_cache : public test_case {
     const bool lfu; // usage scores (ggml_mul_mat_id_set_cache_score)
     const int  k2;  // > 0: each step also has the second share (mode 3, first k2 of the rest in [e1/2, n_mats)) on a copy
                     // of the cache state, so its replay of the first share's choice is checked over the steps
+    const int  n_pf; // > 0: each step stages n_pf experts first (ggml_moe_prefetch_plan from random predictions, then
+                     // ggml_moe_prefetch_copy) and computes the staged ones it selects from staging (ggml_mul_mat_id_set_staged)
+    const bool pf_admit; // ... and admits them to the cache
+    const bool pf_inline; // the copy in order (slot -1; abortable on CUDA) instead of asynchronous (slot 0)
     std::string vars() override {
         return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip) + ",lfu=" + std::to_string(lfu) +
-            (k2 ? ",k2=" + std::to_string(k2) : "");
+            (k2 ? ",k2=" + std::to_string(k2) : "") + (n_pf ? ",n_pf=" + std::to_string(n_pf) : "") + (pf_admit ? ",admit" : "") +
+            (pf_inline ? ",inline" : "");
     }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5467,9 +5472,10 @@ struct test_mul_mat_id_cache : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     test_mul_mat_id_cache(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_k, int e1,
-            int n_slots, int n_steps, bool skip, bool lfu = false, int k2 = 0)
+            int n_slots, int n_steps, bool skip, bool lfu = false, int k2 = 0, int n_pf = 0, bool pf_admit = false,
+            bool pf_inline = false)
         : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_k(split_k), e1(e1), n_slots(n_slots),
-          n_steps(n_steps), skip(skip), lfu(lfu), k2(k2) {}
+          n_steps(n_steps), skip(skip), lfu(lfu), k2(k2), n_pf(n_pf), pf_admit(pf_admit), pf_inline(pf_inline) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
@@ -5490,6 +5496,13 @@ struct test_mul_mat_id_cache : public test_case {
             state2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*n_slots + 1);
             ggml_set_name(state2, "cache_state2");
         }
+        ggml_tensor * pf_list = nullptr, * pf_staging = nullptr;
+        if (n_pf > 0) {
+            pf_list = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pf);
+            ggml_set_name(pf_list, "pf_list");
+            pf_staging = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, 3*n_pf*as->nb[2]);
+            ggml_set_name(pf_staging, "pf_staging");
+        }
         ggml_tensor * sum = nullptr;
         for (int s = 0; s < n_steps; ++s) {
             ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -5503,6 +5516,18 @@ struct test_mul_mat_id_cache : public test_case {
             ggml_mul_mat_id_set_cache(out, state, cache);
             if (score) {
                 ggml_mul_mat_id_set_cache_score(out, score);
+            }
+            if (n_pf > 0) {
+                // predictions: a random top-n_used per token (distinct ids) with random scores
+                ggml_tensor * pscores = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_mats, n);
+                ggml_set_name(pscores, "pf_scores");
+                ggml_tensor * pids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+                ggml_set_name(pids, "ids");
+                pids = ggml_view_2d(ctx, pids, n_used, n, pids->nb[1], 0);
+                ggml_tensor * plan = ggml_moe_prefetch_plan(ctx, pscores, pids, state, pf_list, 0, e1, 0);
+                const int slot = pf_inline ? -1 : 0;
+                ggml_tensor * copy = ggml_moe_prefetch_copy(ctx, plan, as, as, as, pf_staging, slot);
+                ggml_mul_mat_id_set_staged(out, plan, ggml_view_1d(ctx, copy, n_pf*as->nb[2], n_pf*as->nb[2]), slot, pf_admit);
             }
             sum = sum ? ggml_add(ctx, sum, out) : out;
             if (state2) {
@@ -5541,6 +5566,8 @@ struct test_mul_mat_id_cache : public test_case {
                 ggml_backend_tensor_set(t, sc.data(), 0, sc.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "cache") == 0) {
                 cache = t;
+            } else if (strcmp(t->name, "pf_scores") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "ids") == 0) {
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -10459,6 +10486,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, true));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true, true));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false, true));
+            // staged experts (cross-layer prefetch): plan, copy, then hits, staged, k ranked from the rest
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, false, 0, 3));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 2, 64, 9, 6, true, false, 0, 5));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false, true, 0, 4));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, false, 0, 3, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 2, 64, 9, 6, true, false, 0, 5, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false, true, 0, 4, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, false, 0, 3, false, true));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 2, 64, 9, 6, true, false, 0, 5, true, true));
             // second share replaying the first share's cache decisions on its own copy of the state
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, false, 2));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true, false, 2));

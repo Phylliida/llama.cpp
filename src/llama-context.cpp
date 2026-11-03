@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <atomic>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -544,12 +545,52 @@ llama_context::llama_context(
                 total += ggml_nbytes(moe_cache[il].cache[x]);
             }
         }
+        // cross-layer expert prefetch (LLAMA_MOE_GPU_PREFETCH = experts staged per layer, see kimi-k3.cpp): a ring of 3 slots
+        // per GPU, layer il uses slot il % 3 (its plan two layers ahead, the copy and the use overlap on three layers)
+        const int pf_n = getenv("LLAMA_MOE_GPU_PREFETCH") ? atoi(getenv("LLAMA_MOE_GPU_PREFETCH")) : 0;
+        size_t pf_total = 0;
+        if (pf_n > 0) {
+            GGML_ASSERT(pf_n <= 32 && !kb2 && "LLAMA_MOE_GPU_PREFETCH: at most 32, not with LLAMA_MOE_GPU_KB2");
+            std::map<ggml_backend_dev_t, size_t> stage_bytes; // per GPU: n experts of its largest layer (up + gate + down)
+            for (int il = 0; il < n_layer; ++il) {
+                if (moe_cache[il].cache[0]) {
+                    const auto & layer = model.layers[il];
+                    const size_t b = (size_t) pf_n*(layer.ffn_up_exps->nb[2] + layer.ffn_gate_exps->nb[2] + layer.ffn_down_exps->nb[2]);
+                    size_t & cur = stage_bytes[model.dev_layer(il)];
+                    cur = std::max(cur, b);
+                }
+            }
+            std::map<ggml_backend_dev_t, std::array<std::pair<ggml_tensor *, ggml_tensor *>, 3>> ring;
+            for (auto & [dev, bytes] : stage_bytes) {
+                ggml_context * cg = ctx_for(ggml_backend_dev_buffer_type(dev));
+                for (int r = 0; r < 3; ++r) {
+                    ring[dev][r] = { ggml_new_tensor_1d(cg, GGML_TYPE_I32, pf_n), ggml_new_tensor_1d(cg, GGML_TYPE_I8, (int64_t) bytes) };
+                    pf_total += bytes;
+                }
+            }
+            for (int il = 0; il < n_layer; ++il) {
+                if (moe_cache[il].cache[0]) {
+                    const auto & r = ring[model.dev_layer(il)][il % 3];
+                    moe_cache[il].pf_list    = r.first;
+                    moe_cache[il].pf_staging = r.second;
+                    moe_cache[il].pf_slot    = il % 3;
+                }
+            }
+        }
         for (auto & [buft, c] : ctx_map) {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(c, buft);
             if (!buf) {
                 throw std::runtime_error("failed to allocate the MoE expert cache");
             }
             moe_cache_bufs.emplace_back(buf);
+        }
+        if (pf_n > 0) {
+            const std::vector<int32_t> none(pf_n, -1);
+            for (auto & mc : moe_cache) {
+                if (mc.pf_list) {
+                    ggml_backend_tensor_set(mc.pf_list, none.data(), 0, none.size()*sizeof(int32_t));
+                }
+            }
         }
         std::vector<int32_t> init(2*n_slots + 1, 0);
         std::fill(init.begin(), init.begin() + n_slots, -1);
@@ -569,6 +610,9 @@ llama_context::llama_context(
         }
         LLAMA_LOG_INFO("%s: %d slots per layer, %.2f GiB of VRAM%s\n", "moe_gpu_cache", n_slots, total/1073741824.0,
             lfu ? ", usage scores" : "");
+        if (pf_n > 0) {
+            LLAMA_LOG_INFO("%s: %d experts per layer, staging %.2f GiB of VRAM\n", "moe_gpu_prefetch", pf_n, pf_total/1073741824.0);
+        }
     }
     if (moe_gpu_frac && atof(moe_gpu_frac) > 0.0 && !model.devices.empty()) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model.devices[0].dev);

@@ -602,6 +602,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_MOE_FFN_RANGE,
+        GGML_OP_MOE_PREFETCH,
 
         GGML_OP_COUNT,
     };
@@ -670,6 +671,7 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         GGML_TENSOR_FLAG_DEFER   = 32, // ...sched: run in an own split that may start after the next split on another backend has copied its inputs
         GGML_TENSOR_FLAG_HOST_SRC = 64, // ...sched: the node's backend reads host-resident weight sources in place (no copy)
+        GGML_TENSOR_FLAG_PREFETCH = 128, // ...sched: run in an own split (the backend may run it asynchronously, see ggml_moe_prefetch_copy)
     };
 
     enum ggml_tri_type {
@@ -1569,6 +1571,43 @@ extern "C" {
     // (not used by the batch) with the lowest score; then every score decays (s -= s >> 3) and each expert of the batch
     // gains 256 per token. Each node keeps its own copy (like the state)
     GGML_API void ggml_mul_mat_id_set_cache_score(struct ggml_tensor * a, struct ggml_tensor * score);
+
+    // cross-layer expert prefetch for a split MUL_MAT_ID with an expert cache (decode), in two steps on the backend of
+    // the layer the experts are for. Plan: rank the experts predicted for the batch (ids: I32 [k, n_tokens], the top k of
+    // the predicted router scores, scores: F32 [n_as, n_tokens]) by the tokens predicting them, then by summed score
+    // (ties: lower id), leave out those held by the cache (state, see ggml_mul_mat_id_set_cache) and those outside
+    // [e0, e1), and write the first ones to list (I32 [n_list], -1 past the last). Returns a view of list. slot: the id
+    // shared with the copy and the consumers (see below)
+    GGML_API struct ggml_tensor * ggml_moe_prefetch_plan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * list,
+            int                   e0,
+            int                   e1,
+            int                   slot);
+
+    // Copy: the experts in list (the plan's result) of up, gate and down into staging (bytes: n_list*up->nb[2] for up,
+    // then gate, then down; slot i of a part holds list[i]). Flagged GGML_TENSOR_FLAG_PREFETCH: a backend may run it
+    // asynchronously (e.g. on a side stream), the consumers then synchronize through the slot id they share with it
+    // (ggml_mul_mat_id_set_staged). slot -1: an ordinary op (no flag, runs in order). Returns a view of staging
+    GGML_API struct ggml_tensor * ggml_moe_prefetch_copy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * list,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * down,
+            struct ggml_tensor  * staging,
+            int                   slot);
+
+    // after ggml_mul_mat_id_set_cache: the experts of list (the plan's result) that the batch selects and the cache does
+    // not hold are taken from staging (this matrix's part of the copy's result, n_list*nb02 bytes; NULL on a node that
+    // only needs the decision, e.g. the CPU part of the split), after the cache hits and before the k ranked experts,
+    // which are chosen among the others. admit: they are also admitted to the cache (in list order, before the k ranked
+    // ones, same victims rule), else the cache state is unchanged by them. slot: the copy's (-1 for an in-order copy)
+    GGML_API void ggml_mul_mat_id_set_staged(struct ggml_tensor * a, struct ggml_tensor * list, struct ggml_tensor * staging,
+            int slot, bool admit);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

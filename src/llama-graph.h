@@ -781,6 +781,11 @@ struct llm_graph_moe_cache_layer {
     // usage scores (ggml_mul_mat_id_set_cache_score), null = LRU
     ggml_tensor * score_gpu[3] = {};
     ggml_tensor * score_cpu[3] = {};
+    // cross-layer expert prefetch (LLAMA_MOE_GPU_PREFETCH): the ring slot of this layer on its GPU (shared with the layers
+    // pf_slot + 3*i there): the planned experts (I32 [n]) and their staging memory (up, gate, down parts), null = none
+    ggml_tensor * pf_list    = nullptr;
+    ggml_tensor * pf_staging = nullptr;
+    int           pf_slot    = -1;
 };
 
 struct llm_graph_params {
@@ -1076,6 +1081,15 @@ struct llm_graph_context {
     mutable int moe_gpu_k2 = 0;
     // its expert cache per layer (llm_graph_params::moe_cache)
     const std::vector<llm_graph_moe_cache_layer> * moe_cache = nullptr;
+    // cross-layer expert prefetch: a plan for a later layer to expand with this layer's deferred split (then cleared),
+    // and per layer the plan made for it and the copy of its experts (built by the model's graph and build_moe_ffn)
+    mutable ggml_tensor * moe_pf_plan = nullptr;
+    // the copy for the next layer, expanded right after this layer's router (then cleared)
+    mutable ggml_tensor * moe_pf_copy_pending = nullptr;
+    // or an in-order copy (of the plan above), expanded after this layer's GPU share (then cleared)
+    mutable ggml_tensor * moe_pf_copy_inline = nullptr;
+    mutable std::vector<ggml_tensor *> moe_pf_list;
+    mutable std::vector<ggml_tensor *> moe_pf_copy;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
