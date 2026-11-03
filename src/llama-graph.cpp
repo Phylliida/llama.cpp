@@ -2231,17 +2231,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_pf_copy_pending = nullptr;
     }
 
-    // LLAMA_MOE_DEFER_LATE=1 (TEMP experiment): the deferred shared expert after the GPU share in node order, so it runs
-    // on the main stream while the share runs on its own (the share's stream forks at its first node, after it otherwise)
-    static const bool defer_late = getenv("LLAMA_MOE_DEFER_LATE") && atoi(getenv("LLAMA_MOE_DEFER_LATE")) != 0;
-    if (moe_defer && !defer_late) {
+    if (moe_defer) {
         ggml_build_forward_expand(gf, moe_defer);
         moe_defer = nullptr;
     }
-    // ... and the prediction and plan for a later layer with this layer's deferred split: after the GPU share in node order
-    // (LLAMA_MOE_GPU_PREFETCH_PLAN_EARLY=1: before it), so they run on the main stream while the share runs on its own (the
-    // share's stream forks from the main stream at its first node and would wait for them)
-    static const bool pf_plan_early = getenv("LLAMA_MOE_GPU_PREFETCH_PLAN_EARLY") && atoi(getenv("LLAMA_MOE_GPU_PREFETCH_PLAN_EARLY")) != 0;
+    // ... and the prediction and plan for a later layer with this layer's deferred split, before the GPU share in node order:
+    // nodes after it on the main stream would run concurrently with it (it forks onto a stream of its own) while the
+    // allocator, which assumes graph order, may give them memory the share's intermediates still use
     auto expand_pf_plan = [&]() {
         if (moe_pf_plan) {
             const int n0 = ggml_graph_n_nodes(gf);
@@ -2252,9 +2248,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             moe_pf_plan = nullptr;
         }
     };
-    if (pf_plan_early) {
-        expand_pf_plan();
-    }
+    expand_pf_plan();
     // staged experts of this layer (planned two layers before): list and copy, null = none
     ggml_tensor * pf_list = il >= 0 && il < (int) moe_pf_list.size() ? moe_pf_list[il] : nullptr;
     static const int pf_mode = getenv("LLAMA_MOE_GPU_PREFETCH_MODE") ? atoi(getenv("LLAMA_MOE_GPU_PREFETCH_MODE")) : 3; // TEMP
@@ -2342,11 +2336,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         cb(experts_gpu, "ffn_moe_down_gpu", il);
         ggml_build_forward_expand(gf, experts_gpu);
-        if (moe_defer) {
-            ggml_build_forward_expand(gf, moe_defer);
-            moe_defer = nullptr;
-        }
-        expand_pf_plan();
         // an in-order expert prefetch copy (kimi-k3.cpp): after the GPU share in its stream, while the CPU still computes
         if (moe_pf_copy_inline) {
             moe_pf_copy_inline->flags |= GGML_TENSOR_FLAG_DEFER;
@@ -2355,11 +2344,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             moe_pf_copy_inline = nullptr;
         }
     }
-    if (moe_defer) { // LLAMA_MOE_DEFER_LATE without the decode GPU share
-        ggml_build_forward_expand(gf, moe_defer);
-        moe_defer = nullptr;
-    }
-    expand_pf_plan();
     // second GPU at 2-4 tokens (LLAMA_MOE_GPU_KB2): the first gpu_k2 of the experts in [gpu_e2, n_expert) that the layer
     // GPU's share leaves (mode 3: it replays that share's choice on its copy of the cache state), weighted and summed
     // there, so only [n_embd, n_tokens] crosses to the layer's GPU; the CPU leaves those experts out as well

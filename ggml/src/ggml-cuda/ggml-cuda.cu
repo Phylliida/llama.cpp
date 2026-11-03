@@ -2547,10 +2547,12 @@ static ggml_cuda_pf_sync & ggml_cuda_pf(const int device) {
     static ggml_cuda_pf_sync pf[GGML_CUDA_MAX_DEVICES];
     ggml_cuda_pf_sync & p = pf[device];
     if (p.stream == nullptr) {
-        // high priority: its few blocks start without waiting for the big grids of the main stream
+        // high priority: its few blocks start without waiting for the big grids of the main stream (TEMP:
+        // GGML_CUDA_PF_PRIO_LOW=1 for the lowest)
         int lo, hi;
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
-        CUDA_CHECK(cudaStreamCreateWithPriority(&p.stream, cudaStreamNonBlocking, hi));
+        const bool low = getenv("GGML_CUDA_PF_PRIO_LOW") && atoi(getenv("GGML_CUDA_PF_PRIO_LOW")) != 0;
+        CUDA_CHECK(cudaStreamCreateWithPriority(&p.stream, cudaStreamNonBlocking, low ? lo : hi));
         for (int i = 0; i < GGML_CUDA_PF_MAX_SLOTS; ++i) {
             CUDA_CHECK(cudaEventCreateWithFlags(&p.plan[i], cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&p.copy[i], cudaEventDisableTiming));
@@ -2708,8 +2710,11 @@ static void ggml_cuda_pf_timing_report(int device, int il) {
 // in list order, each by all blocks; a block checks the epoch before each expert. Experts not completed by every block
 // are removed from the list (-1), which the consumers (GPU and CPU) read afterwards
 struct ggml_cuda_pf_abort_state {
-    int * stop  = nullptr; // pinned host memory, mapped: the epoch
-    int * state = nullptr; // device: [0] epoch at the copy's start, [1 + p] blocks done with expert p
+    int * stop  = nullptr; // pinned host memory, mapped: [0] the epoch, [16] the epoch when the split with the copy was
+                           // launched (any later stop counts, also one before the copy starts)
+    int * state = nullptr; // device: [0] epoch at the copy's start, [1 + p] blocks done with expert p, [60..61] TEMP: GPU
+                           // time of the last stop (a kernel launched right after it), [62..63] TEMP: first stop seen
+    cudaStream_t ts_stream = nullptr; // TEMP timing
 };
 static ggml_cuda_pf_abort_state * g_pf_abort[GGML_CUDA_MAX_DEVICES] = {};
 
@@ -2736,16 +2741,43 @@ static ggml_cuda_pf_abort_state & ggml_cuda_pf_abort(const int device) {
 }
 
 // the GPU is needed now: stop an in-order prefetch copy
+static __global__ void moe_prefetch_stop_ts_kernel(int * state) {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    *(unsigned long long *) (state + 60) = t;
+}
+static bool ggml_cuda_pf_timing();
+
 static void ggml_cuda_pf_stop(const int device) {
     if (g_pf_abort[device] && ggml_cuda_pf_abort_mode() == 1) {
         volatile int * stop = g_pf_abort[device]->stop;
         *stop = *stop + 1;
+        if (ggml_cuda_pf_timing()) {
+            int prev;
+            CUDA_CHECK(cudaGetDevice(&prev));
+            CUDA_CHECK(cudaSetDevice(device));
+            ggml_cuda_pf_abort_state * a = g_pf_abort[device];
+            if (!a->ts_stream) {
+                int lo, hi;
+                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+                CUDA_CHECK(cudaStreamCreateWithPriority(&a->ts_stream, cudaStreamNonBlocking, hi));
+            }
+            moe_prefetch_stop_ts_kernel<<<1, 1, 0, a->ts_stream>>>(a->state);
+            CUDA_CHECK(cudaSetDevice(prev));
+        }
     }
+}
+
+// the host's stop epoch: a system-scope load (not served from the GPU's caches)
+static __device__ __forceinline__ int moe_prefetch_load_stop(const volatile int * stop) {
+    int v;
+    asm volatile("ld.relaxed.sys.global.s32 %0, [%1];" : "=r"(v) : "l"(stop) : "memory");
+    return v;
 }
 
 static __global__ void moe_prefetch_begin_kernel(const volatile int * stop, int * state, const int n_list) {
     if (threadIdx.x == 0) {
-        state[0] = *stop;
+        state[0] = moe_prefetch_load_stop(stop + 16);
         *(unsigned long long *) (state + 62) = 0;
     }
     for (int p = threadIdx.x; p < n_list; p += blockDim.x) {
@@ -2765,7 +2797,7 @@ static __global__ void moe_prefetch_copy_abortable_kernel(const moe_prefetch_cop
     const int64_t stride = (int64_t) gridDim.x*blockDim.x*U;
     auto check = [&]() {
         if (threadIdx.x == 0) {
-            s_go = *stop == state[0];
+            s_go = moe_prefetch_load_stop(stop) == state[0];
             if (!s_go) {
                 uint64_t t;
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -2835,6 +2867,7 @@ static __global__ void moe_prefetch_end_kernel(int32_t * list, const int n_list,
         ts[1] = t;
         ts[2] = *(const unsigned long long *) (state + 62);
         ts[3] = done;
+        ts[4] = *(const volatile unsigned long long *) (state + 60);
     }
 }
 
@@ -2862,14 +2895,14 @@ static void ggml_cuda_pf_inline_report(int device, int il) {
         if (r[2] >= r[0] && r[2] <= r[1]) {
             acc[device][4] += 1;                           // stopped
             acc[device][5] += (r[1] - r[2])*1e-3;          // stop seen -> copy end
-            acc[device][6] += (r[2] - r[0])*1e-3;          // copy begin -> stop seen
+            acc[device][6] += r[4] && r[4] <= r[2] && r[2] - r[4] < 5000000 ? (r[2] - r[4])*1e-3 : 0.0; // host stop -> seen
         }
         n[device]++;
     }
     if (calls[device] % 512 == 0 && n[device] > 0) {
         const double ns = std::max(1.0, acc[device][4]);
         fprintf(stderr, "pf inline dev %d (%d samples): split start -> share %.0f us, share %.0f us, gap %.0f us, copy %.0f us, "
-            "%.2f experts, stopped %.0f%% (after %.0f us, then %.0f us to end)\n", device, n[device], acc[device][7]/n[device],
+            "%.2f experts, stopped %.0f%% (seen %.0f us after the host's stop, then %.0f us to end)\n", device, n[device], acc[device][7]/n[device],
             acc[device][0]/n[device], acc[device][1]/n[device],
             acc[device][2]/n[device], acc[device][3]/n[device], 100.0*acc[device][4]/n[device], acc[device][6]/ns, acc[device][5]/ns);
         memset(acc[device], 0, sizeof(acc[device]));
@@ -5908,6 +5941,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // an in-order expert prefetch copy in this graph: note the stop epoch at launch (the copy stops at any later stop)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MOE_PREFETCH && ggml_get_op_params_i32(node, 0) == 1 && ggml_get_op_params_i32(node, 1) < 0 &&
+                ggml_cuda_pf_abortable()) {
+            volatile int * stop = ggml_cuda_pf_abort(cuda_ctx->device).stop;
+            stop[16] = stop[0];
+            break;
+        }
+    }
     if (ggml_cuda_pf_timing()) { // TEMP timing: [5] start of the split that plans (indexed like the inline copy: target - 2)
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * node = cgraph->nodes[i];
