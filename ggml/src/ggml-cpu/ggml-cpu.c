@@ -1697,6 +1697,65 @@ static inline bool ggml_mmid_is_taken(const int32_t * taken, int n_taken, int32_
     return false;
 }
 
+// second share of a split (ggml_mul_mat_id_set_split2): of the eligible experts (id in [e2, e3), slot not skipped)
+// not taken by the first share, the first k2 by token count (descending), ties by first occurrence (token-major).
+// Same order as mul_mat_id_split_take (ggml-cuda.cu) restricted to those experts; returns their number
+static int ggml_mmid_split_taken2(const struct ggml_tensor * ids, const struct ggml_tensor * skip_w, int k2, int e2, int e3,
+        const int32_t * taken, int n_taken, int32_t * taken2) {
+    enum { MAX_SLOTS = 1024 };
+    const int n_ids = ids->ne[0];
+    int32_t ue[MAX_SLOTS];
+    int32_t uc[MAX_SLOTS];
+    int     nu = 0;
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int j = 0; j < n_ids; ++j) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            if (e < e2 || e >= e3 || ggml_mmid_slot_skipped(skip_w, j, t) || ggml_mmid_is_taken(taken, n_taken, e)) {
+                continue;
+            }
+            int u = 0;
+            while (u < nu && ue[u] != e) {
+                u++;
+            }
+            if (u == nu) {
+                ue[nu]   = e;
+                uc[nu++] = 0;
+            }
+            uc[u]++;
+        }
+    }
+    int n = 0;
+    for (int r = 0; r < k2; ++r) {
+        int best = -1;
+        for (int u = 0; u < nu; ++u) {
+            if (uc[u] > 0 && (best < 0 || uc[u] > uc[best])) {
+                best = u;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        taken2[n++] = ue[best];
+        uc[best] = 0;
+    }
+    return n;
+}
+
+// slot of expert e: computed by this node of a split? (mode 1: first share, 2: the rest, 3: second share)
+static inline bool ggml_mmid_split_keep(int mode, bool split_range, int e, int e0, int e1,
+        const int32_t * taken, int n_taken, const int32_t * taken2, int n_taken2) {
+    if (split_range) {
+        return (e >= e0 && e < e1) == (mode == 1);
+    }
+    switch (mode) {
+        case 1:  return ggml_mmid_is_taken(taken, n_taken, e);
+        case 2:  return !ggml_mmid_is_taken(taken, n_taken, e) && !ggml_mmid_is_taken(taken2, n_taken2, e);
+        default: return ggml_mmid_is_taken(taken2, n_taken2, e);
+    }
+}
+
+// TEMP: fused gate/up (decode path) per call: slots, skipped, taken by the GPU, unique experts read on the CPU
+static int64_t g_fused_calls, g_fused_slots, g_fused_skipped, g_fused_gpu, g_fused_experts;
 // TEMP: routed slots seen / skipped by the down projections (printed with GGML_CPU_OP_PROFILE)
 static int64_t g_mmid_slots_total;
 static int64_t g_mmid_slots_skipped;
@@ -2052,12 +2111,19 @@ static void ggml_compute_forward_mul_mat_id(
         const bool split_range = split_mode != 0 && split_k >= split_e1 - split_e0 && dst->src[4] == NULL;
         int32_t taken[1024];
         int     n_taken = 0;
+        int32_t taken2[1024];
+        int     n_taken2 = 0;
         if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = dst->src[4];
             const struct ggml_tensor * sc = dst->src[6];
             n_taken = ggml_mmid_split_taken(ids, skip_w, split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
                 sc ? (int32_t *) sc->data : NULL, (int) src0->ne[2], taken);
+            const int32_t split_k2 = ggml_get_op_params_i32(dst, 8);
+            if (split_k2 > 0) {
+                n_taken2 = ggml_mmid_split_taken2(ids, skip_w, split_k2, ggml_get_op_params_i32(dst, 9),
+                    ggml_get_op_params_i32(dst, 10), taken, n_taken, taken2);
+            }
         }
 
         // group rows by src0 matrix
@@ -2078,12 +2144,10 @@ static void ggml_compute_forward_mul_mat_id(
                     continue;
                 }
 
-                if (split_mode != 0) {
-                    const bool is_taken = split_range ? i02 >= split_e0 && i02 < split_e1 : ggml_mmid_is_taken(taken, n_taken, i02);
-                    if (is_taken != (split_mode == 1)) {
-                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                        continue;
-                    }
+                if (split_mode != 0 && !ggml_mmid_split_keep(split_mode, split_range, i02, split_e0, split_e1,
+                        taken, n_taken, taken2, n_taken2)) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
@@ -3739,12 +3803,19 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
         const bool split_range = split_mode != 0 && split_k >= split_e1 - split_e0 && gate->src[4] == NULL;
         int32_t taken[1024];
         int     n_taken = 0;
+        int32_t taken2[1024];
+        int     n_taken2 = 0;
         if (split_mode != 0 && !split_range) {
             const struct ggml_tensor * cs = gate->src[4];
             const struct ggml_tensor * sc = gate->src[6];
             n_taken = ggml_mmid_split_taken(ids, gate->src[3], split_k, split_e0, split_e1,
                 cs ? (int32_t *) cs->data : NULL, cs ? (int) (ggml_nelements(cs)/2) : 0,
                 sc ? (int32_t *) sc->data : NULL, (int) gate->src[0]->ne[2], taken);
+            const int32_t split_k2 = ggml_get_op_params_i32(gate, 8);
+            if (split_k2 > 0) {
+                n_taken2 = ggml_mmid_split_taken2(ids, gate->src[3], split_k2, ggml_get_op_params_i32(gate, 9),
+                    ggml_get_op_params_i32(gate, 10), taken, n_taken, taken2);
+            }
             // the up node's copy of the cache state gets the same update
             const struct ggml_tensor * cs_up = up->src[4];
             if (cs_up) {
@@ -3765,15 +3836,26 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                     memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
                     continue;
                 }
-                if (split_mode != 0) {
-                    const bool is_taken = split_range ? i02 >= split_e0 && i02 < split_e1 : ggml_mmid_is_taken(taken, n_taken, i02);
-                    if (is_taken != (split_mode == 1)) {
-                        memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
-                        continue;
-                    }
+                if (split_mode != 0 && !ggml_mmid_split_keep(split_mode, split_range, i02, split_e0, split_e1,
+                        taken, n_taken, taken2, n_taken2)) {
+                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                    g_fused_gpu++;
+                    continue;
                 }
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+        if (ids->ne[1] <= 4) {
+            g_fused_calls++;
+            g_fused_slots += n_ids*ids->ne[1];
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    g_fused_skipped += ggml_mmid_slot_skipped(gate->src[3], id, iid1);
+                }
+            }
+            for (int a = 0; a < n_as; ++a) {
+                g_fused_experts += matrix_row_counts[a] > 0;
             }
         }
         // 0: shared pool, 1..: prefetch groups (ggml_mmid_pf_iter)
@@ -3902,7 +3984,7 @@ static int ggml_cpu_try_fuse_ops(
                 node->src[1] == n1->src[1] && node->src[2] == n1->src[2] && node->src[3] == n1->src[3] &&
                 (node->src[4] == NULL) == (n1->src[4] == NULL) && (node->src[6] == NULL) == (n1->src[6] == NULL) && node->src[1]->type == GGML_TYPE_F32 &&
                 node->src[0]->type == n1->src[0]->type && ggml_are_same_shape(node->src[0], n1->src[0]) &&
-                memcmp(node->op_params, n1->op_params, 8*sizeof(int32_t)) == 0 &&
+                memcmp(node->op_params, n1->op_params, 11*sizeof(int32_t)) == 0 &&
                 ggml_node_has_n_uses(cgraph, node_n, 1) && ggml_node_has_n_uses(cgraph, node_n + 1, 1) &&
                 ggml_is_contiguous(glu) && ggml_are_same_shape(glu, node) &&
                 node->src[2]->ne[1] <= 4 && !ggml_is_numa() && ggml_mmid_dynamic_enabled()) {
@@ -3950,6 +4032,12 @@ static void ggml_cpu_prof_print(void) {
                 100.0*g_mmid_slots_skipped/g_mmid_slots_total, 16.0*(1.0 - (double) g_mmid_slots_skipped/g_mmid_slots_total));
         fprintf(stderr, "cpu-prof: moe down calls %lld, experts read per call %.2f\n",
                 (long long) g_mmid_calls, g_mmid_calls ? (double) g_mmid_experts/g_mmid_calls : 0.0);
+    }
+    if (g_fused_calls > 0) {
+        fprintf(stderr, "cpu-prof: decode gate/up calls %lld: per call %.2f slots, %.2f skipped, %.2f on GPU, %.2f experts read\n",
+                (long long) g_fused_calls, (double) g_fused_slots/g_fused_calls, (double) g_fused_skipped/g_fused_calls,
+                (double) g_fused_gpu/g_fused_calls, (double) g_fused_experts/g_fused_calls);
+        g_fused_calls = g_fused_slots = g_fused_skipped = g_fused_gpu = g_fused_experts = 0;
     }
     for (int i = 0; i < GGML_OP_COUNT + 2; ++i) {
         if (g_cpu_prof_n[i] == 0) continue;

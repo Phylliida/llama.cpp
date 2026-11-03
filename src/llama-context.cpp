@@ -507,6 +507,10 @@ llama_context::llama_context(
             return c;
         };
         const bool lfu = getenv("LLAMA_MOE_GPU_CACHE_LFU") && atoi(getenv("LLAMA_MOE_GPU_CACHE_LFU")) != 0;
+        // second share at 1-4 tokens on another GPU (LLAMA_MOE_GPU_KB2, kimi-k3.cpp): it replays the first share's cache
+        // decisions on its own copy of the state
+        const bool kb2 = getenv("LLAMA_MOE_GPU_KB2") && atoi(getenv("LLAMA_MOE_GPU_KB2")) > 0;
+        GGML_ASSERT(!(kb2 && lfu) && "LLAMA_MOE_GPU_KB2 needs the LRU cache (no usage scores)");
         moe_cache.resize(n_layer);
         size_t total = 0;
         for (int il = 0; il < n_layer; ++il) {
@@ -519,10 +523,20 @@ llama_context::llama_context(
             }
             ggml_context * cg = ctx_for(ggml_backend_dev_buffer_type(dev));
             ggml_context * cc = ctx_for(ggml_backend_get_default_buffer_type(backend_cpu));
+            ggml_context * cg2 = nullptr;
+            for (size_t d = 0; kb2 && d < model.devices.size() && !cg2; ++d) {
+                ggml_backend_dev_t dev2 = model.devices[d].dev;
+                if (dev2 != dev && ggml_backend_dev_type(dev2) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    cg2 = ctx_for(ggml_backend_dev_buffer_type(dev2));
+                }
+            }
             for (int x = 0; x < 3; ++x) {
                 moe_cache[il].cache[x]     = ggml_new_tensor_1d(cg, GGML_TYPE_I8, (int64_t) (n_slots + k_max)*w[x]->nb[2]);
                 moe_cache[il].state_gpu[x] = ggml_new_tensor_1d(cg, GGML_TYPE_I32, 2*n_slots + 1);
                 moe_cache[il].state_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, 2*n_slots + 1);
+                if (cg2) {
+                    moe_cache[il].state_gpu2[x] = ggml_new_tensor_1d(cg2, GGML_TYPE_I32, 2*n_slots + 1);
+                }
                 if (lfu) {
                     moe_cache[il].score_gpu[x] = ggml_new_tensor_1d(cg, GGML_TYPE_I32, w[x]->ne[2]);
                     moe_cache[il].score_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, w[x]->ne[2]);
@@ -544,6 +558,9 @@ llama_context::llama_context(
             for (int x = 0; mc.cache[0] && x < 3; ++x) {
                 ggml_backend_tensor_set(mc.state_gpu[x], init.data(), 0, init.size()*sizeof(int32_t));
                 ggml_backend_tensor_set(mc.state_cpu[x], init.data(), 0, init.size()*sizeof(int32_t));
+                if (mc.state_gpu2[x]) {
+                    ggml_backend_tensor_set(mc.state_gpu2[x], init.data(), 0, init.size()*sizeof(int32_t));
+                }
                 if (mc.score_gpu[x]) {
                     ggml_backend_tensor_memset(mc.score_gpu[x], 0, 0, ggml_nbytes(mc.score_gpu[x]));
                     ggml_backend_tensor_memset(mc.score_cpu[x], 0, 0, ggml_nbytes(mc.score_cpu[x]));

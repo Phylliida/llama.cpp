@@ -2240,8 +2240,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     moe_gpu_backend = nullptr;
     ggml_backend_t backend_gpu2 = moe_gpu_backend2;
     const int gpu_e2 = moe_gpu_e2;
+    const int gpu_k2 = moe_gpu_k2;
     moe_gpu_backend2 = nullptr;
     moe_gpu_e2 = 0;
+    moe_gpu_k2 = 0;
     // 1-4 tokens: the GPU takes k experts per batch (+ the expert cache); larger batches (prompt processing): a range split,
     // the GPU takes every expert in [0, e1) (gpu_k = n_expert)
     const bool gpu_share = gpu_k > 0 && (n_tokens <= 4 || gpu_k >= n_expert) && type_op == LLM_FFN_SITU && up_exps && gate_exps && !gate_up_exps &&
@@ -2301,6 +2303,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts_gpu, "ffn_moe_down_gpu", il);
         ggml_build_forward_expand(gf, experts_gpu);
     }
+    // second GPU at 2-4 tokens (LLAMA_MOE_GPU_KB2): the first gpu_k2 of the experts in [gpu_e2, n_expert) that the layer
+    // GPU's share leaves (mode 3: it replays that share's choice on its copy of the cache state), weighted and summed
+    // there, so only [n_embd, n_tokens] crosses to the layer's GPU; the CPU leaves those experts out as well
+    const bool decode2 = gpu_share && !fused && backend_gpu2 && gpu_k2 > 0 && n_tokens <= 4 && gpu_e2 < (int) n_expert &&
+        !weight_before_ffn && moe_cache && il >= 0 && il < (int) moe_cache->size() && (*moe_cache)[il].state_gpu2[0];
+    if (decode2) {
+        const llm_graph_moe_cache_layer & mc = (*moe_cache)[il];
+        ggml_tensor * up_2   = ggml_mul_mat_id(ctx0, up_exps,   cur, selected_experts);
+        ggml_tensor * gate_2 = ggml_mul_mat_id(ctx0, gate_exps, cur, selected_experts);
+        ggml_tensor * act_2  = ggml_situ_split(ctx0, gate_2, up_2, hparams.situ_beta, hparams.situ_linear_beta);
+        ggml_tensor * down_2 = ggml_mul_mat_id(ctx0, down_exps, act_2, selected_experts);
+        int x = 0;
+        for (ggml_tensor * t : {up_2, gate_2, down_2}) {
+            ggml_mul_mat_id_set_split(t, 3, gpu_k, 0, gpu_e1);
+            ggml_mul_mat_id_set_split2(t, gpu_k2, gpu_e2, (int) n_expert);
+            if (skip_w) {
+                ggml_mul_mat_id_set_skip(t, skip_w);
+            }
+            ggml_mul_mat_id_set_cache(t, mc.state_gpu2[x], nullptr);
+            t->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+            x++;
+        }
+        ggml_tensor * w_2 = ggml_mul(ctx0, down_2, weights);
+        std::vector<ggml_tensor *> nodes = {up_2, gate_2, act_2, down_2, w_2};
+        ggml_tensor * sum_2 = ggml_view_2d(ctx0, w_2, n_embd, n_tokens, w_2->nb[2], 0);
+        nodes.push_back(sum_2);
+        for (uint32_t i = 1; i < hparams.n_expert_used(il); ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx0, w_2, n_embd, n_tokens, w_2->nb[2], i*w_2->nb[1]);
+            sum_2 = ggml_add(ctx0, sum_2, v);
+            nodes.push_back(v);
+            nodes.push_back(sum_2);
+        }
+        for (ggml_tensor * t : nodes) {
+            t->flags |= GGML_TENSOR_FLAG_DEFER;
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_gpu2);
+        }
+        cb(sum_2, "ffn_moe_out_gpu2", il);
+        ggml_build_forward_expand(gf, sum_2);
+        moe_out_gpu2 = sum_2;
+    }
     // second GPU (larger batches): the experts [gpu_e2, n_expert), weighted and summed over the slots there, so only
     // [n_embd, n_tokens] crosses to the layer's GPU; the CPU then takes the experts in between, [gpu_e1, gpu_e2)
     if (gpu_share && !fused && backend_gpu2 && gpu_e2 >= gpu_e1 && gpu_e2 < (int) n_expert && n_tokens > 4 && !weight_before_ffn) {
@@ -2338,10 +2380,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         (*moe_cache)[il].cache[0] ? &(*moe_cache)[il] : nullptr;
     auto set_cpu_part = [&](ggml_tensor * t, int x) {
         if (gpu_share && t->op == GGML_OP_MUL_MAT_ID) {
-            if (moe_out_gpu2) {
+            if (moe_out_gpu2 && !decode2) {
                 ggml_mul_mat_id_set_split(t, 1, (int) n_expert, gpu_e1, gpu_e2);
             } else {
                 ggml_mul_mat_id_set_split(t, 2, gpu_k, 0, gpu_e1);
+                if (decode2) {
+                    ggml_mul_mat_id_set_split2(t, gpu_k2, gpu_e2, (int) n_expert);
+                }
             }
             if (mc_cpu) {
                 ggml_mul_mat_id_set_cache(t, mc_cpu->state_cpu[x], nullptr);

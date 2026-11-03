@@ -1914,9 +1914,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 // ids_out: ids with -1 for the slots this part does not compute (skipped slots belong to neither part)
 // experts, slots (mode 1): the taken experts by rank (-1 past the last), slots[r*n_tokens + t] = slot of token t for
 // expert r or -1
+// exclude (optional, per slot): >= 0 = taken by another share, not eligible (the second share of a split)
 static __global__ void mul_mat_id_split_take(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
         const int n_tokens, const int mode, const int k, const int e0, const int e1,
-        const char * skip_w, const size_t wnb0, const size_t wnb1, int32_t * ids_out, int32_t * experts, int32_t * slots) {
+        const char * skip_w, const size_t wnb0, const size_t wnb1, int32_t * ids_out, int32_t * experts, int32_t * slots,
+        const int32_t * exclude = nullptr) {
     __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
     __shared__ int32_t s_cnt[1024];  // at an expert's first slot: tokens selecting it, else 0
     __shared__ int32_t s_rank[1024]; // at an expert's first slot: its rank
@@ -1930,7 +1932,7 @@ static __global__ void mul_mat_id_split_take(const char * ids, const size_t nb0,
     if (i < n) {
         id      = *(const int32_t *) (ids + t*nb1 + j*nb0);
         skipped = skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f;
-        s_e[i]  = !skipped && id >= e0 && id < e1 ? id : -1;
+        s_e[i]  = !skipped && id >= e0 && id < e1 && !(exclude && exclude[i] >= 0) ? id : -1;
     }
     if (experts) {
         for (int c = i; c < k; c += blockDim.x) {
@@ -2001,6 +2003,22 @@ static __global__ void mul_mat_id_split_compact(const char * ids, int32_t * ids_
     }
 }
 
+// mode 2 with a second share: ids of the slots neither share takes (taken1/taken2 >= 0: taken), -1 for the others and
+// for skipped slots
+static __global__ void mul_mat_id_split_rest(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
+        const int n_tokens, const char * skip_w, const size_t wnb0, const size_t wnb1, const int32_t * taken1,
+        const int32_t * taken2, int32_t * ids_out) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_ids*n_tokens) {
+        return;
+    }
+    const int t = i / n_ids;
+    const int j = i % n_ids;
+    const int32_t id      = *(const int32_t *) (ids + t*nb1 + j*nb0);
+    const bool    skipped = skip_w && *(const float *) (skip_w + t*wnb1 + j*wnb0) == 0.0f;
+    ids_out[i] = !skipped && taken1[i] < 0 && taken2[i] < 0 ? id : -1;
+}
+
 // copy the listed experts of src0 to dst with 16 byte loads (src0 in host memory is read over PCIe, wide loads are faster)
 static __global__ void mul_mat_id_gather_experts(const int4 * src, int4 * dst, const int32_t * experts, const int64_t n16_per_expert) {
     const int32_t e = experts[blockIdx.y];
@@ -2019,10 +2037,11 @@ static __global__ void mul_mat_id_gather_experts(const int4 * src, int4 * dst, c
 // ones (tokens selecting them, then first occurrence), which are admitted to the cache. Outputs: wslot[r] = weight slot in
 // the cache of the r-th taken expert (-1 past the last, r < n_out), slots[r*n_tokens + t] = slot of token t for it or -1,
 // fill_e[c]/fill_s[c] (c < k) = expert to copy from src0 into weight slot fill_s[c] (-1: none)
+// taken_out (optional, per slot): the expert if this share takes the slot, else -1 (for the second share of a split)
 static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0, const size_t nb1, const int n_ids,
         const int n_tokens, const int k, const int e0, const int e1, const char * skip_w, const size_t wnb0, const size_t wnb1,
         int32_t * state, const int n_slots, int32_t * score, const int n_as, const int n_out, int32_t * wslot, int32_t * slots,
-        int32_t * fill_e, int32_t * fill_s) {
+        int32_t * fill_e, int32_t * fill_s, int32_t * taken_out = nullptr) {
     __shared__ int32_t s_e[1024];    // expert of an eligible slot, else -1
     __shared__ int32_t s_cnt[1024];  // at an uncached expert's first slot: tokens selecting it, else 0
     __shared__ int32_t s_all[1024];  // at an expert's first slot: tokens selecting it (score update), else 0
@@ -2152,6 +2171,9 @@ static __global__ void mul_mat_id_cache_plan(const char * ids, const size_t nb0,
             wslot[r] = s_ws[i];
         }
         slots[r*n_tokens + t] = j;
+    }
+    if (taken_out && i < n) {
+        taken_out[i] = first >= 0 && s_rank[first] >= 0 ? s_e[i] : -1;
     }
 }
 
@@ -2516,6 +2538,41 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const size_t skip_nb0 = dst->src[3] ? dst->src[3]->nb[0] : 0;
         const size_t skip_nb1 = dst->src[3] ? dst->src[3]->nb[1] : 0;
 
+        // the second share of a split (mode 3, e.g. a second GPU): replay the first share's choice (on a copy of its cache
+        // state, or without a cache) to find the slots it takes, then take the first k2 of the remaining eligible experts
+        // in [e2, e3) and compute them expert-major, reading src0 in place (host memory: over this GPU's own link)
+        if (mode == 3) {
+            const int k2 = ggml_get_op_params_i32(dst, 8);
+            const int e2 = ggml_get_op_params_i32(dst, 9);
+            const int e3 = ggml_get_op_params_i32(dst, 10);
+            GGML_ASSERT(k2 > 0 && !dst->src[5] && !dst->src[6] && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst));
+            const int n       = n_ids*n_tokens;
+            const int n_slots = dst->src[4] ? (int) (ggml_nelements(dst->src[4])/2) : 0;
+            const int n_out   = std::min(n_slots + k, n);
+            ggml_cuda_pool_alloc<int32_t> buf(ctx.pool(), n + k2 + k2*n_tokens + n_out + n_out*n_tokens + 2*k);
+            int32_t * taken1  = buf.get();
+            int32_t * experts = taken1 + n;
+            int32_t * slots   = experts + k2;
+            if (dst->src[4]) {
+                int32_t * wslot  = slots + k2*n_tokens;
+                int32_t * pslots = wslot + n_out;
+                int32_t * fill_e = pslots + n_out*n_tokens;
+                int32_t * fill_s = fill_e + k;
+                mul_mat_id_cache_plan<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                    n_ids, n_tokens, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7), skip_d, skip_nb0, skip_nb1,
+                    (int32_t *) dst->src[4]->data, n_slots, nullptr, (int) ne02, n_out, wslot, pslots, fill_e, fill_s, taken1);
+            } else {
+                mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                    n_ids, n_tokens, 1, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
+                    skip_d, skip_nb0, skip_nb1, taken1, nullptr, nullptr);
+            }
+            mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, 1, k2, e2, e3, skip_d, skip_nb0, skip_nb1, nullptr, experts, slots, taken1);
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            ggml_cuda_mul_mat_vec_q_moe_xm(ctx, src0, src1, experts, slots, k2, dst);
+            return;
+        }
+
         // the GPU part with an expert cache: copy the k newly taken experts into their slots, then compute all taken
         // experts (cached + new) from the cache, expert-major
         if (mode == 1 && dst->src[4] && dst->src[5] && k > 0 && ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst)) {
@@ -2563,9 +2620,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         ggml_cuda_pool_alloc<int32_t> ids_split(ctx.pool(), n_ids*n_tokens);
-        mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
-            n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
-            skip_d, skip_nb0, skip_nb1, ids_split.get(), nullptr, nullptr);
+        const int k2 = ggml_get_op_params_i32(dst, 8);
+        if (mode == 2 && k2 > 0) {
+            // the rest of a split with a second share (no cache here): neither the first share's nor the second's slots
+            const int n = n_ids*n_tokens;
+            ggml_cuda_pool_alloc<int32_t> taken(ctx.pool(), 2*n);
+            mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, 1, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
+                skip_d, skip_nb0, skip_nb1, taken.get(), nullptr, nullptr);
+            mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, 1, k2, ggml_get_op_params_i32(dst, 9), ggml_get_op_params_i32(dst, 10),
+                skip_d, skip_nb0, skip_nb1, taken.get() + n, nullptr, nullptr, taken.get());
+            mul_mat_id_split_rest<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, skip_d, skip_nb0, skip_nb1, taken.get(), taken.get() + n, ids_split.get());
+        } else {
+            mul_mat_id_split_take<<<1, n_thr, 0, ctx.stream()>>>((const char *) ids->data, ids->nb[0], ids->nb[1],
+                n_ids, n_tokens, mode, k, ggml_get_op_params_i32(dst, 6), ggml_get_op_params_i32(dst, 7),
+                skip_d, skip_nb0, skip_nb1, ids_split.get(), nullptr, nullptr);
+        }
         ggml_tensor ids_t = *ids;
         ids_t.data  = ids_split.get();
         ids_t.nb[0] = sizeof(int32_t);

@@ -1523,6 +1523,13 @@ extern "C" {
     // mode 1 computes only the taken slots, mode 2 all other slots, skipped slots are written as zeros
     GGML_API void ggml_mul_mat_id_set_split(struct ggml_tensor * a, int mode, int k, int e0, int e1);
 
+    // second share of a split (e.g. a second GPU, at 1-4 tokens), after ggml_mul_mat_id_set_split:
+    // after the experts taken by the first share (its cache hits and k picks, see ggml_mul_mat_id_set_cache), the
+    // remaining eligible experts with id in [e2, e3) are ranked the same way and the first k2 are taken by the second
+    // share. mode 2 then also leaves out those, mode 3 computes only them (its cache state, if any, is a copy of the
+    // first share's that it updates the same way). k2 = 0: no second share
+    GGML_API void ggml_mul_mat_id_set_split2(struct ggml_tensor * a, int k2, int e2, int e3);
+
     // routed experts of a range of expert ids, weighted and summed (Kimi-K3 SiTU experts; prompt batches with
     // host-resident experts, so a backend can stream the range's experts once per batch without materializing the
     // per-slot intermediates):

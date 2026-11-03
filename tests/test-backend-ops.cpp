@@ -5369,17 +5369,24 @@ struct test_mul_mat_id_split : public test_mul_mat_id {
     const bool skip;
     const int split_k;
     const int e0; // the split range is [e0, e0 + n_mats/2)
+    const int k2; // second share (ggml_mul_mat_id_set_split2): the first k2 of the rest in [e2, n_mats)
+    const int e2;
     test_mul_mat_id_split(ggml_type type_a, int mode, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool skip = false,
-            int split_k = 3, int e0 = 0)
-        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode), skip(skip), split_k(split_k), e0(e0) {}
+            int split_k = 3, int e0 = 0, int k2 = 0, int e2 = 0)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), mode(mode), skip(skip), split_k(split_k), e0(e0),
+          k2(k2), e2(e2) {}
     std::string vars() override {
         return test_mul_mat_id::vars() + ",mode=" + std::to_string(mode) + ",skip=" + std::to_string(skip) +
-            ",split_k=" + std::to_string(split_k) + (e0 ? ",e0=" + std::to_string(e0) : "");
+            ",split_k=" + std::to_string(split_k) + (e0 ? ",e0=" + std::to_string(e0) : "") +
+            (k2 ? ",k2=" + std::to_string(k2) + ",e2=" + std::to_string(e2) : "");
     }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
         if (mode != 0) {
             ggml_mul_mat_id_set_split(out, mode, split_k, e0, e0 + n_mats/2);
+        }
+        if (k2 > 0) {
+            ggml_mul_mat_id_set_split2(out, k2, e2, n_mats);
         }
         if (skip) {
             ggml_mul_mat_id_set_skip(out, new_mmid_skip_w(ctx, n_used, n));
@@ -5447,8 +5454,11 @@ struct test_mul_mat_id_cache : public test_case {
     const int split_k, e1, n_slots, n_steps;
     const bool skip;
     const bool lfu; // usage scores (ggml_mul_mat_id_set_cache_score)
+    const int  k2;  // > 0: each step also has the second share (mode 3, first k2 of the rest in [e1/2, n_mats)) on a copy
+                    // of the cache state, so its replay of the first share's choice is checked over the steps
     std::string vars() override {
-        return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip) + ",lfu=" + std::to_string(lfu);
+        return VARS_TO_STR11(type_a, n_mats, n_used, m, n, k, split_k, e1, n_slots, n_steps, skip) + ",lfu=" + std::to_string(lfu) +
+            (k2 ? ",k2=" + std::to_string(k2) : "");
     }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5457,9 +5467,9 @@ struct test_mul_mat_id_cache : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     test_mul_mat_id_cache(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int split_k, int e1,
-            int n_slots, int n_steps, bool skip, bool lfu = false)
+            int n_slots, int n_steps, bool skip, bool lfu = false, int k2 = 0)
         : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), split_k(split_k), e1(e1), n_slots(n_slots),
-          n_steps(n_steps), skip(skip), lfu(lfu) {}
+          n_steps(n_steps), skip(skip), lfu(lfu), k2(k2) {}
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
@@ -5474,6 +5484,11 @@ struct test_mul_mat_id_cache : public test_case {
         if (lfu) {
             score = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_mats);
             ggml_set_name(score, "cache_score");
+        }
+        ggml_tensor * state2 = nullptr;
+        if (k2 > 0) {
+            state2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2*n_slots + 1);
+            ggml_set_name(state2, "cache_state2");
         }
         ggml_tensor * sum = nullptr;
         for (int s = 0; s < n_steps; ++s) {
@@ -5490,6 +5505,17 @@ struct test_mul_mat_id_cache : public test_case {
                 ggml_mul_mat_id_set_cache_score(out, score);
             }
             sum = sum ? ggml_add(ctx, sum, out) : out;
+            if (state2) {
+                // after the first share's node, as in the model graph (both update their own copy of the state)
+                ggml_tensor * out2 = ggml_mul_mat_id(ctx, as, b, ids);
+                ggml_mul_mat_id_set_split(out2, 3, split_k, 0, e1);
+                ggml_mul_mat_id_set_split2(out2, k2, e1/2, n_mats);
+                if (sw) {
+                    ggml_mul_mat_id_set_skip(out2, sw);
+                }
+                ggml_mul_mat_id_set_cache(out2, state2, nullptr);
+                sum = ggml_add(ctx, sum, out2);
+            }
         }
         ggml_set_name(sum, "out");
         return sum;
@@ -5497,13 +5523,15 @@ struct test_mul_mat_id_cache : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::random_device rd;
         std::default_random_engine rng(rd());
-        ggml_tensor * as = nullptr, * state = nullptr, * cache = nullptr;
+        ggml_tensor * as = nullptr, * state = nullptr, * state2 = nullptr, * cache = nullptr;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "as") == 0 || strcmp(t->name, "b") == 0) {
                 init_tensor_uniform(t);
                 as = strcmp(t->name, "as") == 0 ? t : as;
             } else if (strcmp(t->name, "cache_state") == 0) {
                 state = t;
+            } else if (strcmp(t->name, "cache_state2") == 0) {
+                state2 = t;
             } else if (strcmp(t->name, "cache_score") == 0) {
                 // scores that disagree with recency, so the policies pick different experts and victims
                 std::vector<int32_t> sc(t->ne[0]);
@@ -5539,6 +5567,9 @@ struct test_mul_mat_id_cache : public test_case {
         }
         st[2*n_slots] = n_slots + 5;
         ggml_backend_tensor_set(state, st.data(), 0, st.size()*sizeof(int32_t));
+        if (state2) {
+            ggml_backend_tensor_set(state2, st.data(), 0, st.size()*sizeof(int32_t));
+        }
     }
 };
 
@@ -10389,6 +10420,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 2));
             }
         }
+        // second share (a second GPU at 1-4 tokens): mode 3 takes the first k2 of what the first share leaves in [e2, n_mats),
+        // mode 2 then computes neither share's slots; e2 inside the first share's range, so the exclusion matters
+        for (int mode : {2, 3}) {
+            for (int n : {1, 2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, false, 6, 0, 2, 16));
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 64, 16, 64, n, 256, true, 6, 0, 3, 24));
+                test_cases.emplace_back(new test_mul_mat_id_split(type_a, mode, 8, 4, 64, n, 256, true, 2, 0, 2, 2));
+            }
+        }
         // range split of a large batch (prompt processing: k covers every expert of the range, no cache)
         for (int mode : {1, 2}) {
             for (int n : {16, 64, 129}) {
@@ -10419,6 +10459,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, true));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true, true));
             test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 32, 10, 4, false, true));
+            // second share replaying the first share's cache decisions on its own copy of the state
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 16, 4, 64, n, 256, 2, 16, 3, 4, false, false, 2));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 6, 64, 10, 4, true, false, 2));
+            test_cases.emplace_back(new test_mul_mat_id_cache(type_a, 64, 16, 64, n, 256, 2, 64, 6, 6, false, false, 4));
         }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_0}) {
@@ -11578,6 +11622,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // TEMP K3 KDA (96 heads x 128, per-channel decay): decode verify (3 tokens, rollback snapshots), single token,
+    // a short prompt, permuted inputs (multi-column-per-warp CUDA kernel)
+    for (int64_t n_tok : {1, 2, 3, 4, 7}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, n_tok, 1, 1, false, true, /*K=*/3));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, 1, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, 12, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, 3, 2, 1, true, true, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 3, 1, 1, false, false, /*K=*/3));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -11823,6 +11877,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // TEMP K3 MLA decode: 96 query heads on one latent KV head (K 576, V = first 512 of K), f16 cache, 3-token verify
+    for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
+        for (int64_t kv : {512, 8192, 32768, 65536, 98304}) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {96, 1}, kv, 3, true, false, 0, 0, prec,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+        }
+    }
+
+    // TEMP K3 KDA decode step (3-token verify with rollback snapshots) and single token
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, 3, 1, 1, false, true, /*K=*/3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 96, 128, 1, 1, 1, false, true));
 
     // TEMP K3 router top-k
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {896, 1, 1, 1}, GGML_SORT_ORDER_DESC));
