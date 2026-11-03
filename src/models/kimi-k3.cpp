@@ -346,7 +346,36 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         // what draft models (DFlash) are trained on as "the output of layer il-1"
         res->t_layer_inp[il] = cur;
 
-        if (k3_pred_dump_path() && use_attn_res && layer.ffn_gate_inp) {
+        // TEMP (with LLAMA_K3_PRED_DUMP): LLAMA_K3_PRED_AHEAD="1,2,4" predicts the routing of layer il+k from this
+        // layer's stream through layer il+k's own ffn-side mix, norm and router (dumped as layer il+k): tag 10+k from
+        // the pre-attention stream, 20+k from the stream after this layer's attention (cross-layer expert prefetch study)
+        static const std::vector<int> pred_ahead = [] {
+            std::vector<int> v;
+            const char * e = getenv("LLAMA_K3_PRED_AHEAD");
+            for (const char * c = e; c && *c; ) {
+                v.push_back(atoi(c));
+                c = strchr(c, ',');
+                c = c ? c + 1 : nullptr;
+            }
+            return v;
+        }();
+        auto pred_ahead_dump = [&](ggml_tensor * stream, int tag0) {
+            for (int k : pred_ahead) {
+                const int lt = il + k;
+                if (lt >= n_layer || !model.layers[lt].ffn_gate_inp) {
+                    continue;
+                }
+                const auto & lay = model.layers[lt];
+                ggml_tensor * x = res_mix(stream, lay.ffn_res_score, n_tokens, lt);
+                x = build_norm(x, lay.ffn_norm, NULL, LLM_NORM_RMS, lt);
+                k3_pred_dump(ctx0, gf, ggml_mul_mat(ctx0, lay.ffn_gate_inp, x), lay.ffn_exp_probs_b, tag0 + k, lt);
+            }
+        };
+        if (k3_pred_dump_path() && use_attn_res && !pred_ahead.empty()) {
+            pred_ahead_dump(prefix_sum, 10);
+        }
+
+        if (k3_pred_dump_path() && use_attn_res && layer.ffn_gate_inp && pred_ahead.empty()) {
             for (int tag : {1, 2}) {
                 ggml_tensor * x = tag == 1 ? res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il) : cur;
                 x = build_norm(x, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
@@ -403,6 +432,9 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
         }
 
         prefix_sum = banked ? cur : ggml_add(ctx0, prefix_sum, cur);
+        if (k3_pred_dump_path() && use_attn_res && !pred_ahead.empty()) {
+            pred_ahead_dump(prefix_sum, 20);
+        }
         cb(prefix_sum, "prefix_sum_attn", il);
 
         cur = use_attn_res ? res_mix(prefix_sum, layer.ffn_res_score, n_tokens, il)
