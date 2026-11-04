@@ -4264,6 +4264,52 @@ static void ggml_cpu_prof_print(void) {
     }
 }
 
+// TEMP: GGML_MOE_NORM_DUMP=<file>: per (layer, expert) sum / sum of squares / count of the L2 norm of each routed slot's
+// expert output (the dst rows of the ffn_moe_down-<il> MUL_MAT_ID nodes), written at exit. For calibrating an
+// importance-aware expert skip; run with every expert on the CPU (no GPU share) and no skip.
+enum { MOE_NORM_LAYERS = 128, MOE_NORM_EXPERTS = 1024 };
+static double (*g_moe_norm)[MOE_NORM_EXPERTS][3];
+static const char * g_moe_norm_path;
+static void ggml_moe_norm_write(void) {
+    FILE * f = fopen(g_moe_norm_path, "wb");
+    if (!f) return;
+    const int32_t hdr[2] = { MOE_NORM_LAYERS, MOE_NORM_EXPERTS };
+    fwrite(hdr, sizeof(hdr), 1, f);
+    fwrite(g_moe_norm, sizeof(double)*3, (size_t) MOE_NORM_LAYERS*MOE_NORM_EXPERTS, f);
+    fclose(f);
+}
+static void ggml_moe_norm_accumulate(const struct ggml_tensor * node) {
+    static int init = -1;
+    if (init < 0) {
+        g_moe_norm_path = getenv("GGML_MOE_NORM_DUMP");
+        init = g_moe_norm_path != NULL;
+        if (init) {
+            g_moe_norm = calloc((size_t) MOE_NORM_LAYERS*MOE_NORM_EXPERTS, sizeof(double)*3);
+            atexit(ggml_moe_norm_write);
+        }
+    }
+    if (!init || node->op != GGML_OP_MUL_MAT_ID || strncmp(node->name, "ffn_moe_down-", 13) != 0 || node->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int il = atoi(node->name + 13);
+    const struct ggml_tensor * ids = node->src[2];
+    if (il < 0 || il >= MOE_NORM_LAYERS) return;
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int64_t j = 0; j < ids->ne[0]; ++j) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            if (e < 0 || e >= MOE_NORM_EXPERTS) continue;
+            const float * row = (const float *) ((const char *) node->data + j*node->nb[1] + t*node->nb[2]);
+            double ss = 0.0;
+            for (int64_t k = 0; k < node->ne[0]; ++k) ss += (double) row[k]*(double) row[k];
+            if (ss == 0.0) continue; // skipped / computed elsewhere
+            const double n = sqrt(ss);
+            g_moe_norm[il][e][0] += n;
+            g_moe_norm[il][e][1] += n*n;
+            g_moe_norm[il][e][2] += 1.0;
+        }
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -4324,6 +4370,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            ggml_barrier(state->threadpool);
+        }
+        static int moe_norm_on = -1; // TEMP calibration (GGML_MOE_NORM_DUMP)
+        if (moe_norm_on < 0) {
+            moe_norm_on = getenv("GGML_MOE_NORM_DUMP") != NULL;
+        }
+        if (moe_norm_on) {
+            // TEMP calibration: thread 0 reads the finished output, the others wait
+            if (node_n + 1 >= cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
+            if (state->ith == 0) {
+                ggml_moe_norm_accumulate(node);
+            }
             ggml_barrier(state->threadpool);
         }
         if (prof) {

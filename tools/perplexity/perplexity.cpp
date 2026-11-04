@@ -1909,6 +1909,27 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
+    // mean KLD by position within the ubatch, for verify-sized batches (each chunk is decoded from its start in
+    // batches of n_ubatch tokens; in speculative decoding position k is only used once the k drafts before it are accepted)
+    {
+        const int nub = (int) llama_n_ubatch(ctx);
+        if (nub > 1 && nub <= 8 && n_batch == nub) {
+            const size_t per = size_t(n_ctx - 1 - first);
+            double sum[8] = {};
+            size_t cnt[8] = {};
+            for (size_t k = 0; k < (size_t) (kld_ptr - kld_values.data()); ++k) {
+                const int p = (int) ((first + k % per) % nub);
+                sum[p] += kld_values[k];
+                cnt[p] += 1;
+            }
+            LOG("KLD by ubatch position:");
+            for (int p = 0; p < nub; ++p) {
+                LOG(" %d: %.5f (%zu)", p, cnt[p] ? sum[p]/cnt[p] : 0.0, cnt[p]);
+            }
+            LOG("\n");
+        }
+    }
+
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
 

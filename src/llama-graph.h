@@ -1090,6 +1090,8 @@ struct llm_graph_context {
     mutable ggml_tensor * moe_pf_copy_inline = nullptr;
     mutable std::vector<ggml_tensor *> moe_pf_list;
     mutable std::vector<ggml_tensor *> moe_pf_copy;
+    // expert skip threshold per token of a verify batch (LLAMA_MOE_SKIP_POS), built once per graph
+    mutable ggml_tensor * moe_skip_tau_pos = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

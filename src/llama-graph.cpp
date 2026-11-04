@@ -2187,11 +2187,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             tau = r.tau;
         }
     }
+    // LLAMA_MOE_SKIP_POS=t0,t1,t2: in batches of 2-4 tokens (speculative verify) token k uses tau t_k instead: the logits
+    // of a later draft position are only used when the drafts before it are accepted, so it can skip more. The
+    // thresholds follow the parabola through (0, t0), (1, t1), (2, t2), clamped to their range (position 3 included)
+    static const std::vector<float> skip_pos = [] {
+        std::vector<float> v;
+        const char * s = getenv("LLAMA_MOE_SKIP_POS");
+        float t; int n;
+        while (s && v.size() < 3 && sscanf(s, "%f%n", &t, &n) == 1) {
+            v.push_back(t);
+            s += n;
+            s = *s == ',' ? s + 1 : nullptr;
+        }
+        while (!v.empty() && v.size() < 3) {
+            v.push_back(v.back());
+        }
+        return v;
+    }();
+    const bool use_skip_pos = !skip_pos.empty() && tau > 0.0f && n_tokens >= 2 && n_tokens <= 4;
+    if (use_skip_pos && !moe_skip_tau_pos) {
+        const float t0 = skip_pos[0], t1 = skip_pos[1], t2 = skip_pos[2];
+        const float b  = (-3.0f*t0 + 4.0f*t1 - t2)/2.0f;
+        const float c  = (t0 - 2.0f*t1 + t2)/2.0f;
+        ggml_tensor * pos = ggml_arange(ctx0, 0.0f, (float) n_tokens, 1.0f);                   // [n_tokens]
+        ggml_tensor * tp  = ggml_add(ctx0, ggml_scale_bias(ctx0, pos, b, t0), ggml_scale(ctx0, ggml_sqr(ctx0, pos), c));
+        tp = ggml_clamp(ctx0, tp, std::min(t0, std::min(t1, t2)), std::max(t0, std::max(t1, t2)));
+        moe_skip_tau_pos = ggml_reshape_2d(ctx0, tp, 1, n_tokens);
+        cb(moe_skip_tau_pos, "ffn_moe_skip_tau_pos", -1);
+    }
     ggml_tensor * skip_w = nullptr;
     if (tau > 0.0f && norm_w && !weight_before_ffn) {
         ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
-        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -tau));
+        ggml_tensor * keep = use_skip_pos
+            ? ggml_step(ctx0, ggml_sub(ctx0, w2, moe_skip_tau_pos))
+            : ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -tau));
         if (skip_union && n_tokens > 1) {
             // tokens per expert: scatter a one-hot selection mask [1, n_expert, n_tokens] and sum over tokens
             ggml_tensor * ones = ggml_fill(ctx0, weights, 1.0f);                                  // [1, n_used, n_tokens]
