@@ -990,6 +990,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 causal_attn = std::strcmp(buf, "true") == 0;
             }
         }
+        // TEMP experiment (LLAMA_DFLASH_CAUSAL=0/1): override the in-block attention direction. z-lab's model.py,
+        // SGLang and SpecForge make sliding_attention layers causal when the config has no is_causal; the
+        // Kimi-K3 DFlash draft (all layers sliding) was converted without dflash.attention.causal
+        if (const char * e = getenv("LLAMA_DFLASH_CAUSAL")) {
+            causal_attn = atoi(e) != 0;
+        }
+        LOG_INF("%s: in-block attention: %s\n", __func__, causal_attn ? "causal" : "bidirectional");
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
