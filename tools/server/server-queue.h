@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(bool)>                 callback_idle;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -125,6 +126,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register the function to be called about once a second while there are no tasks (mutex_tasks not held),
+    // and with force = true right before entering the sleeping state (mutex_tasks held)
+    void on_idle(std::function<void(bool)> callback) {
+        callback_idle = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

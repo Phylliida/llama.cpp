@@ -245,6 +245,9 @@ struct server_slot {
 
     common_memory mem;
 
+    // released with a state the disk prompt cache does not have yet
+    bool disk_unsaved = false;
+
     // multimodal
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -1331,7 +1334,8 @@ private:
             slot.callback_on_release = [this](int id_slot) {
                 if (prompt_disk) {
                     if (server_slot * slot = get_slot_by_id(id_slot)) {
-                        prompt_disk_save(*slot);
+                        // written once the slot has been idle for a moment, see prompt_disk_idle()
+                        slot->disk_unsaved = true;
                     }
                 }
                 queue_tasks.pop_deferred_task(id_slot);
@@ -1457,6 +1461,11 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        if (prompt_disk) {
+            queue_tasks.on_idle([this](bool force) {
+                prompt_disk_idle(force);
+            });
+        }
 
         metrics.init();
 
@@ -1687,6 +1696,11 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // the slot moves to another prompt: write its state now if it was not yet
+                if (prompt_disk && ret->disk_unsaved) {
+                    prompt_disk_save(*ret);
+                }
+
                 ret->prompt_save(*prompt_cache);
 
                 if (prompt_disk) {
@@ -1732,8 +1746,21 @@ private:
         return server_prompt_disk::hash(types, sizeof(types), h);
     }
 
+    // write the released slots after a quiet moment: a client that answers right away (an agent's tool
+    // results) does not wait for the state copy, which takes ~1.5 s for K3 (more at long contexts)
+    void prompt_disk_idle(bool force) {
+        const int64_t t_now = ggml_time_us();
+        for (auto & slot : slots) {
+            if (slot.disk_unsaved && !slot.is_processing() && (force || t_now - slot.t_last_used >= 2000000)) {
+                prompt_disk_save(slot);
+            }
+        }
+    }
+
     // queue the state of a released slot for the disk prompt cache
-    void prompt_disk_save(const server_slot & slot) {
+    void prompt_disk_save(server_slot & slot) {
+        slot.disk_unsaved = false;
+
         // released completions only; tiny prompts are quick to process again
         if (!slot.task_prev || slot.task_prev->type != SERVER_TASK_TYPE_COMPLETION || slot.prompt.n_tokens() < 256) {
             return;
@@ -1754,9 +1781,23 @@ private:
         server_prompt_cache_state state;
         state.prompt.tokens = slot.prompt.tokens.clone();
 
+        // a draft memory that can drop any tail (a KV cache) needs no copy per checkpoint: restoring one
+        // removes the draft's positions past it from the full draft state (load_dft() skips empty data)
+        const bool keep_dft = ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
         const auto & ckpts = slot.prompt.checkpoints;
         const size_t n_skip = ckpts.size() > server_prompt_disk::n_checkpoints_max ? ckpts.size() - server_prompt_disk::n_checkpoints_max : 0;
-        state.prompt.checkpoints.assign(std::next(ckpts.begin(), n_skip), ckpts.end());
+        for (auto it = std::next(ckpts.begin(), n_skip); it != ckpts.end(); ++it) {
+            auto & ckpt = state.prompt.checkpoints.emplace_back();
+            ckpt.n_tokens  = it->n_tokens;
+            ckpt.pos_min   = it->pos_min;
+            ckpt.pos_max   = it->pos_max;
+            ckpt.data_tgt  = it->data_tgt;
+            ckpt.data_spec = it->data_spec;
+            if (keep_dft) {
+                ckpt.data_dft = it->data_dft;
+            }
+        }
 
         state.data.main.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
         llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), state.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2559,6 +2600,9 @@ private:
                                 }
 
                                 if (params_base.kv_unified) {
+                                    if (prompt_disk && slot.disk_unsaved) {
+                                        prompt_disk_save(slot);
+                                    }
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -4292,6 +4336,11 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // terminated: slots released within the idle delay are not on disk yet
+    if (impl->prompt_disk) {
+        impl->prompt_disk_idle(true);
+    }
 }
 
 void server_context::terminate() {

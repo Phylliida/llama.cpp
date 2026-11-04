@@ -325,6 +325,9 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
             // no tasks, check for sleeping state
             if (should_sleep()) {
+                if (callback_idle) {
+                    callback_idle(true);
+                }
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
                 // Call order cb0 -> cb1 -> cb{N}
@@ -356,6 +359,10 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 });
                 if (res) {
                     break; // new task arrived or terminate
+                }
+                if (callback_idle) {
+                    lock.unlock();
+                    callback_idle(false);
                 }
                 // otherwise, loop again to check sleeping condition
             }
