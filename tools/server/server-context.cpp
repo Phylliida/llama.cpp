@@ -1761,8 +1761,9 @@ private:
     void prompt_disk_save(server_slot & slot) {
         slot.disk_unsaved = false;
 
-        // released completions only; tiny prompts are quick to process again
-        if (!slot.task_prev || slot.task_prev->type != SERVER_TASK_TYPE_COMPLETION || slot.prompt.n_tokens() < 256) {
+        // released completions only; short prompts are quick to process again, while a hybrid model's state costs
+        // ~0.4 GB per checkpoint on disk whatever the length (K3: ~1.4 GB for a 300-token chat, 3.1 GB at 90k)
+        if (!slot.task_prev || slot.task_prev->type != SERVER_TASK_TYPE_COMPLETION || slot.prompt.n_tokens() < 2048) {
             return;
         }
 
