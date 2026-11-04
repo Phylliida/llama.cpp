@@ -1780,6 +1780,37 @@ static inline bool ggml_mmid_split_keep(int mode, bool split_range, int e, int e
 
 // TEMP: fused gate/up (decode path) per call: slots, skipped, taken by the GPU, unique experts read on the CPU
 static int64_t g_fused_calls, g_fused_slots, g_fused_skipped, g_fused_gpu, g_fused_experts;
+// TEMP: decode gate/up calls by batch size, and their CPU experts by token count (1..4)
+static int64_t g_fused_batch[5], g_fused_hist[5][5];
+
+// TEMP: phases of the pooled decode MUL_MAT_ID ops, [0] fused gate/up, [1] down (printed with GGML_CPU_OP_PROFILE):
+// setup = thread 0 from entry to the work start (serial setup + barrier), busy = per thread work time,
+// tail = last thread's end - mean end, per call
+static struct {
+    atomic_llong end_max, end_sum, busy;
+    atomic_int   n;
+    double       setup, busy_tot, tail;
+    long         calls;
+} g_mt[2];
+static double g_dn_quant, g_dn_block; // TEMP: down op setup parts on thread 0 (src1 quantization, the thread-0 block)
+static int ggml_cpu_prof_enabled(void);
+static void ggml_mt_end(int k, int64_t t_ws, int nth) {
+    const long long t_end = ggml_time_us();
+    atomic_fetch_add_explicit(&g_mt[k].end_sum, t_end, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mt[k].busy, t_end - t_ws, memory_order_relaxed);
+    long long prev = atomic_load_explicit(&g_mt[k].end_max, memory_order_relaxed);
+    while (t_end > prev && !atomic_compare_exchange_weak(&g_mt[k].end_max, &prev, t_end)) {}
+    if (atomic_fetch_add(&g_mt[k].n, 1) + 1 == nth) {
+        // last one: the next call starts only after the barrier that follows this node
+        g_mt[k].tail     += (double) atomic_load(&g_mt[k].end_max) - (double) atomic_load(&g_mt[k].end_sum)/nth;
+        g_mt[k].busy_tot += (double) atomic_load(&g_mt[k].busy)/nth;
+        g_mt[k].calls++;
+        atomic_store(&g_mt[k].end_max, 0);
+        atomic_store(&g_mt[k].end_sum, 0);
+        atomic_store(&g_mt[k].busy, 0);
+        atomic_store(&g_mt[k].n, 0);
+    }
+}
 // TEMP: routed slots seen / skipped by the down projections (printed with GGML_CPU_OP_PROFILE)
 static int64_t g_mmid_slots_total;
 static int64_t g_mmid_slots_skipped;
@@ -1984,6 +2015,35 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// quantize src1 into wdata for MUL_MAT_ID: the (row, block) pairs of all rows are split evenly over the threads
+// (a per-row split leaves most threads idle when rows are short, e.g. the 6-block rows of the down projection)
+static void ggml_mmid_quantize_src1(const struct ggml_compute_params * params, const struct ggml_tensor * src1,
+                                    enum ggml_type vec_dot_type, ggml_from_float_t from_float) {
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const size_t  nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+
+    char * wdata = params->wdata;
+    const size_t nbw0 = ggml_type_size(vec_dot_type);
+    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+    const size_t nbw2 = nbw1*ne11;
+    const size_t nbw3 = nbw2*ne12;
+    const int64_t bs   = ggml_blck_size(vec_dot_type);
+    const int64_t nblk = ne10/bs;
+    const int64_t ntot = nblk*ne11*ne12*ne13;
+    const int64_t k1   = (params->ith + 1)*ntot/params->nth;
+    for (int64_t k = params->ith*ntot/params->nth; k < k1; ) {
+        const int64_t r   = k / nblk;
+        const int64_t b   = k % nblk;
+        const int64_t n   = MIN(nblk - b, k1 - k);
+        const int64_t i11 = r % ne11;
+        const int64_t i12 = (r / ne11) % ne12;
+        const int64_t i13 = r / (ne11*ne12);
+        from_float((const float *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + b*bs*nb10),
+                   (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + b*nbw0), n*bs);
+        k += n;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1996,6 +2056,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+    const int64_t t_mt_entry = ggml_cpu_prof_enabled() ? ggml_time_us() : 0;
 
     const enum ggml_type type = src0->type;
 
@@ -2033,6 +2094,10 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
+    // dst rows of the skipped / taken slots: listed by thread 0, zeroed by all threads after the barrier
+    int64_t * zero_rows = // [1 + ids->ne[0]*ids->ne[1]]
+        incr_ptr_aligned(&wdata_cur, (1 + ids->ne[0]*ids->ne[1])*sizeof(int64_t), sizeof(int64_t));
+
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
@@ -2061,21 +2126,12 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
+        GGML_UNUSED(wdata); GGML_UNUSED(nbw0); GGML_UNUSED(nbw3);
+        ggml_mmid_quantize_src1(params, src1, vec_dot_type, from_float);
 #endif
     }
 
+    const int64_t t_dn_q = t_mt_entry ? ggml_time_us() : 0;
     if (ith == 0) {
         // TEMP: GGML_MMID_DUMP=<file> appends the routing of each layer (on the ffn_moe_down node):
         // int32 layer, int32 n_ids, int32 n_tokens, then n_tokens x n_ids int32 expert ids
@@ -2122,6 +2178,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        zero_rows[0] = 0;
 
         // split mode (ggml_mul_mat_id_set_split)
         const int32_t split_mode = ggml_get_op_params_i32(dst, 4);
@@ -2165,13 +2222,13 @@ static void ggml_compute_forward_mul_mat_id(
                     if (count_slots) {
                         g_mmid_slots_skipped++;
                     }
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    zero_rows[1 + zero_rows[0]++] = id*nb1 + iid1*nb2;
                     continue;
                 }
 
                 if (split_mode != 0 && !ggml_mmid_split_keep(split_mode, split_range, i02, split_e0, split_e1,
                         taken, n_taken, taken2, n_taken2)) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    zero_rows[1 + zero_rows[0]++] = id*nb1 + iid1*nb2;
                     continue;
                 }
 
@@ -2185,6 +2242,10 @@ static void ggml_compute_forward_mul_mat_id(
                 g_mmid_experts += matrix_row_counts[a] > 0;
             }
         }
+        if (t_mt_entry && ids->ne[1] <= 4) {
+            g_dn_quant += t_dn_q - t_mt_entry;
+            g_dn_block += ggml_time_us() - t_dn_q;
+        }
     }
 
     // reset current_chunk
@@ -2194,6 +2255,15 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    const int64_t t_mt_ws = t_mt_entry ? ggml_time_us() : 0;
+    if (t_mt_entry && ith == 0 && ids->ne[1] <= 4) {
+        g_mt[1].setup += t_mt_ws - t_mt_entry;
+    }
+
+    for (int64_t i = ith; i < zero_rows[0]; i += nth) {
+        memset((char *) dst->data + zero_rows[1 + i], 0, ne0*sizeof(float));
+    }
 
     // decode (a handful of tokens): every routed expert has only a few rows, so the per-expert
     // split below gives each thread one fixed slice per expert and the slowest thread sets the
@@ -2226,6 +2296,9 @@ static void ggml_compute_forward_mul_mat_id(
                     ir0_start, ir0_end, 0, matrix_row_counts[cur_a],
                     (const char *) src0->data + cur_a * nb02, matrix_rows, row_size, src1_cont, wdata);
             }
+            if (t_mt_entry) {
+                ggml_mt_end(1, t_mt_ws, nth);
+            }
             return;
         }
 
@@ -2240,6 +2313,9 @@ static void ggml_compute_forward_mul_mat_id(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, 0, matrix_row_counts[cur_a],
                 (const char *) src0->data + cur_a * nb02, matrix_rows, row_size, src1_cont, wdata);
+        }
+        if (t_mt_entry) {
+            ggml_mt_end(1, t_mt_ws, nth);
         }
         return;
     }
@@ -3668,6 +3744,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // zero_rows: count + dst offsets of the skipped / taken slots
+                        cur += (1 + ids->ne[0]*ids->ne[1])*sizeof(int64_t) + sizeof(int64_t);
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
@@ -3849,12 +3927,8 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     const int64_t ne02 = src0g->ne[2];
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
-    const size_t  nb10 = src1->nb[0];
     const size_t  nb11 = src1->nb[1];
     const size_t  nb12 = src1->nb[2];
-    const size_t  nb13 = src1->nb[3];
 
     const enum ggml_type type = src0g->type;
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
@@ -3865,6 +3939,7 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     const int  n_ids     = ids->ne[0];
     const int  n_as      = ne02;
     const bool src1_cont = ggml_is_contiguous(src1);
+    const int64_t t_mt_entry = ggml_cpu_prof_enabled() ? ggml_time_us() : 0;
 
     void * wdata_cur = params->wdata;
     if (src1->type != vec_dot_type) {
@@ -3874,30 +3949,17 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     struct mmid_row_mapping * matrix_rows =
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    // dst rows of the skipped / taken slots: listed by thread 0, zeroed by all threads after the barrier
+    int64_t * zero_rows = incr_ptr_aligned(&wdata_cur, (1 + ids->ne[0]*ids->ne[1])*sizeof(int64_t), sizeof(int64_t));
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-        const size_t bs   = ggml_blck_size(vec_dot_type);
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    const int64_t b0 = (ith * ne10/bs) / nth;
-                    const int64_t b1 = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + b0*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + b0*nbw0),
-                               (b1 - b0) * bs);
-                }
-            }
-        }
+        ggml_mmid_quantize_src1(params, src1, vec_dot_type, from_float);
     }
 
     if (ith == 0) {
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        zero_rows[0] = 0;
 
         const int32_t split_mode = ggml_get_op_params_i32(gate, 4);
         const int32_t split_k    = ggml_get_op_params_i32(gate, 5);
@@ -3937,12 +3999,12 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
                 assert(i02 >= 0 && i02 < n_as);
                 if (ggml_mmid_slot_skipped(gate->src[3], id, iid1)) {
-                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                    zero_rows[1 + zero_rows[0]++] = id*dst->nb[1] + iid1*dst->nb[2];
                     continue;
                 }
                 if (split_mode != 0 && !ggml_mmid_split_keep(split_mode, split_range, i02, split_e0, split_e1,
                         taken, n_taken, taken2, n_taken2)) {
-                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                    zero_rows[1 + zero_rows[0]++] = id*dst->nb[1] + iid1*dst->nb[2];
                     g_fused_gpu++;
                     continue;
                 }
@@ -3968,7 +4030,11 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
             }
             for (int a = 0; a < n_as; ++a) {
                 g_fused_experts += matrix_row_counts[a] > 0;
+                if (matrix_row_counts[a] > 0) {
+                    g_fused_hist[ids->ne[1]][MIN(matrix_row_counts[a], 4)]++;
+                }
             }
+            g_fused_batch[ids->ne[1]]++;
         }
         // 0: shared pool, 1..: prefetch groups (ggml_mmid_pf_iter)
         for (int c = 0; c <= GGML_MOE_PF_GROUPS_MAX && c < n_as; ++c) {
@@ -3977,6 +4043,15 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
     }
 
     ggml_barrier(params->threadpool);
+
+    const int64_t t_mt_ws = t_mt_entry ? ggml_time_us() : 0;
+    if (t_mt_entry && ith == 0) {
+        g_mt[0].setup += t_mt_ws - t_mt_entry;
+    }
+
+    for (int64_t i = ith; i < zero_rows[0]; i += nth) {
+        memset((char *) dst->data + zero_rows[1 + i], 0, dst->ne[0]*sizeof(float));
+    }
 
     enum { MAX_ACTIVE = 256 };
     const int CHUNK_ROWS = ggml_mmid_chunk_rows();
@@ -4068,6 +4143,9 @@ static void ggml_compute_forward_mul_mat_id_situ_fused(
             }
         }
     }
+    if (t_mt_entry) {
+        ggml_mt_end(0, t_mt_ws, nth);
+    }
 }
 
 static int ggml_cpu_try_fuse_ops(
@@ -4151,6 +4229,27 @@ static void ggml_cpu_prof_print(void) {
                 (long long) g_fused_calls, (double) g_fused_slots/g_fused_calls, (double) g_fused_skipped/g_fused_calls,
                 (double) g_fused_gpu/g_fused_calls, (double) g_fused_experts/g_fused_calls);
         g_fused_calls = g_fused_slots = g_fused_skipped = g_fused_gpu = g_fused_experts = 0;
+        for (int b = 1; b <= 4; ++b) {
+            if (g_fused_batch[b] == 0) continue;
+            fprintf(stderr, "cpu-prof:   batch %d: %lld calls, CPU experts per call with 1/2/3/4 tokens: %.2f %.2f %.2f %.2f\n", b,
+                    (long long) g_fused_batch[b], (double) g_fused_hist[b][1]/g_fused_batch[b], (double) g_fused_hist[b][2]/g_fused_batch[b],
+                    (double) g_fused_hist[b][3]/g_fused_batch[b], (double) g_fused_hist[b][4]/g_fused_batch[b]);
+            g_fused_batch[b] = 0;
+            for (int c = 0; c <= 4; ++c) g_fused_hist[b][c] = 0;
+        }
+    }
+    for (int k = 0; k < 2; ++k) {
+        if (g_mt[k].calls == 0) continue;
+        fprintf(stderr, "cpu-prof: pooled %s per call (%ld): setup %.1f us, mean busy %.1f us, tail %.1f us\n",
+                k == 0 ? "gate/up" : "down   ", g_mt[k].calls, g_mt[k].setup/g_mt[k].calls, g_mt[k].busy_tot/g_mt[k].calls,
+                g_mt[k].tail/g_mt[k].calls);
+        if (k == 1) {
+            fprintf(stderr, "cpu-prof:   down setup on thread 0: quantize %.1f us, thread-0 block %.1f us\n",
+                    g_dn_quant/g_mt[k].calls, g_dn_block/g_mt[k].calls);
+            g_dn_quant = g_dn_block = 0;
+        }
+        g_mt[k].setup = g_mt[k].busy_tot = g_mt[k].tail = 0;
+        g_mt[k].calls = 0;
     }
     if (g_pf_calls > 0) {
         fprintf(stderr, "cpu-prof: staged experts per decode gate/up call (%lld calls): listed %.2f, used %.2f\n",
