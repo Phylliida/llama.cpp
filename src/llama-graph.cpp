@@ -2219,9 +2219,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (tau > 0.0f && norm_w && !weight_before_ffn) {
         ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
+        // LLAMA_MOE_SKIP_NORMS: skip by importance = weight x the expert's typical output norm (llama-context.cpp),
+        // normalized over the token's selected experts (with equal norms this is the weight itself)
+        ggml_tensor * exp_norm = moe_cache && il >= 0 && il < (int) moe_cache->size() ? (*moe_cache)[il].exp_norm : nullptr;
+        ggml_tensor * score = w2;
+        if (exp_norm) {
+            ggml_tensor * nrm = ggml_get_rows(ctx0, exp_norm,
+                    ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens));      // [1, n_used*n_tokens]
+            score = ggml_mul(ctx0, w2, ggml_reshape_2d(ctx0, nrm, n_expert_used, n_tokens));
+            score = ggml_div(ctx0, score, ggml_clamp(ctx0, ggml_sum_rows(ctx0, score), 1e-6f, INFINITY));
+            cb(score, "ffn_moe_importance", il);
+        }
         ggml_tensor * keep = use_skip_pos
-            ? ggml_step(ctx0, ggml_sub(ctx0, w2, moe_skip_tau_pos))
-            : ggml_step(ctx0, ggml_scale_bias(ctx0, w2, 1.0f, -tau));
+            ? ggml_step(ctx0, ggml_sub(ctx0, score, moe_skip_tau_pos))
+            : ggml_step(ctx0, ggml_scale_bias(ctx0, score, 1.0f, -tau));
         if (skip_union && n_tokens > 1) {
             // tokens per expert: scatter a one-hot selection mask [1, n_expert, n_tokens] and sum over tokens
             ggml_tensor * ones = ggml_fill(ctx0, weights, 1.0f);                                  // [1, n_used, n_tokens]

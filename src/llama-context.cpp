@@ -513,6 +513,21 @@ llama_context::llama_context(
         const bool kb2 = getenv("LLAMA_MOE_GPU_KB2") && atoi(getenv("LLAMA_MOE_GPU_KB2")) > 0;
         GGML_ASSERT(!(kb2 && lfu) && "LLAMA_MOE_GPU_KB2 needs the LRU cache (no usage scores)");
         moe_cache.resize(n_layer);
+        // LLAMA_MOE_SKIP_NORMS=<file>: per (layer, expert) output norm statistics (GGML_MOE_NORM_DUMP) for the
+        // importance-aware expert skip: int32 n_layers, n_experts, then n_layers x n_experts x {sum, sum sq, count} f64
+        std::vector<double> norm_stats;
+        int32_t norm_dims[2] = { 0, 0 };
+        if (const char * path = getenv("LLAMA_MOE_SKIP_NORMS")) {
+            FILE * f = fopen(path, "rb");
+            if (!f || fread(norm_dims, sizeof(norm_dims), 1, f) != 1) {
+                throw std::runtime_error(std::string("LLAMA_MOE_SKIP_NORMS: cannot read ") + path);
+            }
+            norm_stats.resize((size_t) norm_dims[0]*norm_dims[1]*3);
+            if (fread(norm_stats.data(), sizeof(double), norm_stats.size(), f) != norm_stats.size()) {
+                throw std::runtime_error(std::string("LLAMA_MOE_SKIP_NORMS: truncated ") + path);
+            }
+            fclose(f);
+        }
         size_t total = 0;
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -543,6 +558,9 @@ llama_context::llama_context(
                     moe_cache[il].score_cpu[x] = ggml_new_tensor_1d(cc, GGML_TYPE_I32, w[x]->ne[2]);
                 }
                 total += ggml_nbytes(moe_cache[il].cache[x]);
+            }
+            if (!norm_stats.empty() && il < norm_dims[0] && w[0]->ne[2] <= norm_dims[1]) {
+                moe_cache[il].exp_norm = ggml_new_tensor_2d(cg, GGML_TYPE_F32, 1, w[0]->ne[2]);
             }
         }
         // cross-layer expert prefetch (LLAMA_MOE_GPU_PREFETCH = experts staged per layer, see kimi-k3.cpp): a ring of 3 slots
@@ -591,6 +609,25 @@ llama_context::llama_context(
                     ggml_backend_tensor_set(mc.pf_list, none.data(), 0, none.size()*sizeof(int32_t));
                 }
             }
+        }
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * t = moe_cache[il].exp_norm;
+            if (!t) {
+                continue;
+            }
+            // mean output norm per expert relative to the layer mean; experts seen fewer than 20 times get the mean
+            const double * st = norm_stats.data() + (size_t) il*norm_dims[1]*3;
+            double sum = 0.0, cnt = 0.0;
+            for (int64_t e = 0; e < t->ne[1]; ++e) {
+                sum += st[3*e + 0];
+                cnt += st[3*e + 2];
+            }
+            const double mean = cnt > 0.0 ? sum/cnt : 1.0;
+            std::vector<float> v(t->ne[1]);
+            for (int64_t e = 0; e < t->ne[1]; ++e) {
+                v[e] = st[3*e + 2] >= 20.0 && mean > 0.0 ? (float) (st[3*e + 0]/st[3*e + 2]/mean) : 1.0f;
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
         }
         std::vector<int32_t> init(2*n_slots + 1, 0);
         std::fill(init.begin(), init.begin() + n_slots, -1);

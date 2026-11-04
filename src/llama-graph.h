@@ -786,6 +786,9 @@ struct llm_graph_moe_cache_layer {
     ggml_tensor * pf_list    = nullptr;
     ggml_tensor * pf_staging = nullptr;
     int           pf_slot    = -1;
+    // importance-aware expert skip (LLAMA_MOE_SKIP_NORMS): each expert's mean output norm relative to the layer's
+    // (F32 [1, n_expert], on the layer's GPU), null = skip by router weight alone
+    ggml_tensor * exp_norm   = nullptr;
 };
 
 struct llm_graph_params {
