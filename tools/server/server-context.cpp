@@ -928,6 +928,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_prompt_disk>  prompt_disk;
 
     server_metrics metrics;
 
@@ -1328,6 +1329,11 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                if (prompt_disk) {
+                    if (server_slot * slot = get_slot_by_id(id_slot)) {
+                        prompt_disk_save(*slot);
+                    }
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1389,6 +1395,15 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        if (!params_base.cache_disk_path.empty()) {
+            if (prompt_cache) {
+                prompt_disk = std::make_unique<server_prompt_disk>(params_base.cache_disk_path, params_base.cache_disk_mib,
+                        prompt_disk_fingerprint(), mctx != nullptr);
+            } else {
+                SRV_WRN("%s", "--cache-disk requires --cache-ram, disabling\n");
+            }
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -1674,6 +1689,10 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                if (prompt_disk) {
+                    prompt_disk->fetch(*prompt_cache, ret->prompt, task.tokens);
+                }
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -1685,6 +1704,71 @@ private:
         }
 
         return ret;
+    }
+
+    // identifies the models and cache types, so the disk prompt cache never restores a state into another model
+    uint64_t prompt_disk_fingerprint() const {
+        uint64_t h = server_prompt_disk::hash(nullptr, 0);
+
+        for (const llama_model * model : { model_tgt, model_dft }) {
+            if (!model) {
+                continue;
+            }
+            char desc[256] = {};
+            llama_model_desc(model, desc, sizeof(desc));
+            const uint64_t size     = llama_model_size(model);
+            const uint64_t n_params = llama_model_n_params(model);
+            h = server_prompt_disk::hash(desc, strlen(desc), h);
+            h = server_prompt_disk::hash(&size, sizeof(size), h);
+            h = server_prompt_disk::hash(&n_params, sizeof(n_params), h);
+        }
+
+        // tensors replaced from another file (the model size alone may not change)
+        if (const char * src = getenv("LLAMA_TENSOR_SOURCE")) {
+            h = server_prompt_disk::hash(src, strlen(src), h);
+        }
+
+        const int32_t types[2] = { (int32_t) params_base.cache_type_k, (int32_t) params_base.cache_type_v };
+        return server_prompt_disk::hash(types, sizeof(types), h);
+    }
+
+    // queue the state of a released slot for the disk prompt cache
+    void prompt_disk_save(const server_slot & slot) {
+        // released completions only; tiny prompts are quick to process again
+        if (!slot.task_prev || slot.task_prev->type != SERVER_TASK_TYPE_COMPLETION || slot.prompt.n_tokens() < 256) {
+            return;
+        }
+
+        if (prompt_disk->has(slot.prompt.tokens)) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        // no decode in flight (e.g. the draft's after the last verify) while reading the memory
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+
+        server_prompt_cache_state state;
+        state.prompt.tokens = slot.prompt.tokens.clone();
+
+        const auto & ckpts = slot.prompt.checkpoints;
+        const size_t n_skip = ckpts.size() > server_prompt_disk::n_checkpoints_max ? ckpts.size() - server_prompt_disk::n_checkpoints_max : 0;
+        state.prompt.checkpoints.assign(std::next(ckpts.begin(), n_skip), ckpts.end());
+
+        state.data.main.resize(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+        llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), state.data.main.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            state.data.drft.resize(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE));
+            llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), state.data.drft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        SLT_INF(slot, "queued prompt for the disk cache: %d tokens, %zu checkpoints, %.3f MiB, %.0f ms\n",
+                slot.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+
+        prompt_disk->save(std::move(state));
     }
 
     // return true if at least one slot has been cleared

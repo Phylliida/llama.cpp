@@ -5,8 +5,12 @@
 
 #include <string>
 #include <unordered_set>
+#include <condition_variable>
 #include <list>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -632,6 +636,55 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+};
+
+// persists prompt states in a directory, so a restarted server resumes long conversations without
+// processing them again. a background thread writes the state of each released slot; a new task
+// whose prompt matches a stored state better than the slot and the RAM entries reads it back
+// into the RAM cache, where server_prompt_cache::load() picks it up.
+struct server_prompt_disk {
+    // checkpoints stored per prompt: the newest ones, enough for a chat that rolls back to its previous prompt
+    static constexpr size_t n_checkpoints_max = 4;
+
+    server_prompt_disk(const std::string & dir, int32_t limit_size_mib, uint64_t fingerprint, bool has_mtmd);
+    ~server_prompt_disk();
+
+    // is the prompt (or a longer one starting with it) stored or queued?
+    bool has(const server_tokens & tokens);
+
+    // queue a state for writing, replacing a queued one that has not started yet
+    void save(server_prompt_cache_state && state);
+
+    // if a stored prompt beats the slot's prompt and every RAM entry for tokens_new, read it into the RAM cache
+    bool fetch(server_prompt_cache & cache, const server_prompt & prompt, const server_tokens & tokens_new);
+
+    static uint64_t hash(const void * data, size_t size, uint64_t h = 14695981039346656037ull);
+
+private:
+    struct entry {
+        std::string   path;
+        server_tokens tokens; // empty: a file of another model or format, evicted first
+        size_t        size;
+        int64_t       t_used; // file clock seconds
+    };
+
+    std::string dir;
+    size_t      limit_size; // bytes, 0 = no limit
+    uint64_t    fingerprint;
+    bool        has_mtmd;
+
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::list<entry>        entries; // least recently used first
+    std::unique_ptr<server_prompt_cache_state> pending;
+    bool                    stop = false;
+    std::thread             worker;
+
+    void   scan();
+    void   run();
+    size_t write_file(const server_prompt_cache_state & state, const std::string & path) const;
+    bool   read_file(const std::string & path, server_prompt_cache_state & state) const;
+    void   evict(); // mtx held
 };
 
 // used exclusively by router mode
