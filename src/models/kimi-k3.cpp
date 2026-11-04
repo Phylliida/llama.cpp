@@ -489,6 +489,12 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
                 ggml_tensor * cp = ggml_moe_prefetch_copy(ctx0, pf_list_next, nx.ffn_up_exps, nx.ffn_gate_exps, nx.ffn_down_exps,
                     mn.pf_staging, mn.pf_slot);
                 cp->flags |= GGML_TENSOR_FLAG_HOST_SRC;
+                // in the attention/router split (the CUDA backend issues it after that split's graph, on its own stream);
+                // LLAMA_MOE_GPU_PREFETCH_SPLIT=1: in a split of its own (more scheduler overhead)
+                static const bool pf_own_split = getenv("LLAMA_MOE_GPU_PREFETCH_SPLIT") && atoi(getenv("LLAMA_MOE_GPU_PREFETCH_SPLIT")) != 0;
+                if (!pf_own_split) {
+                    cp->flags &= ~GGML_TENSOR_FLAG_PREFETCH;
+                }
                 for (int i = 0; sched && i < ggml_backend_sched_get_n_backends(sched); ++i) {
                     ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
                     if (ggml_backend_get_device(b) == model.dev_layer(il + 1)) {

@@ -1054,18 +1054,24 @@ static __device__ __forceinline__ void mul_mat_vec_q_moe_xm_rows(
 
 // Grid: (nrows_x / (nwarps*rows_per_warp), n_experts), block: (warp_size, nwarps).
 template <ggml_type type, int rows_per_warp, int max_tok>
+// vx2 (optional): experts >= e_split are read from vx2 (index e - e_split), e.g. staged experts outside the cache
 static __global__ void mul_mat_vec_q_moe_xm(
         const void * GGML_CUDA_RESTRICT vx, const void * GGML_CUDA_RESTRICT vy,
         const int32_t * GGML_CUDA_RESTRICT experts, const int32_t * GGML_CUDA_RESTRICT slots, float * GGML_CUDA_RESTRICT dst,
         const uint32_t ncols_x, const int n_tokens, const uint32_t nchannels_y,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst) {
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const void * GGML_CUDA_RESTRICT vx2, const int e_split) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
 
-    const int     r = blockIdx.y;
-    const int32_t e = experts[r];
+    const int r = blockIdx.y;
+    int32_t   e = experts[r];
     if (e < 0) {
         return;
+    }
+    if (vx2 && e >= e_split) {
+        vx = vx2;
+        e -= e_split;
     }
     const block_q8_1 * y[max_tok];
     float            * d[max_tok];
@@ -1919,17 +1925,18 @@ template <ggml_type type>
 static void mul_mat_vec_q_moe_xm_launch(const void * vx, const void * vy, const int32_t * experts, const int32_t * slots,
         float * dst, const int n_experts, const int ncols_x, const int nrows_x, const int n_tokens, const int nchannels_y,
         const int stride_row_x, const int stride_col_y, const int stride_col_dst,
-        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream) {
+        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst, cudaStream_t stream,
+        const void * vx2, const int e_split) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const dim3 block_nums(nrows_x / (MMVQ_XM_ROWS_PER_WARP*MMVQ_XM_NWARPS), n_experts);
     const dim3 block_dims(warp_size, MMVQ_XM_NWARPS);
     mul_mat_vec_q_moe_xm<type, MMVQ_XM_ROWS_PER_WARP, MMVQ_XM_MAX_TOK><<<block_nums, block_dims, 0, stream>>>(
         vx, vy, experts, slots, dst, ncols_x, n_tokens, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst);
+        stride_channel_x, stride_channel_y, stride_channel_dst, vx2, e_split);
 }
 
 void ggml_cuda_mul_mat_vec_q_moe_xm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-        const int32_t * experts, const int32_t * slots, const int n_experts, ggml_tensor * dst) {
+        const int32_t * experts, const int32_t * slots, const int n_experts, ggml_tensor * dst, const void * vx2, const int e_split) {
     GGML_ASSERT(ggml_cuda_mul_mat_vec_q_moe_xm_supported(src0, src1, dst));
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -1950,7 +1957,7 @@ void ggml_cuda_mul_mat_vec_q_moe_xm(ggml_backend_cuda_context & ctx, const ggml_
 
 #define XM_CASE(T) case T: mul_mat_vec_q_moe_xm_launch<T>(src0->data, src1_q8_1.get(), experts, slots, (float *) dst->data, \
         n_experts, ne00, ne01, ne12, ne11, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, \
-        stride_channel_dst, stream); break;
+        stride_channel_dst, stream, vx2, e_split); break;
     switch (src0->type) {
         XM_CASE(GGML_TYPE_Q4_0)
         XM_CASE(GGML_TYPE_Q8_0)

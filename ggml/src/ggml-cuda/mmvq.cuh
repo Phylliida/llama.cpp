@@ -16,7 +16,8 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
 // all its tokens (host weights over PCIe). Writes only those slots: dst must be zeroed first.
 bool ggml_cuda_mul_mat_vec_q_moe_xm_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_vec_q_moe_xm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-    const int32_t * experts, const int32_t * slots, int n_experts, ggml_tensor * dst);
+    const int32_t * experts, const int32_t * slots, int n_experts, ggml_tensor * dst,
+        const void * vx2 = nullptr, int e_split = 0);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
