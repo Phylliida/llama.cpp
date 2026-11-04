@@ -262,6 +262,7 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
     std::vector<std::vector<llama_token_data>> spec_draft_probs; // proposal distributions of sampled drafts
+    std::vector<float> spec_draft_conf;                          // drafter top-1 p per examined position (step log)
     std::mt19937 spec_rs_rng;                                    // stochastic verification
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -388,6 +389,7 @@ struct server_slot {
         if (can_speculate()) {
             spec_draft.clear();
             spec_draft_probs.clear();
+            spec_draft_conf.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3201,6 +3203,7 @@ private:
                             /* .prompt       = */ &slot.spec_prompt,
                             /* .result       = */ &slot.spec_draft,
                             /* .result_probs = */ use_draft_probs ? &slot.spec_draft_probs : nullptr,
+                            /* .result_conf  = */ &slot.spec_draft_conf,
                         };
 
                         drafting.push_back(&slot);
@@ -4093,6 +4096,21 @@ private:
                 slot.spec_draft_probs.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // TEMP experiment (LLAMA_SPEC_STEP_LOG=<file>): one line per verify step for tuning the draft length:
+                // time (us), context tokens (incl. the batch), drafted, accepted, checkpoint replay, drafter top-1 p per
+                // examined position
+                static FILE * f_step = getenv("LLAMA_SPEC_STEP_LOG") ? fopen(getenv("LLAMA_SPEC_STEP_LOG"), "a") : nullptr;
+                if (f_step) {
+                    fprintf(f_step, "%" PRId64 " %d %zu %zu %d", ggml_time_us(), slot.prompt.n_tokens(), n_draft, accepted.size() - 1,
+                            slot.spec_is_replay ? 1 : 0);
+                    for (float c : slot.spec_draft_conf) {
+                        fprintf(f_step, " %.4f", c);
+                    }
+                    fprintf(f_step, "\n");
+                    fflush(f_step);
+                }
+                slot.spec_draft_conf.clear();
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

@@ -73,6 +73,10 @@ struct common_speculative_draft_params {
     // optional: the proposal distribution (id, p) each draft token was sampled from, for stochastic verification
     // (common_sampler_sample_and_accept_n with draft_probs). Left empty by drafters that draft greedily
     std::vector<std::vector<llama_token_data>> * result_probs = nullptr;
+
+    // optional: the drafter's top-1 probability at each examined position (one more than the draft size when the
+    // draft was cut short by p_min). Filled by the DFlash drafter only
+    std::vector<float> * result_conf = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

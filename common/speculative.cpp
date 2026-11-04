@@ -943,6 +943,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     float        rs_greedy_above = 2.0f;
     std::mt19937 rs_rng{1234};
 
+    // confidence-based draft length (TEMP experiment, LLAMA_SPEC_P_MIN_MODE): which drafted tokens --spec-draft-p-min
+    // can cut: 0 every token by its own top-1 p, 1 from the 2nd token on by its own p, 2 from the 2nd token on by the
+    // product of the top-1 p so far (~ the chance the whole draft is accepted)
+    int32_t      p_min_mode = 0;
+    // TEMP experiment (LLAMA_SPEC_CUT_RAND=<prob>): drop the drafted tokens after the first with this probability.
+    // Lossless; it measures the step time of shorter drafts in the same session (LLAMA_SPEC_STEP_LOG in the server)
+    float        cut_rand   = 0.0f;
+    std::mt19937 cut_rng{4321};
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1057,6 +1066,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         if (const char * e = getenv("LLAMA_SPEC_RS_GREEDY_ABOVE")) {
             rs_greedy_above = (float) atof(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_P_MIN_MODE")) {
+            p_min_mode = atoi(e);
+        }
+        if (const char * e = getenv("LLAMA_SPEC_CUT_RAND")) {
+            cut_rand = (float) atof(e);
+        }
+        if (this->params.p_min > 0.0f || cut_rand > 0.0f) {
+            LOG_INF("%s: draft length: p_min %.3f mode %d, random cut %.3f\n", __func__, this->params.p_min, p_min_mode, cut_rand);
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
@@ -1251,6 +1269,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (dp.result_probs) {
                 dp.result_probs->clear();
             }
+            if (dp.result_conf) {
+                dp.result_conf->clear();
+            }
 
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
@@ -1312,6 +1333,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                float conf_prod = 1.0f;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
@@ -1327,8 +1349,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     common_sampler_temp_set_draft_cands(i - 1, cur_p); // TEMP experiment (LLAMA_SPEC_RS_STATS)
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    const float conf = cur_p->data[0].p;
+                    conf_prod *= conf;
+                    if (dp.result_conf) {
+                        dp.result_conf->push_back(conf);
+                    }
+
+                    if (p_min_mode == 0 && conf < params.p_min) {
                         break;
+                    }
+                    if (i >= 2) {
+                        if ((p_min_mode == 1 && conf < params.p_min) || (p_min_mode == 2 && conf_prod < params.p_min)) {
+                            break;
+                        }
+                        if (cut_rand > 0.0f && std::uniform_real_distribution<float>(0.0f, 1.0f)(cut_rng) < cut_rand) {
+                            break;
+                        }
                     }
 
                     if (result_probs) {
