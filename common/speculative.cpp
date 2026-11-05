@@ -951,6 +951,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // Lossless; it measures the step time of shorter drafts in the same session (LLAMA_SPEC_STEP_LOG in the server)
     float        cut_rand   = 0.0f;
     std::mt19937 cut_rng{4321};
+    // TEMP experiment (LLAMA_DFLASH_FULL_BLOCK=1): decode the whole trained block ([anchor, mask x ...] as in
+    // training; matters for drafts with bidirectional in-block attention) and read only the first n_max drafts
+    bool         full_block      = false;
+    int32_t      n_draft_trained = 0;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1027,6 +1031,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+        n_draft_trained = n_draft_max;
+        if (const char * e = getenv("LLAMA_DFLASH_FULL_BLOCK")) {
+            full_block = atoi(e) != 0;
+        }
+        LOG_INF("%s: draft block: %s (%d positions decoded, n_max %d)\n", __func__, full_block ? "full" : "truncated",
+                (full_block ? n_draft_trained : this->params.n_max) + (is_dspark && sample_from_anchor ? 0 : 1), this->params.n_max);
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1238,7 +1248,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = full_block ? n_draft_trained : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1285,7 +1295,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
@@ -1315,7 +1325,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -1341,7 +1351,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 float conf_prod = 1.0f;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
