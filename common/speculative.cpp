@@ -933,6 +933,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // dspark speculators
     bool sample_from_anchor = true;
+    bool has_conf_head      = false; // DSpark confidence head (per-position acceptance estimate)
 
     // block-internal attention
     bool causal_attn = false;
@@ -1006,12 +1007,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        if (is_dspark && this->params.p_min > 0.0f) {
+        if (is_dspark) {
             char buf[16] = {};
-            const bool has_conf =
+            has_conf_head =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
+            if (!has_conf_head && this->params.p_min > 0.0f) {
                 throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
             }
         }
@@ -1321,14 +1322,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             if (is_dspark) {
-                // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // DSpark: read from the first draft slot, truncate below the confidence threshold (the confidence
+                // head's output; LLAMA_SPEC_P_MIN_MODE as for DFlash: 0 every token, 1 from the 2nd token on,
+                // 2 from the 2nd token on by the product)
+                const float * conf = (params.p_min > 0.0f || dp.result_conf) && has_conf_head ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+                float conf_prod = 1.0f;
                 for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf) {
+                        const float c = conf[(size_t) idx * n_embd_dec];
+                        conf_prod *= c;
+                        if (dp.result_conf) {
+                            dp.result_conf->push_back(c);
+                        }
+                        if (params.p_min > 0.0f) {
+                            const bool later = !result.empty();
+                            if ((p_min_mode == 0 && c < params.p_min) ||
+                                (later && p_min_mode == 1 && c < params.p_min) ||
+                                (later && p_min_mode == 2 && conf_prod < params.p_min)) {
+                                break;
+                            }
+                        }
+                    }
+                    if (!result.empty() && cut_rand > 0.0f && std::uniform_real_distribution<float>(0.0f, 1.0f)(cut_rng) < cut_rand) {
                         break;
                     }
 
@@ -1342,7 +1361,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id = cur_p->data[0].id;
+
+                    // sampled draft for stochastic verification. The in-graph Markov chain conditions the next
+                    // position on the argmax token, so its proposal is a function of the context only: still exact
+                    if (result_probs) {
+                        id = draft_sample(cur_p, result_probs->emplace_back());
+                    }
 
                     common_sampler_accept(smpl, id, true);
 
