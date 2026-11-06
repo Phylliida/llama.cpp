@@ -1956,6 +1956,37 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// TEMP experiment (LLAMA_MOE_SKIP_ORACLE): fraction of routed slots the oracle skip keeps, printed at exit
+static double g_moe_oracle_kept  = 0.0;
+static double g_moe_oracle_slots = 0.0;
+static void moe_oracle_report() {
+    if (g_moe_oracle_slots > 0.0) {
+        fprintf(stderr, "moe-oracle: kept %.4f of the routed slots (%.0f slots)\n", g_moe_oracle_kept/g_moe_oracle_slots, g_moe_oracle_slots);
+    }
+}
+static void moe_oracle_count(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        atexit(moe_oracle_report);
+    }
+    const int64_t n   = ggml_nelements(a);
+    const float * src = (const float *) a->data;
+    float       * out = (float *) dst->data;
+    double kept = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = src[i];
+        kept  += src[i];
+    }
+    g_moe_oracle_kept  += kept;
+    g_moe_oracle_slots += (double) n;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2168,6 +2199,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // LLAMA_MOE_SKIP_UNION=1: in a batch (e.g. speculative verify) an expert another token also selected is read
     // anyway, so only skip the low-weight experts no other token of the batch needs
     static const bool  skip_union  = getenv("LLAMA_MOE_SKIP_UNION") && atoi(getenv("LLAMA_MOE_SKIP_UNION")) != 0;
+    // TEMP experiment (LLAMA_MOE_SKIP_ORACLE=1, with LLAMA_MOE_SKIP=tau): decide the skip after computing every selected
+    // expert, by importance = weight x the slot's actual output norm: the upper bound of any output-norm predictor.
+    // Needs every expert on the CPU (no GPU share): GPU-share slots come back pre-summed
+    static const bool  skip_oracle = getenv("LLAMA_MOE_SKIP_ORACLE") && atoi(getenv("LLAMA_MOE_SKIP_ORACLE")) != 0;
     // LLAMA_MOE_SKIP_LAYERS=a-b:tau[,a-b:tau...]: a different tau for layers a..b (0 = no skip there); later ranges win
     struct skip_range { int a, b; float tau; };
     static const std::vector<skip_range> skip_ranges = [] {
@@ -2216,7 +2251,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(moe_skip_tau_pos, "ffn_moe_skip_tau_pos", -1);
     }
     ggml_tensor * skip_w = nullptr;
-    if (tau > 0.0f && norm_w && !weight_before_ffn) {
+    if (tau > 0.0f && norm_w && !weight_before_ffn && !skip_oracle) {
         ggml_tensor * w2 = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         // the top expert always has weight >= 1/n_expert_used, so tau below that keeps at least one
         // LLAMA_MOE_SKIP_NORMS: skip by importance = weight x the expert's typical output norm (llama-context.cpp),
@@ -2646,6 +2681,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    if (skip_oracle && tau > 0.0f && norm_w && !weight_before_ffn) {
+        ggml_tensor * w2  = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * nrm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, experts)));          // [1, n_used, n_tokens]
+        ggml_tensor * score = ggml_mul(ctx0, w2, ggml_reshape_2d(ctx0, nrm, n_expert_used, n_tokens));
+        score = ggml_div(ctx0, score, ggml_clamp(ctx0, ggml_sum_rows(ctx0, score), 1e-12f, INFINITY));
+        cb(score, "ffn_moe_oracle_importance", il);
+        ggml_tensor * keep = ggml_step(ctx0, ggml_scale_bias(ctx0, score, 1.0f, -tau));
+        if (skip_union && n_tokens > 1) {
+            // same rule as the regular skip: an expert another token of the batch selected is read anyway
+            ggml_tensor * ones = ggml_fill(ctx0, weights, 1.0f);
+            ggml_tensor * sel  = ggml_fill(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens), 0.0f);
+            sel = ggml_set_rows(ctx0, sel, ones, selected_experts);
+            ggml_tensor * cnt = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0,
+                                    ggml_reshape_2d(ctx0, sel, n_expert, n_tokens))));
+            cnt = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, cnt, 1, n_expert),
+                    ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens));
+            ggml_tensor * shared = ggml_step(ctx0, ggml_scale_bias(ctx0, cnt, 1.0f, -1.5f));
+            keep = ggml_clamp(ctx0, ggml_add(ctx0, keep, ggml_reshape_2d(ctx0, shared, n_expert_used, n_tokens)), 0.0f, 1.0f);
+        }
+        keep = ggml_map_custom1(ctx0, keep, moe_oracle_count, 1, nullptr);
+        ggml_tensor * wk = ggml_mul(ctx0, w2, keep);
+        if (skip_renorm) {
+            // back to the original total (which includes w_scale)
+            wk = ggml_mul(ctx0, ggml_div(ctx0, wk, ggml_clamp(ctx0, ggml_sum_rows(ctx0, wk), 6.103515625e-5, INFINITY)),
+                    ggml_sum_rows(ctx0, w2));
+        }
+        cb(wk, "ffn_moe_weights_oracle", il);
+        weights = ggml_reshape_3d(ctx0, wk, 1, n_expert_used, n_tokens);
     }
 
     if (!weight_before_ffn) {
