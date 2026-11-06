@@ -274,6 +274,16 @@ ggml_tensor * llama_model_kimi_k3::graph::res_mix(ggml_tensor * cur, ggml_tensor
 
     const float eps = hparams.f_norm_rms_eps;
 
+    // TEMP (LLAMA_K3_FUSED_RESMIX=1): the same mix as one op (two kernels on CUDA instead of six, no concat copy)
+    static const bool fused = [] {
+        const char * e = getenv("LLAMA_K3_FUSED_RESMIX");
+        return e && atoi(e) != 0;
+    }();
+    if (fused && score_w->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32 && resi_stack->type == GGML_TYPE_F32) {
+        GGML_UNUSED(il);
+        return ggml_res_mix(ctx0, resi_stack, ggml_reshape_2d(ctx0, cur, cur->ne[0], n_tokens), score_w, eps);
+    }
+
     // score the banked checkpoints and the current stream together: [n_embd, n_ckpt + 1, n_tokens]
     // note: the scores use the normalized values, but the sum below uses the raw ones
     ggml_tensor * src = ggml_concat(ctx0, resi_stack, ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_tokens), 1);

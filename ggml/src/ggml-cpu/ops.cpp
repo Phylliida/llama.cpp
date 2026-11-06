@@ -11323,6 +11323,66 @@ void ggml_compute_forward_dsv4_hc_comb(
     }
 }
 
+// ggml_compute_forward_res_mix
+
+void ggml_compute_forward_res_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * stack   = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * score_w = dst->src[2];
+
+    GGML_ASSERT(stack->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && score_w->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = stack->ne[0];
+    const int64_t n_ckpt   = stack->ne[1];
+    const int64_t n_tokens = stack->ne[2];
+    const int64_t n_src    = n_ckpt + 1;
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const float * w = (const float *) score_w->data;
+
+    // one token per thread at a time: the scores need all sources of a token
+    std::vector<float> p(n_src);
+    std::vector<const float *> rows(n_src);
+
+    for (int64_t it = params->ith; it < n_tokens; it += params->nth) {
+        for (int64_t is = 0; is < n_src; ++is) {
+            rows[is] = is < n_ckpt
+                ? (const float *) ((const char *) stack->data + is*stack->nb[1] + it*stack->nb[2])
+                : (const float *) ((const char *) x->data + it*x->nb[1]);
+        }
+        float max_score = -INFINITY;
+        for (int64_t is = 0; is < n_src; ++is) {
+            float sumsq = 0.0f;
+            float dot   = 0.0f;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                sumsq += rows[is][i]*rows[is][i];
+                dot   += rows[is][i]*w[i];
+            }
+            p[is] = dot / sqrtf(sumsq/n_embd + eps);
+            max_score = std::max(max_score, p[is]);
+        }
+        float sum = 0.0f;
+        for (int64_t is = 0; is < n_src; ++is) {
+            p[is] = expf(p[is] - max_score);
+            sum += p[is];
+        }
+        for (int64_t is = 0; is < n_src; ++is) {
+            p[is] /= sum;
+        }
+        float * out = (float *) ((char *) dst->data + it*dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float acc = 0.0f;
+            for (int64_t is = 0; is < n_src; ++is) {
+                acc += p[is]*rows[is][i];
+            }
+            out[i] = acc;
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(

@@ -314,3 +314,137 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
+
+// res_mix (ggml.h): softmax-weighted mix of a stack of residual checkpoints and the current stream (Kimi-K3).
+// Two kernels instead of concat + rms_norm/mul + sum_rows + soft_max + hc_pre: one block per (source, token) for
+// the scores, then one block per (chunk of n_embd, token) for the softmax and the weighted sum.
+
+static __device__ __forceinline__ const float * res_mix_row(
+        const float * stack, const float * x, int64_t is, int64_t it, int64_t n_ckpt,
+        int64_t ss1, int64_t ss2, int64_t sx1) {
+    return is < n_ckpt ? stack + is*ss1 + it*ss2 : x + it*sx1;
+}
+
+static __global__ void res_mix_scores_f32(
+        const float * stack, const float * x, const float * w, float * scores,
+        int64_t n_embd, int64_t n_ckpt, int64_t ss1, int64_t ss2, int64_t sx1, float eps) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    const int64_t is    = blockIdx.x;
+    const int64_t it    = blockIdx.y;
+    const int64_t n_src = n_ckpt + 1;
+    const float * row   = res_mix_row(stack, x, is, it, n_ckpt, ss1, ss2, sx1);
+
+    float sumsq = 0.0f;
+    float dot   = 0.0f;
+    for (int64_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        const float v = row[i];
+        sumsq += v*v;
+        dot   += v*w[i];
+    }
+    sumsq = warp_reduce_sum(sumsq);
+    dot   = warp_reduce_sum(dot);
+
+    __shared__ float s_sumsq[32];
+    __shared__ float s_dot[32];
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (lane == 0) {
+        s_sumsq[warp] = sumsq;
+        s_dot[warp]   = dot;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int n_warps = blockDim.x / WARP_SIZE;
+        sumsq = lane < n_warps ? s_sumsq[lane] : 0.0f;
+        dot   = lane < n_warps ? s_dot[lane]   : 0.0f;
+        sumsq = warp_reduce_sum(sumsq);
+        dot   = warp_reduce_sum(dot);
+        if (lane == 0) {
+            scores[it*n_src + is] = dot / sqrtf(sumsq/n_embd + eps);
+        }
+    }
+}
+
+static __global__ void res_mix_out_f32(
+        const float * stack, const float * x, const float * scores, float * dst,
+        int64_t n_embd, int64_t n_ckpt, int64_t ss1, int64_t ss2, int64_t sx1, int64_t sd1) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    extern __shared__ float s_p[];   // n_src probabilities of this token
+
+    const int64_t it    = blockIdx.y;
+    const int64_t n_src = n_ckpt + 1;
+
+    if (threadIdx.x == 0) {
+        float max_score = -INFINITY;
+        for (int64_t is = 0; is < n_src; ++is) {
+            max_score = fmaxf(max_score, scores[it*n_src + is]);
+        }
+        float sum = 0.0f;
+        for (int64_t is = 0; is < n_src; ++is) {
+            const float e = expf(scores[it*n_src + is] - max_score);
+            s_p[is] = e;
+            sum += e;
+        }
+        const float inv_sum = 1.0f/sum;
+        for (int64_t is = 0; is < n_src; ++is) {
+            s_p[is] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_embd) {
+        return;
+    }
+    float acc = 0.0f;
+    for (int64_t is = 0; is < n_src; ++is) {
+        acc += s_p[is]*res_mix_row(stack, x, is, it, n_ckpt, ss1, ss2, sx1)[i];
+    }
+    dst[it*sd1 + i] = acc;
+}
+
+void ggml_cuda_op_res_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * stack   = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * score_w = dst->src[2];
+
+    GGML_ASSERT(stack->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && score_w->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(stack->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t n_embd   = stack->ne[0];
+    const int64_t n_ckpt   = stack->ne[1];
+    const int64_t n_tokens = stack->ne[2];
+    const int64_t n_src    = n_ckpt + 1;
+    const float   eps      = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t ss1 = stack->nb[1]/sizeof(float);
+    const int64_t ss2 = stack->nb[2]/sizeof(float);
+    const int64_t sx1 = x->nb[1]/sizeof(float);
+    const int64_t sd1 = dst->nb[1]/sizeof(float);
+
+    ggml_cuda_pool_alloc<float> scores(ctx.pool(), n_src*n_tokens);
+
+    {
+        const dim3 grid_dims((unsigned) n_src, (unsigned) n_tokens, 1);
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+        ggml_cuda_kernel_launch(res_mix_scores_f32, launch_params,
+                (const float *) stack->data, (const float *) x->data, (const float *) score_w->data, scores.get(),
+                n_embd, n_ckpt, ss1, ss2, sx1, eps);
+    }
+    {
+        const int block_size = 256;
+        const dim3 grid_dims((unsigned) ((n_embd + block_size - 1)/block_size), (unsigned) n_tokens, 1);
+        const dim3 block_dims(block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(grid_dims, block_dims, n_src*sizeof(float), ctx.stream());
+        ggml_cuda_kernel_launch(res_mix_out_f32, launch_params,
+                (const float *) stack->data, (const float *) x->data, (const float *) scores.get(), (float *) dst->data,
+                n_embd, n_ckpt, ss1, ss2, sx1, sd1);
+    }
+}

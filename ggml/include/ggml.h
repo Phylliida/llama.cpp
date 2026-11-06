@@ -604,6 +604,8 @@ extern "C" {
         GGML_OP_MOE_FFN_RANGE,
         GGML_OP_MOE_PREFETCH,
 
+        GGML_OP_RES_MIX,
+
         GGML_OP_COUNT,
     };
 
@@ -2808,6 +2810,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
+
+    // softmax-weighted residual mix (Kimi-K3 cross-layer residual attention), one op for
+    //   concat(stack, x) -> rms_norm -> mul(score_w) -> sum_rows -> soft_max -> hc_pre:
+    //   stack [n_embd, n_ckpt, n_tokens], x [n_embd, n_tokens], score_w [n_embd] -> [n_embd, n_tokens]
+    //   src_s = stack[:, s, t] (s < n_ckpt) or x[:, t] (s = n_ckpt)
+    //   score_s = sum_i src_s[i]*score_w[i] / sqrt(mean(src_s^2) + eps), p = softmax_s(score)
+    //   result[i, t] = sum_s p_s*src_s[i]
+    //
+    GGML_API struct ggml_tensor * ggml_res_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * stack,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * score_w,
+            float                 eps);
 
     // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
     //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])

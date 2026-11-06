@@ -4391,6 +4391,81 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_RES_MIX (Kimi-K3 cross-layer residual mix); x_view: x is a row slice of a wider tensor (nb1 > ne0)
+struct test_res_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_ckpt;
+    const int64_t n_tokens;
+    const bool    x_view;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_ckpt, n_tokens, x_view);
+    }
+
+    test_res_mix(int64_t n_embd = 64, int64_t n_ckpt = 3, int64_t n_tokens = 5, bool x_view = false)
+        : n_embd(n_embd), n_ckpt(n_ckpt), n_tokens(n_tokens), x_view(x_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ckpt, n_tokens);
+        ggml_set_name(stack, "stack");
+
+        ggml_tensor * x;
+        if (x_view) {
+            ggml_tensor * wide = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + 16, n_tokens);
+            ggml_set_name(wide, "wide");
+            x = ggml_view_2d(ctx, wide, n_embd, n_tokens, wide->nb[1], 0);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        }
+        ggml_set_name(x, "x");
+
+        ggml_tensor * score_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(score_w, "score_w");
+
+        ggml_tensor * out = ggml_res_mix(ctx, stack, x, score_w, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the op chain GGML_OP_RES_MIX replaces (as kimi-k3.cpp builds it), for perf comparison
+struct test_res_mix_unfused : public test_case {
+    const int64_t n_embd;
+    const int64_t n_ckpt;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RES_MIX_UNFUSED";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_ckpt, n_tokens);
+    }
+
+    test_res_mix_unfused(int64_t n_embd = 64, int64_t n_ckpt = 3, int64_t n_tokens = 5)
+        : n_embd(n_embd), n_ckpt(n_ckpt), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ckpt, n_tokens);
+        ggml_set_name(stack, "stack");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * score_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(score_w, "score_w");
+
+        ggml_tensor * src = ggml_concat(ctx, stack, ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens), 1);
+        ggml_tensor * scores = ggml_rms_norm(ctx, src, 1e-6f);
+        scores = ggml_mul(ctx, scores, score_w);
+        scores = ggml_sum_rows(ctx, scores);
+        scores = ggml_reshape_2d(ctx, scores, n_ckpt + 1, n_tokens);
+        ggml_tensor * probs = ggml_soft_max(ctx, scores);
+        ggml_tensor * out = ggml_dsv4_hc_pre(ctx, src, probs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9531,6 +9606,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    for (int64_t n_ckpt : {1, 2, 5, 23}) {
+        for (int64_t n_tokens : {1, 3, 17, 512}) {
+            test_cases.emplace_back(new test_res_mix(7168, n_ckpt, n_tokens));
+        }
+    }
+    test_cases.emplace_back(new test_res_mix(31, 4, 7));
+    test_cases.emplace_back(new test_res_mix_unfused(7168, 5, 3));
+    test_cases.emplace_back(new test_res_mix(300, 9, 3, true));
+    test_cases.emplace_back(new test_res_mix(7168, 12, 3, true));
+
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
@@ -11742,6 +11827,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Kimi-K3 residual mix at decode (3 tokens) and prompt (512) shapes: fused op vs the chain it replaces
+    for (int64_t n_ckpt : {5, 12, 23}) {
+        for (int64_t n_tokens : {3, 512}) {
+            test_cases.emplace_back(new test_res_mix(7168, n_ckpt, n_tokens));
+            test_cases.emplace_back(new test_res_mix_unfused(7168, n_ckpt, n_tokens));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

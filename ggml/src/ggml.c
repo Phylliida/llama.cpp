@@ -1102,9 +1102,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MOE_FFN_RANGE",
     "MOE_PREFETCH",
+
+    "RES_MIX",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1220,9 +1222,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "moe_ffn_range(x)",
     "moe_prefetch(x)",
+
+    "res_mix(stack, x, score_w)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6729,6 +6733,38 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights) {
     return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
+}
+
+// ggml_res_mix
+
+struct ggml_tensor * ggml_res_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * stack,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * score_w,
+        float                 eps) {
+    GGML_ASSERT(stack->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(score_w->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = stack->ne[0];
+    const int64_t n_tokens = stack->ne[2];
+
+    GGML_ASSERT(stack->ne[1] > 0 && stack->ne[3] == 1);
+    GGML_ASSERT(x->ne[0] == n_embd && x->ne[1] == n_tokens && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(score_w) == n_embd && ggml_is_contiguous(score_w));
+    GGML_ASSERT(stack->nb[0] == sizeof(float) && x->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_RES_MIX;
+    result->src[0] = stack;
+    result->src[1] = x;
+    result->src[2] = score_w;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_dsv4_hc_pre_gated(

@@ -3596,6 +3596,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MOE_PREFETCH:
             ggml_cuda_moe_prefetch(ctx, dst);
             break;
+        case GGML_OP_RES_MIX:
+            ggml_cuda_op_res_mix(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -7217,6 +7220,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_RES_MIX:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) && op->src[0]->ne[1] < 4096 &&
+                op->src[0]->ne[2] <= 65535;
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
