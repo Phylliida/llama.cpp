@@ -39,6 +39,9 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// TEMP (LLAMA_SPEC_STEP_LOG): phase timing of a speculative step, for the step log
+static int64_t g_spec_t_draft_start_us = 0, g_spec_t_draft_us = 0, g_spec_t_decode_us = 0, g_spec_t_decode_end_us = 0;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -559,8 +562,12 @@ struct server_slot {
             // and are removed with the rejected positions
             static const int pad_tok = getenv("LLAMA_SPEC_PAD_TOKEN") ? atoi(getenv("LLAMA_SPEC_PAD_TOKEN")) : -1;
             if (pad_tok >= 0) {
+                static long n_padded = 0;
                 for (int i = (int) spec_draft.size(); i < spec_n_max; ++i) {
                     add_ok &= batch.add(this->id, pad_tok, pos0++, true, false);
+                    if (++n_padded % 200 == 0) {
+                        SRV_INF("padded verify batches: %ld pad tokens so far\n", n_padded);
+                    }
                 }
             }
         }
@@ -3227,7 +3234,9 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                g_spec_t_draft_start_us = ggml_time_us();
                 common_speculative_draft(spec.get());
+                g_spec_t_draft_us = ggml_time_us() - g_spec_t_draft_start_us;
             });
         }
 
@@ -3863,10 +3872,13 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const int64_t t_decode_start_us = ggml_time_us();
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            g_spec_t_decode_end_us = ggml_time_us();
+            g_spec_t_decode_us = g_spec_t_decode_end_us - t_decode_start_us;
         });
 
         if (ret != 0) {
@@ -4111,15 +4123,21 @@ private:
 
                 // TEMP experiment (LLAMA_SPEC_STEP_LOG=<file>): one line per verify step for tuning the draft length:
                 // time (us), context tokens (incl. the batch), drafted, accepted, checkpoint replay, drafter top-1 p per
-                // examined position
+                // examined position, then after a '|': phase times (us) of this step: since the previous step's log line
+                // until drafting starts (rollback, token output), drafting, target decode, verification sampling
                 static FILE * f_step = getenv("LLAMA_SPEC_STEP_LOG") ? fopen(getenv("LLAMA_SPEC_STEP_LOG"), "a") : nullptr;
                 if (f_step) {
-                    fprintf(f_step, "%" PRId64 " %d %zu %zu %d", ggml_time_us(), slot.prompt.n_tokens(), n_draft, accepted.size() - 1,
+                    static int64_t t_prev_log_us = 0;
+                    const int64_t t_now_us = ggml_time_us();
+                    fprintf(f_step, "%" PRId64 " %d %zu %zu %d", t_now_us, slot.prompt.n_tokens(), n_draft, accepted.size() - 1,
                             slot.spec_is_replay ? 1 : 0);
                     for (float c : slot.spec_draft_conf) {
                         fprintf(f_step, " %.4f", c);
                     }
-                    fprintf(f_step, "\n");
+                    fprintf(f_step, " | %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "\n",
+                            t_prev_log_us ? g_spec_t_draft_start_us - t_prev_log_us : 0, g_spec_t_draft_us, g_spec_t_decode_us,
+                            t_now_us - g_spec_t_decode_end_us);
+                    t_prev_log_us = t_now_us;
                     fflush(f_step);
                 }
                 slot.spec_draft_conf.clear();

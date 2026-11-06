@@ -623,7 +623,7 @@ llama_context::llama_context(
                 GGML_ASSERT(pad >= 0 && pad < (int) v.size());
                 v[pad] = 1.0f;
                 ggml_backend_tensor_set(mc.pad_lut, v.data(), 0, v.size()*sizeof(float));
-                LLAMA_LOG_INFO("%s: padded speculative verify batches: pad token %d\n", __func__, pad);
+                LLAMA_LOG_WARN("%s: padded speculative verify batches: pad token %d\n", __func__, pad);
             }
         }
         for (int il = 0; il < n_layer; ++il) {

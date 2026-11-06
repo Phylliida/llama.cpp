@@ -5975,7 +5975,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ++n_replay;
         }
         if (n_calls % 20000 == 0) {
-            GGML_LOG_INFO("cuda-graph-stats: %ld calls: %ld replays, %ld captures, %ld direct\n", n_calls, n_replay, n_capture, n_direct);
+            GGML_LOG_WARN("cuda-graph-stats: %ld calls: %ld replays, %ld captures, %ld direct\n", n_calls, n_replay, n_capture, n_direct);
         }
     }
 
