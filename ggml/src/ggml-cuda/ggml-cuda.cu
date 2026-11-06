@@ -5961,6 +5961,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // TEMP (GGML_CUDA_GRAPH_STATS=1): how often graphs are replayed, (re)captured or run directly (incompatible splits,
+    // warmup, property changes), printed every 20000 calls
+    static const bool graph_stats = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+    if (graph_stats) {
+        static long n_calls = 0, n_replay = 0, n_capture = 0, n_direct = 0;
+        ++n_calls;
+        if (!use_cuda_graph) {
+            ++n_direct;
+        } else if (cuda_graph_update_required) {
+            ++n_capture;
+        } else {
+            ++n_replay;
+        }
+        if (n_calls % 20000 == 0) {
+            GGML_LOG_INFO("cuda-graph-stats: %ld calls: %ld replays, %ld captures, %ld direct\n", n_calls, n_replay, n_capture, n_direct);
+        }
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
