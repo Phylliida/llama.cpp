@@ -1255,7 +1255,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                // outputs only where a draft can be read (backend sampling allows n_max + 1 per sequence); with
+                // LLAMA_DFLASH_FULL_BLOCK the other positions still shape the attention like in training
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2 && i <= params.n_max);
             }
         }
 
@@ -2686,6 +2688,11 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // TEMP experiment (LLAMA_SPEC_DRAFT_CTX=N): a smaller draft context, e.g. to fit a full-attention draft's KV cache
+    // in short-context benchmarks (positions beyond N cannot be drafted)
+    if (const char * e = getenv("LLAMA_SPEC_DRAFT_CTX")) {
+        cparams.n_ctx = std::min<uint32_t>(cparams.n_ctx, (uint32_t) atoi(e));
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
