@@ -3935,7 +3935,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // the first node's address alone collides between graphs of different batch sizes (they are rebuilt into the same
+    // memory), so batches alternating between two sizes (variable speculative draft lengths) re-captured the CUDA graphs
+    // on every step: mix in the node count and the shapes of the first and last node. A collision is still safe (the
+    // node properties are checked before an executable graph is reused)
+    const ggml_tensor * first = cgraph->nodes[0];
+    const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
+    uint64_t key = (uint64_t) (uintptr_t) first ^ ((uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        key = key * 1000003u ^ (uint64_t) first->ne[i];
+        key = key * 1000003u ^ (uint64_t) last->ne[i];
+    }
+    return (const void *) (uintptr_t) key;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
