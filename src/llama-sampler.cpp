@@ -1569,7 +1569,163 @@ struct llama_sampler_top_p : public llama_sampler_backend {
     const size_t min_keep;
 
     std::vector<llama_token_data> buf_sort;
+    std::vector<float>            buf_logit; // fast path: contiguous logits and their exp
+    std::vector<float>            buf_exp;
 };
+
+// fast exact top-p for a large unsorted array (a full vocabulary: ~0.6 ms instead of ~2-3 ms at 164k tokens, and a
+// more accurate normalization than llama_sampler_softmax_impl's single float accumulator): one pass copies the logits
+// and finds the max, one vectorized pass computes exp and the sum, then only the tokens within 8 (16, 32) nats of the
+// max are gathered and sorted; the usual running sum over them decides the cut. Every token above the threshold is in
+// the gathered set, so the result is the exact top-p set. Returns false (cur_p untouched) when the set cannot reach p.
+// TEMP: LLAMA_SAMPLER_TOPP_FAST=0 disables it (A/B).
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define LLAMA_TOPP_AVX2 1
+
+// ggml_v_expf (ggml-cpu/vec.h)
+__attribute__((target("avx2,fma"))) static inline __m256 llama_topp_v_expf(__m256 x) {
+    const __m256 r = _mm256_set1_ps(0x1.8p23f);
+    const __m256 z = _mm256_fmadd_ps(x, _mm256_set1_ps(0x1.715476p+0f), r);
+    const __m256 n = _mm256_sub_ps(z, r);
+    const __m256 b = _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.7f7d1cp-20f),
+                                      _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.62e4p-1f), x));
+    const __m256i e = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
+    const __m256 k = _mm256_castsi256_ps(
+        _mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1))));
+    const __m256i c = _mm256_castps_si256(
+        _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n),
+                      _mm256_set1_ps(126), _CMP_GT_OQ));
+    const __m256 u = _mm256_mul_ps(b, b);
+    const __m256 j = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_set1_ps(0x1.0e4020p-7f), b,
+                                                                     _mm256_set1_ps(0x1.573e2ep-5f)), u,
+                                                     _mm256_fmadd_ps(_mm256_set1_ps(0x1.555e66p-3f), b,
+                                                                     _mm256_set1_ps(0x1.fffdb6p-2f))),
+                                     u, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
+    if (!_mm256_movemask_ps(_mm256_castsi256_ps(c))) {
+        return _mm256_fmadd_ps(j, k, k);
+    }
+    const __m256i g = _mm256_and_si256(
+        _mm256_castps_si256(_mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ)),
+        _mm256_set1_epi32(0x82000000u));
+    const __m256 s1 =
+        _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f000000u)));
+    const __m256 s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+    const __m256i d = _mm256_castps_si256(
+        _mm256_cmp_ps(_mm256_andnot_ps(_mm256_set1_ps(-0.f), n),
+                      _mm256_set1_ps(192), _CMP_GT_OQ));
+    return _mm256_or_ps(
+        _mm256_and_ps(_mm256_castsi256_ps(d), _mm256_mul_ps(s1, s1)),
+        _mm256_andnot_ps(
+            _mm256_castsi256_ps(d),
+            _mm256_or_ps(
+                _mm256_and_ps(_mm256_castsi256_ps(c),
+                              _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
+                _mm256_andnot_ps(_mm256_castsi256_ps(c), _mm256_fmadd_ps(k, j, k)))));
+}
+
+// e[i] = exp(l[i] - max_l), returns the sum (accumulated in double)
+__attribute__((target("avx2,fma"))) static double llama_topp_exp_sum_avx2(const float * l, float * e, size_t n, float max_l) {
+    const __m256 m = _mm256_set1_ps(max_l);
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = llama_topp_v_expf(_mm256_sub_ps(_mm256_loadu_ps(l + i), m));
+        _mm256_storeu_ps(e + i, v);
+        acc0 = _mm256_add_pd(acc0, _mm256_cvtps_pd(_mm256_castps256_ps128(v)));
+        acc1 = _mm256_add_pd(acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(v, 1)));
+    }
+    alignas(32) double t[4];
+    _mm256_store_pd(t, _mm256_add_pd(acc0, acc1));
+    double sum = (t[0] + t[1]) + (t[2] + t[3]);
+    for (; i < n; ++i) {
+        e[i] = expf(l[i] - max_l);
+        sum += e[i];
+    }
+    return sum;
+}
+#endif
+
+static bool llama_sampler_top_p_fast(llama_sampler_top_p * ctx, llama_token_data_array * cur_p) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_SAMPLER_TOPP_FAST");
+        return !e || atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const size_t n = cur_p->size;
+    llama_token_data * data = cur_p->data;
+
+    auto & lg = ctx->buf_logit;
+    auto & ex = ctx->buf_exp;
+    lg.resize(n);
+    ex.resize(n);
+
+    float max_l = -INFINITY;
+    for (size_t i = 0; i < n; ++i) {
+        lg[i] = data[i].logit;
+        max_l = std::max(max_l, lg[i]);
+    }
+    if (!std::isfinite(max_l)) {
+        return false;
+    }
+
+    double sum = 0.0;
+#ifdef LLAMA_TOPP_AVX2
+    static const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    if (avx2) {
+        sum = llama_topp_exp_sum_avx2(lg.data(), ex.data(), n, max_l);
+    } else
+#endif
+    {
+        for (size_t i = 0; i < n; ++i) {
+            ex[i] = expf(lg[i] - max_l);
+            sum += ex[i];
+        }
+    }
+
+    const double need = (double) ctx->p * sum;
+    auto & buf = ctx->buf_sort;
+    for (const float width : { 8.0f, 16.0f, 32.0f }) {
+        const float thr = max_l - width;
+        buf.clear();
+        double mass = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (lg[i] >= thr) {
+                buf.push_back({ data[i].id, lg[i], ex[i] });
+                mass += ex[i];
+            }
+        }
+        if (mass < need * (1.0 - 1e-4) || buf.size() < ctx->min_keep) {
+            continue; // the gathered tokens cannot reach p
+        }
+        std::sort(buf.begin(), buf.end(), [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        });
+        const float inv_sum = (float) (1.0 / sum);
+        float  cum_sum  = 0.0f;
+        size_t last_idx = 0;
+        for (size_t i = 0; i < buf.size(); ++i) {
+            buf[i].p *= inv_sum;
+            cum_sum += buf[i].p;
+            if (cum_sum >= ctx->p && i + 1 >= ctx->min_keep) {
+                last_idx = i + 1;
+                break;
+            }
+        }
+        if (last_idx == 0) {
+            continue;
+        }
+        std::copy(buf.begin(), buf.begin() + last_idx, data);
+        cur_p->size   = last_idx;
+        cur_p->sorted = true;
+        return true;
+    }
+    return false;
+}
 
 static const char * llama_sampler_top_p_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
@@ -1580,6 +1736,10 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
     auto * ctx = (llama_sampler_top_p *) smpl->ctx;
 
     if (ctx->p >= 1.0f) {
+        return;
+    }
+
+    if (!cur_p->sorted && cur_p->size > 1024 && llama_sampler_top_p_fast(ctx, cur_p)) {
         return;
     }
 
@@ -1762,8 +1922,10 @@ struct llama_sampler * llama_sampler_init_top_p(float p, size_t min_keep) {
         /* .ctx   = */ new llama_sampler_top_p {
             ("top-p"),
             /* .p        = */ p,
-            /* .min_keep = */ min_keep,
-            /* .buf_sort = */ {},
+            /* .min_keep  = */ min_keep,
+            /* .buf_sort  = */ {},
+            /* .buf_logit = */ {},
+            /* .buf_exp   = */ {},
         }
     );
 }
