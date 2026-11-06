@@ -516,6 +516,7 @@ llama_context::llama_context(
         // LLAMA_MOE_SKIP_NORMS=<file>: per (layer, expert) output norm statistics (GGML_MOE_NORM_DUMP) for the
         // importance-aware expert skip: int32 n_layers, n_experts, then n_layers x n_experts x {sum, sum sq, count} f64
         std::vector<double> norm_stats;
+        bool pad_lut_set = false; // LLAMA_SPEC_PAD_TOKEN: one lookup table, on the first MoE layer
         int32_t norm_dims[2] = { 0, 0 };
         if (const char * path = getenv("LLAMA_MOE_SKIP_NORMS")) {
             FILE * f = fopen(path, "rb");
@@ -561,6 +562,11 @@ llama_context::llama_context(
             }
             if (!norm_stats.empty() && il < norm_dims[0] && w[0]->ne[2] <= norm_dims[1]) {
                 moe_cache[il].exp_norm = ggml_new_tensor_2d(cg, GGML_TYPE_F32, 1, w[0]->ne[2]);
+            }
+            // TEMP (LLAMA_SPEC_PAD_TOKEN=<id>): pad-token lookup table for padded speculative verify batches
+            if (getenv("LLAMA_SPEC_PAD_TOKEN") && !pad_lut_set) {
+                moe_cache[il].pad_lut = ggml_new_tensor_2d(cg, GGML_TYPE_F32, 1, model.vocab.n_tokens());
+                pad_lut_set = true;
             }
         }
         // cross-layer expert prefetch (LLAMA_MOE_GPU_PREFETCH = experts staged per layer, see kimi-k3.cpp): a ring of 3 slots
@@ -608,6 +614,16 @@ llama_context::llama_context(
                 if (mc.pf_list) {
                     ggml_backend_tensor_set(mc.pf_list, none.data(), 0, none.size()*sizeof(int32_t));
                 }
+            }
+        }
+        for (auto & mc : moe_cache) {
+            if (mc.pad_lut) {
+                std::vector<float> v(mc.pad_lut->ne[1], 0.0f);
+                const int pad = atoi(getenv("LLAMA_SPEC_PAD_TOKEN"));
+                GGML_ASSERT(pad >= 0 && pad < (int) v.size());
+                v[pad] = 1.0f;
+                ggml_backend_tensor_set(mc.pad_lut, v.data(), 0, v.size()*sizeof(float));
+                LLAMA_LOG_INFO("%s: padded speculative verify batches: pad token %d\n", __func__, pad);
             }
         }
         for (int il = 0; il < n_layer; ++il) {

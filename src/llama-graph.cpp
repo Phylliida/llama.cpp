@@ -2281,6 +2281,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             keep = ggml_clamp(ctx0, ggml_add(ctx0, keep, ggml_reshape_2d(ctx0, shared, n_expert_used, n_tokens)), 0.0f, 1.0f);
             cb(keep, "ffn_moe_keep_union", il);
         }
+        // padded speculative verify batches (LLAMA_SPEC_PAD_TOKEN, TEMP): the pad tokens keep no routed expert, so a
+        // cut draft costs no expert reads while the batch (and the graph) keeps its shape
+        if (moe_cache && res->t_inp_tokens && n_tokens > 1 && n_tokens <= 4) {
+            if (!moe_pad_flag) {
+                for (const auto & mc : *moe_cache) {
+                    if (mc.pad_lut) {
+                        moe_pad_flag = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mc.pad_lut, res->t_inp_tokens), 1, n_tokens);
+                        cb(moe_pad_flag, "ffn_moe_pad_flag", -1);
+                        break;
+                    }
+                }
+            }
+            if (moe_pad_flag) {
+                keep = ggml_mul(ctx0, keep, ggml_scale_bias(ctx0, moe_pad_flag, -1.0f, 1.0f));
+            }
+        }
         w2 = ggml_mul(ctx0, w2, keep);
         if (skip_renorm) {
             ggml_tensor * w_sum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2), 6.103515625e-5, INFINITY);

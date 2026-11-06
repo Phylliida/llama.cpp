@@ -263,6 +263,7 @@ struct server_slot {
     std::mt19937 spec_synth_rng;
     std::vector<std::vector<llama_token_data>> spec_draft_probs; // proposal distributions of sampled drafts
     std::vector<float> spec_draft_conf;                          // drafter top-1 p per examined position (step log)
+    int spec_n_max = 0;                                          // draft length requested for this step (padding)
     std::mt19937 spec_rs_rng;                                    // stochastic verification
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -552,6 +553,15 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+            // TEMP (LLAMA_SPEC_PAD_TOKEN=<id>): pad a cut draft to the requested length so the verify batch, and with it
+            // the target's graph, keeps its shape; the pads skip all routed experts, take no part in the verification
+            // and are removed with the rejected positions
+            static const int pad_tok = getenv("LLAMA_SPEC_PAD_TOKEN") ? atoi(getenv("LLAMA_SPEC_PAD_TOKEN")) : -1;
+            if (pad_tok >= 0) {
+                for (int i = (int) spec_draft.size(); i < spec_n_max; ++i) {
+                    add_ok &= batch.add(this->id, pad_tok, pos0++, true, false);
+                }
             }
         }
 
@@ -3194,6 +3204,8 @@ private:
                              (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
                               common_speculative_n_max(spec.get()) <= (int32_t) llama_n_rs_seq(ctx_tgt))) &&
                             common_speculative_get_synth_probs(spec.get()).empty();
+
+                        slot.spec_n_max = std::min(n_draft_max, common_speculative_n_max(spec.get()));
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting     = */ true,
