@@ -820,6 +820,14 @@ struct mtmd_context {
                     }
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_KIMIK3:
+                {
+                    // <|media_begin|>image {W}x{H}<|media_content|> ... (image embeddings) ... <|media_end|>
+                    // W x H is the original image size (Moonshot's make_image_prompt); the prefix is built per image in add_media
+                    img_beg = "<|media_begin|>";
+                    img_end = "<|media_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_LIGHTONOCR:
                 {
                     // <|im_start|> ... (image embeddings) ... <|im_end|>
@@ -1350,7 +1358,9 @@ struct mtmd_tokenizer {
                 return 2;
             }
 
-            if (!ctx->img_beg.empty()) {
+            if (ctx->proj_type_v() == PROJECTOR_TYPE_KIMIK3) {
+                add_text("<|media_begin|>image " + std::to_string(bitmaps[0]->nx) + "x" + std::to_string(bitmaps[0]->ny) + "<|media_content|>", true);
+            } else if (!ctx->img_beg.empty()) {
                 add_text(ctx->img_beg, true); // add image begin token
             }
 
