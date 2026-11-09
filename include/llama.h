@@ -817,9 +817,43 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // KV splice (fork addition, used by the server's /kv/splice):
+    // export the attention-cache entries of seq_id at positions [p0, p1) into dst (raw cache rows of every attention
+    // layer, valid only for the same model and cache types). Returns the bytes written, or the size needed when
+    // dst is NULL; 0 on failure
+    LLAMA_API size_t llama_memory_seq_span_export(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+                   uint8_t * dst,
+                    size_t   size);
+
+    // KV splice (fork addition): replace the attention-cache entries of seq_id at [p0, p1) with an exported span,
+    // placed from p0 on, and move the later entries by the length difference (written to *delta). Keys with RoPE are
+    // re-rotated right away (K-shift); keys without position (NoPE, e.g. Kimi-K3's MLA) only move. A hybrid memory
+    // keeps its recurrent state. Returns false, with nothing changed, if the span does not fit the cache
+    LLAMA_API bool llama_memory_seq_span_replace(
+      struct llama_context * ctx,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+             const uint8_t * src,
+                    size_t   size,
+                 llama_pos * delta);
+
     //
     // State / sessions
     //
+
+    // KV splice (fork addition): add delta to the cell positions stored in a sequence state written with
+    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY by a hybrid or recurrent memory (e.g. the server's context checkpoints)
+    // returns false if the state is not of that kind
+    LLAMA_API bool llama_state_seq_partial_shift_pos(
+            struct llama_context * ctx,
+                         uint8_t * data,
+                          size_t   size,
+                       llama_pos   delta);
 
     // Returns the *actual* size in bytes of the state
     // (logits, embedding and memory)

@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -4460,6 +4463,97 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+size_t llama_memory_seq_span_export(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+               uint8_t * dst,
+                size_t   size) {
+    const llama_kv_cache * kv = nullptr;
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        kv = hyb->get_mem_attn();
+    } else {
+        kv = dynamic_cast<llama_kv_cache *>(mem);
+    }
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: KV splice supports a plain or hybrid KV cache only\n", __func__);
+        return 0;
+    }
+
+    return kv->span_export(seq_id, p0, p1, dst, size);
+}
+
+bool llama_memory_seq_span_replace(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+         const uint8_t * src,
+                size_t   size,
+             llama_pos * delta) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_pos d = 0;
+    bool ok = false;
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        ok = hyb->span_replace(seq_id, p0, p1, src, size, d);
+    } else if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        ok = kv->span_replace(seq_id, p0, p1, src, size, d);
+    } else {
+        LLAMA_LOG_ERROR("%s: KV splice supports a plain or hybrid KV cache only\n", __func__);
+    }
+    if (delta) {
+        *delta = d;
+    }
+
+    // apply the K-shift now: a state saved before the next decode would otherwise hold the moved positions with
+    // the keys still rotated for the old ones
+    if (ok) {
+        ctx->memory_update(false);
+    }
+
+    return ok;
+}
+
+bool llama_state_seq_partial_shift_pos(llama_context * ctx, uint8_t * data, size_t size, llama_pos delta) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!dynamic_cast<llama_memory_hybrid *>(mem) && !dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return false;
+    }
+
+    // state_seq_get_data: u32 io_magic, i32 seq_id, then llama_memory_recurrent::state_write:
+    // u32 cell_count, per cell i32 pos, u32 n_seq_id, i32 seq_id[n_seq_id], then the data
+    uint32_t magic;
+    uint32_t cell_count;
+    if (size < sizeof(magic) + sizeof(llama_seq_id) + sizeof(cell_count)) {
+        return false;
+    }
+    memcpy(&magic, data, sizeof(magic));
+    if (magic != io_magic) {
+        return false;
+    }
+    size_t off = sizeof(magic) + sizeof(llama_seq_id);
+    memcpy(&cell_count, data + off, sizeof(cell_count));
+    off += sizeof(cell_count);
+
+    for (uint32_t c = 0; c < cell_count; ++c) {
+        llama_pos pos;
+        uint32_t  n_seq_id;
+        if (off + sizeof(pos) + sizeof(n_seq_id) > size) {
+            return false;
+        }
+        memcpy(&pos,      data + off,               sizeof(pos));
+        memcpy(&n_seq_id, data + off + sizeof(pos), sizeof(n_seq_id));
+        if (pos >= 0) {
+            pos = std::max(0, pos + delta);
+            memcpy(data + off, &pos, sizeof(pos));
+        }
+        off += sizeof(pos) + sizeof(n_seq_id) + (size_t) n_seq_id*sizeof(llama_seq_id);
+    }
+
+    return off <= size;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

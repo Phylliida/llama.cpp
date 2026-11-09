@@ -1241,6 +1241,311 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+//
+// KV splice (fork addition, server /kv/splice)
+//
+// blob: u32 magic, u32 version, u32 n_layer, u32 n_cells, i32 pos[n_cells] (non-decreasing),
+//       per layer: u32 il, i32 k_type, u64 k_row, i32 v_type (-1: no V rows), u64 v_row,
+//       per layer: K rows [n_cells][k_row], then V rows [n_cells][v_row]
+//
+
+static constexpr uint32_t LLAMA_KV_SPAN_MAGIC   = 0x5053564b; // "KVSP"
+static constexpr uint32_t LLAMA_KV_SPAN_VERSION = 1;
+
+static constexpr size_t LLAMA_KV_SPAN_LAYER_HDR = 4 + 4 + 8 + 4 + 8;
+
+// calls f(first, count) for each run of consecutive cell indices in idxs
+template <typename F>
+static void llama_kv_span_runs(const std::vector<uint32_t> & idxs, F && f) {
+    size_t j0 = 0;
+    for (size_t j = 1; j <= idxs.size(); ++j) {
+        if (j == idxs.size() || idxs[j] != idxs[j - 1] + 1) {
+            f(j0, j - j0);
+            j0 = j;
+        }
+    }
+}
+
+size_t llama_kv_cache::span_export(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t size) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & cells = v_cells[strm];
+
+    // the cells of the span, ordered by position
+    std::vector<std::pair<llama_pos, uint32_t>> span;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
+            span.emplace_back(cells.pos_get(i), i);
+        }
+    }
+    std::sort(span.begin(), span.end());
+
+    const size_t n = span.size();
+
+    size_t total = 4*sizeof(uint32_t) + n*sizeof(llama_pos) + layers.size()*LLAMA_KV_SPAN_LAYER_HDR;
+    for (const auto & layer : layers) {
+        total += n*ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(layer.il));
+        if (layer.v_stream[strm]) {
+            if (v_trans) {
+                LLAMA_LOG_ERROR("%s: a transposed V cache cannot be exported (enable flash attention)\n", __func__);
+                return 0;
+            }
+            total += n*ggml_row_size(layer.v->type, hparams.n_embd_v_gqa(layer.il));
+        }
+    }
+
+    if (dst == nullptr) {
+        return total;
+    }
+    if (size < total) {
+        LLAMA_LOG_ERROR("%s: buffer of %zu bytes, %zu needed\n", __func__, size, total);
+        return 0;
+    }
+
+    uint8_t * p = dst;
+    auto put = [&](const void * x, size_t nb) { memcpy(p, x, nb); p += nb; };
+
+    const uint32_t hdr[4] = { LLAMA_KV_SPAN_MAGIC, LLAMA_KV_SPAN_VERSION, (uint32_t) layers.size(), (uint32_t) n };
+    put(hdr, sizeof(hdr));
+    for (const auto & c : span) {
+        put(&c.first, sizeof(llama_pos));
+    }
+
+    for (const auto & layer : layers) {
+        const uint32_t il     = layer.il;
+        const int32_t  k_type = layer.k->type;
+        const uint64_t k_row  = ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(il));
+        const bool     has_v  = layer.v_stream[strm] != nullptr;
+        const int32_t  v_type = has_v ? (int32_t) layer.v->type : -1;
+        const uint64_t v_row  = has_v ? ggml_row_size(layer.v->type, hparams.n_embd_v_gqa(il)) : 0;
+        put(&il, 4); put(&k_type, 4); put(&k_row, 8); put(&v_type, 4); put(&v_row, 8);
+    }
+
+    std::vector<uint32_t> idxs(n);
+    for (size_t j = 0; j < n; ++j) {
+        idxs[j] = span[j].second;
+    }
+
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream[strm];
+        const size_t k_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
+        llama_kv_span_runs(idxs, [&](size_t j, size_t len) {
+            ggml_backend_tensor_get(k, p + j*k_row, idxs[j]*k_row, len*k_row);
+        });
+        p += n*k_row;
+
+        ggml_tensor * v = layer.v_stream[strm];
+        if (v) {
+            const size_t v_row = ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
+            llama_kv_span_runs(idxs, [&](size_t j, size_t len) {
+                ggml_backend_tensor_get(v, p + j*v_row, idxs[j]*v_row, len*v_row);
+            });
+            p += n*v_row;
+        }
+    }
+
+    GGML_ASSERT((size_t) (p - dst) == total);
+
+    return total;
+}
+
+bool llama_kv_cache::span_replace(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const uint8_t * src, size_t size, llama_pos & delta) {
+    delta = 0;
+
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        LLAMA_LOG_ERROR("%s: a cache that mirrors another one cannot be spliced\n", __func__);
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (hparams.n_pos_per_embd() != 1) {
+        LLAMA_LOG_ERROR("%s: multi-dimensional positions (M-RoPE) are not supported\n", __func__);
+        return false;
+    }
+    if (p0 < 0 || p1 < p0) {
+        LLAMA_LOG_ERROR("%s: invalid range [%d, %d)\n", __func__, p0, p1);
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cells = v_cells[strm];
+
+    // parse and check the blob against this cache
+    const uint8_t * p   = src;
+    const uint8_t * end = src + size;
+    auto get = [&](void * x, size_t nb) {
+        if ((size_t) (end - p) < nb) {
+            return false;
+        }
+        memcpy(x, p, nb);
+        p += nb;
+        return true;
+    };
+
+    uint32_t hdr[4];
+    if (!get(hdr, sizeof(hdr)) || hdr[0] != LLAMA_KV_SPAN_MAGIC || hdr[1] != LLAMA_KV_SPAN_VERSION) {
+        LLAMA_LOG_ERROR("%s: not a KV span blob (or another version)\n", __func__);
+        return false;
+    }
+    if (hdr[2] != layers.size()) {
+        LLAMA_LOG_ERROR("%s: span of %u layers, this cache has %zu\n", __func__, hdr[2], layers.size());
+        return false;
+    }
+
+    const uint32_t n = hdr[3];
+
+    std::vector<llama_pos> pos(n);
+    if (!get(pos.data(), n*sizeof(llama_pos))) {
+        LLAMA_LOG_ERROR("%s: truncated span\n", __func__);
+        return false;
+    }
+    for (uint32_t j = 0; j < n; ++j) {
+        if (pos[j] < 0 || (j > 0 && pos[j] < pos[j - 1])) {
+            LLAMA_LOG_ERROR("%s: span positions must be non-negative and non-decreasing\n", __func__);
+            return false;
+        }
+    }
+
+    size_t n_data = 0;
+    for (const auto & layer : layers) {
+        uint32_t il; int32_t k_type; uint64_t k_row; int32_t v_type; uint64_t v_row;
+        if (!get(&il, 4) || !get(&k_type, 4) || !get(&k_row, 8) || !get(&v_type, 4) || !get(&v_row, 8)) {
+            LLAMA_LOG_ERROR("%s: truncated span\n", __func__);
+            return false;
+        }
+
+        const bool has_v = layer.v_stream[strm] != nullptr;
+        if (has_v && v_trans) {
+            LLAMA_LOG_ERROR("%s: a transposed V cache cannot be spliced (enable flash attention)\n", __func__);
+            return false;
+        }
+
+        const uint64_t k_row_cur = ggml_row_size(layer.k->type, hparams.n_embd_k_gqa(layer.il));
+        const uint64_t v_row_cur = has_v ? ggml_row_size(layer.v->type, hparams.n_embd_v_gqa(layer.il)) : 0;
+        if (il != layer.il || k_type != (int32_t) layer.k->type || k_row != k_row_cur ||
+            v_type != (has_v ? (int32_t) layer.v->type : -1) || v_row != v_row_cur) {
+            LLAMA_LOG_ERROR("%s: layer %u of the span does not match this cache (types or sizes)\n", __func__, il);
+            return false;
+        }
+
+        n_data += n*(k_row + v_row);
+    }
+
+    if ((size_t) (end - p) != n_data) {
+        LLAMA_LOG_ERROR("%s: span data of %zu bytes, %zu expected\n", __func__, (size_t) (end - p), n_data);
+        return false;
+    }
+
+    // enough room once the replaced cells are gone?
+    uint32_t n_free = cells.size() - cells.get_used();
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id) && cells.seq_get_all(i).count() == 1) {
+            n_free++;
+        }
+    }
+    if (n_free < n) {
+        LLAMA_LOG_ERROR("%s: %u cells needed, %u free\n", __func__, n, n_free);
+        return false;
+    }
+
+    const llama_pos span_len = n > 0 ? pos[n - 1] - pos[0] + 1 : 0;
+
+    delta = (p0 + span_len) - p1;
+
+    // keys without RoPE carry no position: move them without a K-shift
+    const bool rope = hparams.rope_type != LLAMA_ROPE_TYPE_NONE;
+    auto move = [&](uint32_t i, llama_pos d) {
+        if (d == 0) {
+            return;
+        }
+        if (rope) {
+            cells.pos_add(i, d);
+        } else {
+            cells.pos_move(i, d);
+        }
+    };
+
+    // 1. drop the replaced cells
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.pos_in(i, p0, p1) && cells.seq_has(i, seq_id)) {
+            cells.seq_rm(i, seq_id);
+        }
+    }
+
+    // 2. move the cells after them
+    if (delta != 0) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_get(i) >= p1) {
+                move(i, delta);
+            }
+        }
+    }
+
+    // 3. take free cells for the span: one contiguous run if there is one
+    std::vector<uint32_t> idxs;
+    idxs.reserve(n);
+    if (n > 0) {
+        uint32_t run = 0;
+        for (uint32_t i = 0; i < cells.size() && idxs.size() < n; ++i) {
+            run = cells.is_empty(i) ? run + 1 : 0;
+            if (run == n) {
+                for (uint32_t j = i + 1 - n; j <= i; ++j) {
+                    idxs.push_back(j);
+                }
+            }
+        }
+        if (idxs.size() < n) {
+            idxs.clear();
+            for (uint32_t i = 0; i < cells.size() && idxs.size() < n; ++i) {
+                if (cells.is_empty(i)) {
+                    idxs.push_back(i);
+                }
+            }
+        }
+        GGML_ASSERT(idxs.size() == n);
+    }
+
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint32_t i = idxs[j];
+        cells.pos_set(i, pos[j]);
+        cells.seq_add(i, seq_id);
+        move(i, p0 + (pos[j] - pos[0]) - pos[j]);
+    }
+
+    // 4. the rows
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream[strm];
+        const size_t k_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
+        llama_kv_span_runs(idxs, [&](size_t j, size_t len) {
+            ggml_backend_tensor_set(k, p + j*k_row, idxs[j]*k_row, len*k_row);
+        });
+        p += n*k_row;
+
+        ggml_tensor * v = layer.v_stream[strm];
+        if (v) {
+            const size_t v_row = ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
+            llama_kv_span_runs(idxs, [&](size_t j, size_t len) {
+                ggml_backend_tensor_set(v, p + j*v_row, idxs[j]*v_row, len*v_row);
+            });
+            p += n*v_row;
+        }
+    }
+
+    v_heads[strm] = 0;
+
+    return true;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

@@ -187,6 +187,24 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+bool llama_memory_hybrid::span_replace(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const uint8_t * src, size_t size, llama_pos & delta) {
+    const llama_pos rpos = mem_recr->seq_pos_max(seq_id);
+
+    if (!mem_attn->span_replace(seq_id, p0, p1, src, size, delta)) {
+        return false;
+    }
+
+    if (rpos >= p1) {
+        mem_recr->seq_add(seq_id, p1, -1, delta);
+    } else if (rpos >= p0) {
+        // the span reached the end of the sequence: the state now ends where the attention cells do
+        const llama_pos last = mem_attn->seq_pos_max(seq_id);
+        mem_recr->seq_add(seq_id, rpos, rpos + 1, last - rpos);
+    }
+
+    return true;
+}
+
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);

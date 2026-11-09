@@ -166,6 +166,16 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // KV splice (fork addition, server /kv/splice): the raw rows of every layer for the cells of seq_id at
+    // positions [p0, p1), as a self-describing blob (see span_export); returns the blob size, dst == NULL queries it
+    size_t span_export(llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t size) const;
+
+    // replace the cells of seq_id at [p0, p1) with the cells of an exported span, placed from p0 on (keeping their
+    // relative offsets), and move the cells at >= p1 by the length difference (returned in delta). Keys with RoPE are
+    // re-rotated by the K-shift on the next update; keys without position (NoPE, e.g. Kimi-K3's MLA) only move.
+    // returns false without changing anything if the blob does not fit this cache or there are not enough free cells
+    bool span_replace(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const uint8_t * src, size_t size, llama_pos & delta);
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in

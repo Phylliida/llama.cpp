@@ -83,6 +83,10 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // KV splice (fork addition): llama_kv_cache::span_replace on the attention part; the recurrent state is kept
+    // and only its position moves with the rest of the sequence
+    bool span_replace(llama_seq_id seq_id, llama_pos p0, llama_pos p1, const uint8_t * src, size_t size, llama_pos & delta);
+
 private:
     const llama_hparams & hparams;
 

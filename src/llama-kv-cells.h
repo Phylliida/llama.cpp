@@ -463,6 +463,18 @@ public:
         return false;
     }
 
+    // pos[i] = pos[i] + d without marking a RoPE shift, for caches whose keys carry no position (NoPE)
+    // note: call only if the cell is not empty and pos[i] + d >= 0
+    void pos_move(uint32_t i, llama_pos d) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+        assert(pos[i] + d >= 0);
+
+        seq_pos_rm(i);
+        pos[i] += d;
+        seq_pos_add(i);
+    }
+
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
