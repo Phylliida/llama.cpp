@@ -1776,6 +1776,275 @@ private:
         }
     }
 
+    //
+    // KV splice (POST /kv/splice, fork addition)
+    //
+
+    // put the cached state that best matches tokens into the slot; the slot's current state stays in the RAM
+    // cache (the swap get_available_slot() does when a request moves a slot to another prompt)
+    void kv_splice_load(server_slot & slot, const server_tokens & tokens) {
+        if (prompt_disk && slot.disk_unsaved) {
+            prompt_disk_save(slot);
+        }
+
+        slot.prompt_save(*prompt_cache);
+
+        if (prompt_disk) {
+            prompt_disk->fetch(*prompt_cache, slot.prompt, tokens);
+        }
+
+        if (!slot.prompt_load(*prompt_cache, tokens)) {
+            slot.prompt_clear();
+        }
+
+        prompt_cache->update();
+    }
+
+    // the token range [t0, t1) of toks whose text covers span, widened to token boundaries
+    // occurrence: "unique" (exactly one match), "first", "last" or a 0-based index
+    bool kv_splice_find(const llama_tokens & toks, const std::string & span, const std::string & occurrence,
+            int32_t & t0, int32_t & t1, bool & widened, std::string & err) const {
+        if (span.empty()) {
+            err = "is empty";
+            return false;
+        }
+
+        std::string text;
+        std::vector<size_t> off(toks.size() + 1);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            off[i] = text.size();
+            text += common_token_to_piece(ctx_tgt, toks[i], true);
+        }
+        off[toks.size()] = text.size();
+
+        std::vector<size_t> hits;
+        for (size_t p = text.find(span); p != std::string::npos; p = text.find(span, p + 1)) {
+            hits.push_back(p);
+        }
+        if (hits.empty()) {
+            err = "not found";
+            return false;
+        }
+
+        size_t k = 0;
+        if (occurrence == "unique") {
+            if (hits.size() != 1) {
+                err = "found " + std::to_string(hits.size()) + " times (pass an occurrence: \"first\", \"last\" or an index)";
+                return false;
+            }
+        } else if (occurrence == "first") {
+            k = 0;
+        } else if (occurrence == "last") {
+            k = hits.size() - 1;
+        } else {
+            try {
+                k = std::stoul(occurrence);
+            } catch (...) {
+                err = "has an invalid occurrence '" + occurrence + "'";
+                return false;
+            }
+            if (k >= hits.size()) {
+                err = "occurrence " + occurrence + " requested, found " + std::to_string(hits.size());
+                return false;
+            }
+        }
+
+        const size_t c0 = hits[k];
+        const size_t c1 = c0 + span.size();
+
+        t0 = (int32_t) (std::upper_bound(off.begin(), off.end(), c0) - off.begin()) - 1; // the token holding c0
+        t1 = (int32_t) (std::lower_bound(off.begin(), off.end(), c1) - off.begin());     // the first token from c1 on
+        widened = off[t0] != c0 || off[t1] != c1;
+
+        return true;
+    }
+
+    // replace a span of the destination conversation's cached state with a span of the source conversation's
+    // state, without processing anything again. The recurrent state (Kimi-K3's KDA) stays the destination's own;
+    // only the attention cache (K3: the MLA layers) changes, and the positions after the span move
+    bool kv_splice_run(server_slot & slot, const server_task::kv_splice_params & p, json & out, std::string & err) {
+        const int64_t t_start = ggml_time_us();
+
+        if (!prompt_cache) {
+            err = "/kv/splice needs the RAM prompt cache (--cache-ram > 0) to hold one conversation while the other is loaded";
+            return false;
+        }
+
+        auto resolve = [&](const char * which, const llama_tokens & state, const std::string & span, const int32_t range[2],
+                const std::string & occurrence, int32_t & t0, int32_t & t1, bool & widened) {
+            widened = false;
+            if (range[0] >= 0) {
+                t0 = range[0];
+                t1 = range[1];
+                if (t1 <= t0 || t1 > (int32_t) state.size()) {
+                    err = std::string(which) + "_range is outside the cached state (" + std::to_string(state.size()) + " tokens)";
+                    return false;
+                }
+                return true;
+            }
+            std::string e;
+            if (!kv_splice_find(state, span, occurrence, t0, t1, widened, e)) {
+                err = std::string(which) + "_span " + e + " in the cached state (" + std::to_string(state.size()) + " tokens)";
+                return false;
+            }
+            return true;
+        };
+
+        auto text_only = [&](const char * which) {
+            const auto & toks = slot.prompt.tokens.get_tokens();
+            if (toks.empty()) {
+                err = std::string("no cached state matches the ") + which + " context";
+                return false;
+            }
+            if (std::find(toks.begin(), toks.end(), LLAMA_TOKEN_NULL) != toks.end()) {
+                err = std::string("the ") + which + " state holds media, which /kv/splice does not support";
+                return false;
+            }
+            return true;
+        };
+
+        const server_tokens src_ctx(p.src_tokens, false);
+        const server_tokens dst_ctx(p.dst_tokens, false);
+
+        // 1. the source state and its span
+        kv_splice_load(slot, src_ctx);
+        if (!text_only("source")) {
+            return false;
+        }
+        const llama_tokens src_state = slot.prompt.tokens.get_tokens();
+        const size_t src_lcp = slot.prompt.tokens.get_common_prefix(src_ctx);
+
+        int32_t q0 = 0, q1 = 0;
+        bool src_widened = false;
+        if (!resolve("src", src_state, p.src_span, p.src_range, p.src_occurrence, q0, q1, src_widened)) {
+            return false;
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        std::vector<uint8_t> blob(llama_memory_seq_span_export(mem, slot.id, q0, q1, nullptr, 0));
+        if (blob.empty() || llama_memory_seq_span_export(mem, slot.id, q0, q1, blob.data(), blob.size()) != blob.size()) {
+            err = "exporting the source span failed (see the server log)";
+            return false;
+        }
+        const llama_tokens span_tokens(src_state.begin() + q0, src_state.begin() + q1);
+
+        // sampled tokens are not always the tokenizer's own split of their text: then a prompt that contains the
+        // text matches the spliced state only up to the first difference
+        const std::string span_text = common_detokenize(ctx_tgt, span_tokens, true);
+        const bool src_canonical = common_tokenize(ctx_tgt, span_text, false, true) == span_tokens;
+
+        // 2. the destination state and its span
+        kv_splice_load(slot, dst_ctx);
+        if (!text_only("destination")) {
+            return false;
+        }
+        const llama_tokens dst_state = slot.prompt.tokens.get_tokens();
+        const size_t dst_lcp = slot.prompt.tokens.get_common_prefix(dst_ctx);
+
+        int32_t a = 0, b = 0;
+        bool dst_widened = false;
+        if (!resolve("dst", dst_state, p.dst_span, p.dst_range, p.dst_occurrence, a, b, dst_widened)) {
+            return false;
+        }
+        if ((size_t) b > dst_lcp) {
+            err = "dst_span ends at token " + std::to_string(b) + ", but the cached state matches the destination context only up to token " +
+                  std::to_string(dst_lcp) + ": the result would not be reused";
+            return false;
+        }
+
+        // 3. the splice
+        llama_pos delta = 0;
+        if (!llama_memory_seq_span_replace(ctx_tgt, slot.id, a, b, blob.data(), blob.size(), &delta)) {
+            err = "the cache refused the splice (see the server log)";
+            return false;
+        }
+
+        // the draft's own cache: the same cut and move; it gets no copy of the span (it only proposes tokens)
+        std::string draft = "none";
+        if (ctx_dft) {
+            llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+            if (llama_memory_seq_rm(mem_dft, slot.id, a, b)) {
+                if (delta != 0) {
+                    llama_memory_seq_add(mem_dft, slot.id, b, -1, delta);
+                }
+                draft = "moved";
+            } else {
+                llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
+                draft = "cleared";
+            }
+        }
+
+        llama_tokens new_tokens(dst_state.begin(), dst_state.begin() + a);
+        new_tokens.insert(new_tokens.end(), span_tokens.begin(), span_tokens.end());
+        new_tokens.insert(new_tokens.end(), dst_state.begin() + b, dst_state.end());
+        GGML_ASSERT((int64_t) new_tokens.size() == (int64_t) dst_state.size() + delta);
+
+        slot.prompt.tokens = server_tokens(new_tokens, mctx != nullptr);
+
+        // context checkpoints: keep those before the span, move those after it, drop those inside it
+        int n_kept = 0, n_moved = 0, n_dropped = 0;
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            if (it->pos_max < a) {
+                n_kept++;
+                ++it;
+                continue;
+            }
+            if (it->pos_max >= b && (delta == 0 || llama_state_seq_partial_shift_pos(ctx_tgt, it->data_tgt.data(), it->data_tgt.size(), delta))) {
+                it->pos_max  += delta;
+                it->n_tokens += delta;
+                if (it->pos_min >= b) {
+                    it->pos_min += delta;
+                }
+                it->data_dft.clear();
+                it->data_spec.clear();
+                n_moved++;
+                ++it;
+                continue;
+            }
+            it = slot.prompt.checkpoints.erase(it);
+            n_dropped++;
+        }
+
+        if (prompt_disk) {
+            slot.disk_unsaved = true;
+        }
+        slot.t_last_used = ggml_time_us();
+
+        const llama_tokens dst_span_tokens(dst_state.begin() + a, dst_state.begin() + b);
+
+        auto span_json = [](size_t n_state, size_t lcp, int32_t t0, int32_t t1, bool widened, const std::string & text) {
+            json o = json::object();
+            o["state_tokens"] = (int64_t) n_state;
+            o["lcp"]          = (int64_t) lcp;
+            o["range"]        = json::array({ t0, t1 });
+            o["widened"]      = widened;
+            o["text"]         = text;
+            return o;
+        };
+
+        json ckpts = json::object();
+        ckpts["kept"]    = n_kept;
+        ckpts["moved"]   = n_moved;
+        ckpts["dropped"] = n_dropped;
+
+        out = json::object();
+        out["id_slot"]         = slot.id;
+        out["n_tokens_before"] = (int64_t) dst_state.size();
+        out["n_tokens_after"]  = (int64_t) new_tokens.size();
+        out["delta"]           = delta;
+        out["src"]             = span_json(src_state.size(), src_lcp, q0, q1, src_widened, span_text);
+        out["src"]["canonical"] = src_canonical;
+        out["dst"]             = span_json(dst_state.size(), dst_lcp, a, b, dst_widened, common_detokenize(ctx_tgt, dst_span_tokens, true));
+        out["draft"]           = draft;
+        out["checkpoints"]     = ckpts;
+        out["t_ms"]            = (ggml_time_us() - t_start) / 1000.0;
+
+        SLT_INF(slot, "kv splice: [%d, %d) of %zu tokens replaced by [%d, %d) of another state: %zu -> %zu tokens (%.1f ms)\n",
+                a, b, dst_state.size(), q0, q1, dst_state.size(), new_tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
     // queue the state of a released slot for the disk prompt cache
     void prompt_disk_save(server_slot & slot) {
         slot.disk_unsaved = false;
@@ -2860,6 +3129,33 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_KV_SPLICE:
+                {
+                    const int id_slot = task.kv_splice.id_slot >= 0 ? task.kv_splice.id_slot : 0;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    json out;
+                    std::string err;
+                    if (!kv_splice_run(*slot, task.kv_splice, out, err)) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    auto res = std::make_unique<server_task_result_kv_splice>();
+                    res->id      = task.id;
+                    res->id_slot = slot->id;
+                    res->data    = std::move(out);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -5024,6 +5320,87 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_kv_splice = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        // a context is a chat request body ("messages", "tools", template options), rendered exactly like
+        // /v1/chat/completions renders it, or a raw "prompt"
+        auto render = [&](const char * key) -> llama_tokens {
+            if (!body.contains(key) || !body.at(key).is_object()) {
+                throw std::invalid_argument(std::string("missing object \"") + key + "\" (a chat request body or {\"prompt\": ...})");
+            }
+            const json & spec = body.at(key);
+            json prompt;
+            if (spec.contains("messages")) {
+                std::vector<raw_buffer> files;
+                json chat = spec;
+                const json parsed = oaicompat_chat_params_parse(chat, meta->chat_params, files);
+                if (!files.empty()) {
+                    throw std::invalid_argument("/kv/splice does not support contexts with media");
+                }
+                prompt = parsed.at("prompt");
+            } else if (spec.contains("prompt")) {
+                prompt = spec.at("prompt");
+            } else {
+                throw std::invalid_argument(std::string("\"") + key + "\" needs \"messages\" or \"prompt\"");
+            }
+            auto toks = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            if (toks.size() != 1) {
+                throw std::invalid_argument(std::string("\"") + key + "\" must render to a single prompt");
+            }
+            return toks[0].get_text_tokens();
+        };
+
+        auto span = [&](const char * which, std::string & text, int32_t range[2], std::string & occurrence) {
+            const std::string k_span  = std::string(which) + "_span";
+            const std::string k_range = std::string(which) + "_range";
+            const std::string k_occ   = std::string(which) + "_occurrence";
+            if (body.contains(k_range)) {
+                const auto r = body.at(k_range).get<std::vector<int32_t>>();
+                if (r.size() != 2 || r[0] < 0 || r[1] <= r[0]) {
+                    throw std::invalid_argument(k_range + " must be [start, end) token indices");
+                }
+                range[0] = r[0];
+                range[1] = r[1];
+            } else if (body.contains(k_span)) {
+                text = body.at(k_span).get<std::string>();
+            } else {
+                throw std::invalid_argument("missing \"" + k_span + "\" (or \"" + k_range + "\")");
+            }
+            if (body.contains(k_occ)) {
+                const json & o = body.at(k_occ);
+                occurrence = o.is_number_integer() ? std::to_string(o.get<int>()) : o.get<std::string>();
+            }
+        };
+
+        server_task task(SERVER_TASK_TYPE_KV_SPLICE);
+        task.kv_splice.id_slot    = json_value(body, "id_slot", -1);
+        task.kv_splice.src_tokens = render("src");
+        task.kv_splice.dst_tokens = render("dst");
+        span("src", task.kv_splice.src_span, task.kv_splice.src_range, task.kv_splice.src_occurrence);
+        span("dst", task.kv_splice.dst_span, task.kv_splice.dst_range, task.kv_splice.dst_occurrence);
+
+        auto & rd = res->rd;
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
         return res;
     };
 

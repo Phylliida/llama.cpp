@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_KV_SPLICE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -172,6 +173,22 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_KV_SPLICE (POST /kv/splice): replace a span of the destination conversation's
+    // cache with a span of the source conversation's cache. The rendered contexts pick the cached states; the
+    // spans are found, by text or token range, in those states' own tokens
+    struct kv_splice_params {
+        int id_slot = -1;
+        llama_tokens src_tokens;
+        llama_tokens dst_tokens;
+        std::string  src_span;
+        std::string  dst_span;
+        int32_t      src_range[2] = { -1, -1 };
+        int32_t      dst_range[2] = { -1, -1 };
+        std::string  src_occurrence = "unique"; // "unique", "first", "last" or an index
+        std::string  dst_occurrence = "unique";
+    };
+    kv_splice_params kv_splice;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -531,6 +548,14 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+struct server_task_result_kv_splice : server_task_result {
+    json data;
+
+    virtual json to_json() override {
+        return data;
+    }
 };
 
 struct server_task_result_slot_erase : server_task_result {
