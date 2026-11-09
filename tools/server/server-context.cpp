@@ -1890,28 +1890,29 @@ private:
             return true;
         };
 
+        // note: with a vision projector loaded every prompt is an mtmd one, so use get_text_tokens(), not get_tokens()
         auto text_only = [&](const char * which) {
-            const auto & toks = slot.prompt.tokens.get_tokens();
-            if (toks.empty()) {
+            const auto & st = slot.prompt.tokens;
+            if (st.empty()) {
                 err = std::string("no cached state matches the ") + which + " context";
                 return false;
             }
-            if (std::find(toks.begin(), toks.end(), LLAMA_TOKEN_NULL) != toks.end()) {
+            if (st.get_text_tokens().size() != st.size()) {
                 err = std::string("the ") + which + " state holds media, which /kv/splice does not support";
                 return false;
             }
             return true;
         };
 
-        const server_tokens src_ctx(p.src_tokens, false);
-        const server_tokens dst_ctx(p.dst_tokens, false);
+        const server_tokens src_ctx(p.src_tokens, mctx != nullptr);
+        const server_tokens dst_ctx(p.dst_tokens, mctx != nullptr);
 
         // 1. the source state and its span
         kv_splice_load(slot, src_ctx);
         if (!text_only("source")) {
             return false;
         }
-        const llama_tokens src_state = slot.prompt.tokens.get_tokens();
+        const llama_tokens src_state = slot.prompt.tokens.get_text_tokens();
         const size_t src_lcp = slot.prompt.tokens.get_common_prefix(src_ctx);
 
         int32_t q0 = 0, q1 = 0;
@@ -1938,7 +1939,7 @@ private:
         if (!text_only("destination")) {
             return false;
         }
-        const llama_tokens dst_state = slot.prompt.tokens.get_tokens();
+        const llama_tokens dst_state = slot.prompt.tokens.get_text_tokens();
         const size_t dst_lcp = slot.prompt.tokens.get_common_prefix(dst_ctx);
 
         int32_t a = 0, b = 0;
