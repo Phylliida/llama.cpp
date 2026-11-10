@@ -1960,15 +1960,14 @@ private:
             return false;
         }
 
-        // the draft's own cache: the same cut and move; it gets no copy of the span (it only proposes tokens)
+        // the draft's own cache: drop it from the span on and let the next tokens refill it (it only proposes
+        // tokens, verification keeps the output exact). Moving it instead (seq_rm + seq_add, a K-shift of the draft
+        // context) was followed by a segfault on the next request on Kimi-K3 (2026-11-09), cause not found yet
         std::string draft = "none";
         if (ctx_dft) {
             llama_memory_t mem_dft = llama_get_memory(ctx_dft);
-            if (llama_memory_seq_rm(mem_dft, slot.id, a, b)) {
-                if (delta != 0) {
-                    llama_memory_seq_add(mem_dft, slot.id, b, -1, delta);
-                }
-                draft = "moved";
+            if (llama_memory_seq_rm(mem_dft, slot.id, a, -1)) {
+                draft = "truncated";
             } else {
                 llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
                 draft = "cleared";

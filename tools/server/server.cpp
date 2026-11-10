@@ -1,3 +1,5 @@
+#include <execinfo.h>
+#include <unistd.h>
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
@@ -41,6 +43,17 @@ int llama_server(int argc, char ** argv);
 
 // to be used via CLI (argc / argv are used by router mode only)
 int llama_server(common_params & params, int argc, char ** argv);
+
+// TEMP: backtrace on SIGSEGV / SIGBUS, then the default action (core dump)
+static void server_crash_handler(int sig) {
+    static const char msg[] = "\nfatal signal, backtrace:\n";
+    if (write(2, msg, sizeof(msg) - 1) < 0) {}
+    void * frames[64];
+    const int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, 2);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 void llama_server_terminate();
 void llama_server_terminate() {
     if (shutdown_handler) {
@@ -91,6 +104,10 @@ int llama_server(int argc, char ** argv) {
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
     signal(SIGPIPE, SIG_IGN);
+
+    // TEMP: print a backtrace on a crash (the KV splice investigation, 2026-11-09)
+    signal(SIGSEGV, server_crash_handler);
+    signal(SIGBUS,  server_crash_handler);
 #endif
 
     // own arguments required by this example
