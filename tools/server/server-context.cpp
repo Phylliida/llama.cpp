@@ -2369,6 +2369,10 @@ private:
     bool kv_splice2_run(server_slot & slot, const server_task::kv_splice2_params & p, json & out, std::string & err) {
         const int64_t t_start = ggml_time_us();
 
+        // where the time goes (ms), reported in the response
+        double t_load = 0, t_export = 0, t_state = 0, t_advance = 0, t_prefix = 0, t_eval = 0, t_insert = 0;
+        auto ms_since = [](int64_t t0) { return (ggml_time_us() - t0) / 1000.0; };
+
         if (!prompt_cache) {
             err = "/kv/splice2 needs the RAM prompt cache (--cache-ram > 0)";
             return false;
@@ -2442,7 +2446,11 @@ private:
                 }
                 src_ctx = server_tokens(toks, mctx != nullptr);
             }
-            kv_splice_load(slot, src_ctx);
+            {
+                const int64_t t0 = ggml_time_us();
+                kv_splice_load(slot, src_ctx);
+                t_load += ms_since(t0);
+            }
             const llama_tokens S = slot.prompt.tokens.get_text_tokens();
             if (S.size() != slot.prompt.tokens.size()) {
                 err = "a source conversation contains images, which /kv/splice2 does not support";
@@ -2507,11 +2515,14 @@ private:
             pl.r0 = r0; pl.r1 = r0 + n;
             pl.s0 = s0; pl.s1 = s0 + n;
 
+            const int64_t t_ex = ggml_time_us();
             pl.blob.resize(llama_memory_seq_span_export(mem, slot.id, pl.s0, pl.s1, nullptr, 0));
             if (pl.blob.empty() || llama_memory_seq_span_export(mem, slot.id, pl.s0, pl.s1, pl.blob.data(), pl.blob.size()) != pl.blob.size()) {
                 why[i] = "exporting its cache entries failed";
                 continue;
             }
+            t_export += ms_since(t_ex);
+            const int64_t t_st = ggml_time_us();
 
             // the source's recurrent state at the piece's end: its own final state, a checkpoint there, or the latest
             // checkpoint before it advanced over the source's tokens (or used as it is if that is too far)
@@ -2545,6 +2556,7 @@ private:
                     const int64_t gap = (int64_t) pl.s1 - best->n_tokens;
                     if (gap > 0 && gap <= p.max_advance) {
                         // advance: keep a copy of the source in the RAM cache, then evaluate its tokens up to s1
+                        const int64_t t_adv = ggml_time_us();
                         slot.prompt_save(*prompt_cache);
                         const size_t c = best->n_tokens;
                         const size_t sz = pl.state.size();
@@ -2559,17 +2571,21 @@ private:
                         }
                         // the slot's copy is now cut at s1: drop it (the full one is in the RAM cache)
                         slot.prompt_clear();
+                        t_advance += ms_since(t_adv);
                     } else {
                         pl.advanced = -gap;
                     }
                 }
             }
 
+            t_state += ms_since(t_st);
+
             ok[i] = true;
             prev_end = pl.r1;
         }
 
         // 2. the request's prefix: load its conversation and cut it back to a state the gaps can start from
+        const int64_t t_pre = ggml_time_us();
         kv_splice_load(slot, Rst);
         const size_t P = slot.prompt.tokens.get_common_prefix(Rst);
         size_t c = P;
@@ -2616,6 +2632,8 @@ private:
             }
         }
 
+        t_prefix += ms_since(t_pre);
+
         // 3. build: evaluate each gap, insert each piece and take its recurrent state
         size_t cursor = c;
         size_t copied = 0, prefilled = 0;
@@ -2635,12 +2653,15 @@ private:
             }
             auto & pl = placed[i];
 
+            const int64_t t_ev = ggml_time_us();
             if (!kv2_eval(slot, R, cursor, pl.r0)) {
                 slot.prompt_clear();
                 err = "evaluating the tokens before piece " + std::to_string(i) + " failed (see the server log)";
                 return false;
             }
+            t_eval += ms_since(t_ev);
             prefilled += pl.r0 - cursor;
+            const int64_t t_in = ggml_time_us();
 
             llama_pos d = 0;
             if (!llama_memory_seq_span_replace(ctx_tgt, slot.id, pl.r0, pl.r0, pl.blob.data(), pl.blob.size(), &d)) {
@@ -2673,6 +2694,7 @@ private:
                 ck.data_tgt = pl.state;
             }
 
+            t_insert += ms_since(t_in);
             copied += pl.r1 - pl.r0;
             cursor  = pl.r1;
             last    = (int) i;
@@ -2721,6 +2743,19 @@ private:
             out["prefix_recurrent"] = ps;
         }
         out["t_ms"]      = (ggml_time_us() - t_start) / 1000.0;
+        {
+            json tm = json::object();
+            tm["load_sources"] = t_load;
+            tm["export"]       = t_export;
+            tm["states"]       = t_state;
+            tm["advance"]      = t_advance;
+            tm["prefix"]       = t_prefix;
+            tm["eval_gaps"]    = t_eval;
+            tm["insert"]       = t_insert;
+            out["timing_ms"] = tm;
+        }
+        SLT_INF(slot, "kv splice2: timing ms: load %.0f export %.0f states %.0f (advance %.0f) prefix %.0f gaps %.0f insert %.0f\n",
+                t_load, t_export, t_state, t_advance, t_prefix, t_eval, t_insert);
 
         SLT_INF(slot, "kv splice2: built %zu tokens: prefix %zu, copied %zu, prefilled %zu, %d of %zu pieces placed (%.1f ms)\n",
                 cursor, c, copied, prefilled, (int) std::count(ok.begin(), ok.end(), true), np, (ggml_time_us() - t_start) / 1000.0);
