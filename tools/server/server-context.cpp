@@ -1960,18 +1960,14 @@ private:
             return false;
         }
 
-        // the draft's own cache: drop it from the span on and let the next tokens refill it (it only proposes
-        // tokens, verification keeps the output exact). Moving it instead (seq_rm + seq_add, a K-shift of the draft
-        // context) was followed by a segfault on the next request on Kimi-K3 (2026-11-09), cause not found yet
+        // the draft's own cache: clear the sequence and let the next tokens refill it (it only proposes tokens;
+        // verification keeps the output exact, draft acceptance is lower until its window refills). Its positions
+        // must stay consecutive, and an empty sequence may restart at any position. Moving it instead (seq_add: a
+        // K-shift of the draft context, then a graph re-reserve) was followed by a segfault on Kimi-K3 (2026-11-09)
         std::string draft = "none";
         if (ctx_dft) {
-            llama_memory_t mem_dft = llama_get_memory(ctx_dft);
-            if (llama_memory_seq_rm(mem_dft, slot.id, a, -1)) {
-                draft = "truncated";
-            } else {
-                llama_memory_seq_rm(mem_dft, slot.id, -1, -1);
-                draft = "cleared";
-            }
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+            draft = "cleared";
         }
 
         llama_tokens new_tokens(dst_state.begin(), dst_state.begin() + a);
