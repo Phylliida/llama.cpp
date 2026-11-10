@@ -1800,25 +1800,111 @@ private:
         prompt_cache->update();
     }
 
-    // the token range [t0, t1) of toks whose text covers span, widened to token boundaries
+    // a media chunk in the text that spans are searched in (never typed by a user)
+    static constexpr const char * KV_SPLICE_MEDIA = "\x1f<media>\x1f";
+
+    // a cached prompt as searchable text
+    struct kv_splice_view {
+        std::string text;                               // token pieces, a media chunk as KV_SPLICE_MEDIA
+        std::vector<size_t> off;                        // text offset of each token; off[n] = text.size()
+        std::vector<std::pair<size_t, size_t>> chunks;  // media chunks, [start, end) token ranges
+        std::vector<std::pair<size_t, size_t>> blocks;  // the chunks with their wrapper tokens
+                                                        // (Kimi-K3: <|media_begin|>image WxH<|media_content|> ... <|media_end|>)
+    };
+
+    kv_splice_view kv_splice_make_view(const server_tokens & st) const {
+        kv_splice_view v;
+        const size_t n = st.size();
+
+        if (n > 0 && st.has_mtmd) {
+            if (st[0] == LLAMA_TOKEN_NULL) {
+                v.chunks.emplace_back(0, mtmd_input_chunk_get_n_tokens(st.find_chunk(0).get()));
+            }
+            for (auto next = st.find_next_media_chunk(0); next.first; next = st.find_next_media_chunk(next.second)) {
+                v.chunks.emplace_back(next.second, next.second + mtmd_input_chunk_get_n_tokens(next.first->get()));
+            }
+        }
+
+        v.off.assign(n + 1, 0);
+        size_t c = 0;
+        for (size_t i = 0; i < n; ++i) {
+            v.off[i] = v.text.size();
+            if (st[i] == LLAMA_TOKEN_NULL) {
+                if (c < v.chunks.size() && v.chunks[c].first == i) {
+                    v.text += KV_SPLICE_MEDIA;
+                }
+                if (c < v.chunks.size() && i + 1 == v.chunks[c].second) {
+                    c++;
+                }
+            } else {
+                v.text += common_token_to_piece(ctx_tgt, st[i], true);
+            }
+        }
+        v.off[n] = v.text.size();
+
+        auto piece = [&](size_t i) { return v.text.substr(v.off[i], v.off[i + 1] - v.off[i]); };
+        for (const auto & ch : v.chunks) {
+            size_t b0 = ch.first;
+            size_t b1 = ch.second;
+            for (size_t k = 1; k <= 32 && k <= ch.first; ++k) {
+                const size_t i = ch.first - k;
+                if (st[i] == LLAMA_TOKEN_NULL) {
+                    break;
+                }
+                if (piece(i) == "<|media_begin|>") {
+                    b0 = i;
+                    break;
+                }
+            }
+            if (b1 < n && st[b1] != LLAMA_TOKEN_NULL && piece(b1) == "<|media_end|>") {
+                b1++;
+            }
+            v.blocks.emplace_back(b0, b1);
+        }
+
+        return v;
+    }
+
+    // keep media blocks whole; with media_edges, also take in the blocks right at the span's edges, so a message
+    // content that starts or ends with an image is replaced as a unit
+    static void kv_splice_snap(const kv_splice_view & v, bool media_edges, int32_t & t0, int32_t & t1) {
+        for (const auto & bl : v.blocks) {
+            if ((int32_t) bl.first < t0 && t0 < (int32_t) bl.second) {
+                t0 = bl.first;
+            }
+            if ((int32_t) bl.first < t1 && t1 < (int32_t) bl.second) {
+                t1 = bl.second;
+            }
+        }
+        if (media_edges) {
+            for (bool changed = true; changed; ) {
+                changed = false;
+                for (const auto & bl : v.blocks) {
+                    if ((int32_t) bl.second == t0 && (int32_t) bl.first < t0) {
+                        t0 = bl.first;
+                        changed = true;
+                    }
+                    if ((int32_t) bl.first == t1 && (int32_t) bl.second > t1) {
+                        t1 = bl.second;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // the token range [t0, t1) whose text covers span (or, with span_end, runs from the start of span to the end of
+    // the first span_end after it), widened to token boundaries and whole media blocks
     // occurrence: "unique" (exactly one match), "first", "last" or a 0-based index
-    bool kv_splice_find(const llama_tokens & toks, const std::string & span, const std::string & occurrence,
-            int32_t & t0, int32_t & t1, bool & widened, std::string & err) const {
+    bool kv_splice_find(const kv_splice_view & v, const std::string & span, const std::string & span_end,
+            const std::string & occurrence, bool media_edges, int32_t & t0, int32_t & t1, bool & widened, std::string & err) const {
         if (span.empty()) {
             err = "is empty";
             return false;
         }
 
-        std::string text;
-        std::vector<size_t> off(toks.size() + 1);
-        for (size_t i = 0; i < toks.size(); ++i) {
-            off[i] = text.size();
-            text += common_token_to_piece(ctx_tgt, toks[i], true);
-        }
-        off[toks.size()] = text.size();
-
         std::vector<size_t> hits;
-        for (size_t p = text.find(span); p != std::string::npos; p = text.find(span, p + 1)) {
+        for (size_t p = v.text.find(span); p != std::string::npos; p = v.text.find(span, p + 1)) {
             hits.push_back(p);
         }
         if (hits.empty()) {
@@ -1850,18 +1936,30 @@ private:
         }
 
         const size_t c0 = hits[k];
-        const size_t c1 = c0 + span.size();
+        size_t c1 = c0 + span.size();
+        if (!span_end.empty()) {
+            const size_t pe = v.text.find(span_end, c0);
+            if (pe == std::string::npos) {
+                err = "end text not found after the start text";
+                return false;
+            }
+            c1 = pe + span_end.size();
+        }
 
+        const auto & off = v.off;
         t0 = (int32_t) (std::upper_bound(off.begin(), off.end(), c0) - off.begin()) - 1; // the token holding c0
         t1 = (int32_t) (std::lower_bound(off.begin(), off.end(), c1) - off.begin());     // the first token from c1 on
         widened = off[t0] != c0 || off[t1] != c1;
+
+        kv_splice_snap(v, media_edges, t0, t1);
 
         return true;
     }
 
     // replace a span of the destination conversation's cached state with a span of the source conversation's
     // state, without processing anything again. The recurrent state (Kimi-K3's KDA) stays the destination's own;
-    // only the attention cache (K3: the MLA layers) changes, and the positions after the span move
+    // only the attention cache (K3: the MLA layers) changes, and the positions after the span move. Spans may hold
+    // images (their cache entries are copied or dropped with the span); M-RoPE models are not supported
     bool kv_splice_run(server_slot & slot, const server_task::kv_splice_params & p, json & out, std::string & err) {
         const int64_t t_start = ggml_time_us();
 
@@ -1869,55 +1967,77 @@ private:
             err = "/kv/splice needs the RAM prompt cache (--cache-ram > 0) to hold one conversation while the other is loaded";
             return false;
         }
+        if (mctx && mtmd_decode_use_mrope(mctx)) {
+            err = "/kv/splice does not support M-RoPE models (an image does not take one position per token)";
+            return false;
+        }
 
-        auto resolve = [&](const char * which, const llama_tokens & state, const std::string & span, const int32_t range[2],
-                const std::string & occurrence, int32_t & t0, int32_t & t1, bool & widened) {
+        auto resolve = [&](const char * which, const kv_splice_view & v, const std::string & span, const std::string & span_end,
+                const int32_t range[2], const std::string & occurrence, int32_t & t0, int32_t & t1, bool & widened) {
             widened = false;
+            const int32_t n = (int32_t) v.off.size() - 1;
             if (range[0] >= 0) {
                 t0 = range[0];
                 t1 = range[1];
-                if (t1 <= t0 || t1 > (int32_t) state.size()) {
-                    err = std::string(which) + "_range is outside the cached state (" + std::to_string(state.size()) + " tokens)";
+                if (t1 <= t0 || t1 > n) {
+                    err = std::string(which) + "_range is outside the cached state (" + std::to_string(n) + " tokens)";
                     return false;
                 }
+                kv_splice_snap(v, false, t0, t1);
                 return true;
             }
             std::string e;
-            if (!kv_splice_find(state, span, occurrence, t0, t1, widened, e)) {
-                err = std::string(which) + "_span " + e + " in the cached state (" + std::to_string(state.size()) + " tokens)";
+            if (!kv_splice_find(v, span, span_end, occurrence, p.media_edges, t0, t1, widened, e)) {
+                err = std::string(which) + "_span " + e + " in the cached state (" + std::to_string(n) + " tokens)";
                 return false;
             }
             return true;
         };
 
-        // note: with a vision projector loaded every prompt is an mtmd one, so use get_text_tokens(), not get_tokens()
-        auto text_only = [&](const char * which) {
-            const auto & st = slot.prompt.tokens;
-            if (st.empty()) {
-                err = std::string("no cached state matches the ") + which + " context";
-                return false;
+        auto n_media = [](const kv_splice_view & v, int32_t t0, int32_t t1) {
+            int n = 0;
+            for (const auto & ch : v.chunks) {
+                n += (int32_t) ch.first >= t0 && (int32_t) ch.second <= t1;
             }
-            if (st.get_text_tokens().size() != st.size()) {
-                err = std::string("the ") + which + " state holds media, which /kv/splice does not support";
-                return false;
-            }
-            return true;
+            return n;
         };
 
-        const server_tokens src_ctx(p.src_tokens, mctx != nullptr);
-        const server_tokens dst_ctx(p.dst_tokens, mctx != nullptr);
+        auto view_text = [](const kv_splice_view & v, int32_t t0, int32_t t1) {
+            std::string s = v.text.substr(v.off[t0], v.off[t1] - v.off[t0]);
+            const std::string m = KV_SPLICE_MEDIA;
+            for (size_t i = s.find(m); i != std::string::npos; i = s.find(m, i)) {
+                s.replace(i, m.size(), "[image]");
+            }
+            return s;
+        };
+
+        // the tokens [i0, i1) of src onto dst, media chunks as whole chunks (the ranges are chunk-aligned)
+        auto append = [](server_tokens & dst, const server_tokens & src, size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ) {
+                if (src[i] == LLAMA_TOKEN_NULL) {
+                    const auto & chunk = src.find_chunk(i);
+                    dst.push_back(chunk.get());
+                    i += mtmd_input_chunk_get_n_tokens(chunk.get());
+                } else {
+                    dst.push_back(src[i]);
+                    ++i;
+                }
+            }
+        };
 
         // 1. the source state and its span
-        kv_splice_load(slot, src_ctx);
-        if (!text_only("source")) {
+        kv_splice_load(slot, p.src_ctx);
+        if (slot.prompt.tokens.empty()) {
+            err = "no cached state matches the source context";
             return false;
         }
-        const llama_tokens src_state = slot.prompt.tokens.get_text_tokens();
-        const size_t src_lcp = slot.prompt.tokens.get_common_prefix(src_ctx);
+        const server_tokens  src_st  = slot.prompt.tokens.clone();
+        const size_t         src_lcp = src_st.get_common_prefix(p.src_ctx);
+        const kv_splice_view src_v   = kv_splice_make_view(src_st);
 
         int32_t q0 = 0, q1 = 0;
         bool src_widened = false;
-        if (!resolve("src", src_state, p.src_span, p.src_range, p.src_occurrence, q0, q1, src_widened)) {
+        if (!resolve("src", src_v, p.src_span, p.src_span_end, p.src_range, p.src_occurrence, q0, q1, src_widened)) {
             return false;
         }
 
@@ -1927,7 +2047,6 @@ private:
             err = "exporting the source span failed (see the server log)";
             return false;
         }
-        const llama_tokens span_tokens(src_state.begin() + q0, src_state.begin() + q1);
 
         // every token of the span must have its cache entry (the last sampled token of a state has none yet)
         {
@@ -1947,21 +2066,33 @@ private:
         }
 
         // sampled tokens are not always the tokenizer's own split of their text: then a prompt that contains the
-        // text matches the spliced state only up to the first difference
-        const std::string span_text = common_detokenize(ctx_tgt, span_tokens, true);
-        const bool src_canonical = common_tokenize(ctx_tgt, span_text, false, true) == span_tokens;
+        // text matches the spliced state only up to the first difference (checked per text run between images)
+        bool src_canonical = true;
+        for (int32_t i = q0; i < q1 && src_canonical; ) {
+            if (src_st[i] == LLAMA_TOKEN_NULL) {
+                ++i;
+                continue;
+            }
+            llama_tokens run;
+            while (i < q1 && src_st[i] != LLAMA_TOKEN_NULL) {
+                run.push_back(src_st[i++]);
+            }
+            src_canonical = common_tokenize(ctx_tgt, common_detokenize(ctx_tgt, run, true), false, true) == run;
+        }
 
         // 2. the destination state and its span
-        kv_splice_load(slot, dst_ctx);
-        if (!text_only("destination")) {
+        kv_splice_load(slot, p.dst_ctx);
+        if (slot.prompt.tokens.empty()) {
+            err = "no cached state matches the destination context";
             return false;
         }
-        const llama_tokens dst_state = slot.prompt.tokens.get_text_tokens();
-        const size_t dst_lcp = slot.prompt.tokens.get_common_prefix(dst_ctx);
+        const server_tokens  dst_st  = slot.prompt.tokens.clone();
+        const size_t         dst_lcp = dst_st.get_common_prefix(p.dst_ctx);
+        const kv_splice_view dst_v   = kv_splice_make_view(dst_st);
 
         int32_t a = 0, b = 0;
         bool dst_widened = false;
-        if (!resolve("dst", dst_state, p.dst_span, p.dst_range, p.dst_occurrence, a, b, dst_widened)) {
+        if (!resolve("dst", dst_v, p.dst_span, p.dst_span_end, p.dst_range, p.dst_occurrence, a, b, dst_widened)) {
             return false;
         }
         if (llama_memory_seq_pos_max(mem, slot.id) < b - 1) {
@@ -1991,12 +2122,17 @@ private:
             draft = "cleared";
         }
 
-        llama_tokens new_tokens(dst_state.begin(), dst_state.begin() + a);
-        new_tokens.insert(new_tokens.end(), span_tokens.begin(), span_tokens.end());
-        new_tokens.insert(new_tokens.end(), dst_state.begin() + b, dst_state.end());
-        GGML_ASSERT((int64_t) new_tokens.size() == (int64_t) dst_state.size() + delta);
+        server_tokens new_tokens;
+        new_tokens.has_mtmd = mctx != nullptr;
+        append(new_tokens, dst_st, 0, a);
+        append(new_tokens, src_st, q0, q1);
+        append(new_tokens, dst_st, b, dst_st.size());
+        GGML_ASSERT((int64_t) new_tokens.size() == (int64_t) dst_st.size() + delta);
 
-        slot.prompt.tokens = server_tokens(new_tokens, mctx != nullptr);
+        const size_t n_before = dst_st.size();
+        const size_t n_after  = new_tokens.size();
+
+        slot.prompt.tokens = std::move(new_tokens);
 
         // context checkpoints: keep those before the span, move those after it, drop those inside it
         int n_kept = 0, n_moved = 0, n_dropped = 0;
@@ -2027,14 +2163,13 @@ private:
         }
         slot.t_last_used = ggml_time_us();
 
-        const llama_tokens dst_span_tokens(dst_state.begin() + a, dst_state.begin() + b);
-
-        auto span_json = [](size_t n_state, size_t lcp, int32_t t0, int32_t t1, bool widened, const std::string & text) {
+        auto span_json = [](size_t n_state, size_t lcp, int32_t t0, int32_t t1, bool widened, int media, const std::string & text) {
             json o = json::object();
             o["state_tokens"] = (int64_t) n_state;
             o["lcp"]          = (int64_t) lcp;
             o["range"]        = json::array({ t0, t1 });
             o["widened"]      = widened;
+            o["images"]       = media;
             o["text"]         = text;
             return o;
         };
@@ -2045,19 +2180,19 @@ private:
         ckpts["dropped"] = n_dropped;
 
         out = json::object();
-        out["id_slot"]         = slot.id;
-        out["n_tokens_before"] = (int64_t) dst_state.size();
-        out["n_tokens_after"]  = (int64_t) new_tokens.size();
-        out["delta"]           = delta;
-        out["src"]             = span_json(src_state.size(), src_lcp, q0, q1, src_widened, span_text);
+        out["id_slot"]          = slot.id;
+        out["n_tokens_before"]  = (int64_t) n_before;
+        out["n_tokens_after"]   = (int64_t) n_after;
+        out["delta"]            = delta;
+        out["src"]              = span_json(src_st.size(), src_lcp, q0, q1, src_widened, n_media(src_v, q0, q1), view_text(src_v, q0, q1));
         out["src"]["canonical"] = src_canonical;
-        out["dst"]             = span_json(dst_state.size(), dst_lcp, a, b, dst_widened, common_detokenize(ctx_tgt, dst_span_tokens, true));
-        out["draft"]           = draft;
-        out["checkpoints"]     = ckpts;
-        out["t_ms"]            = (ggml_time_us() - t_start) / 1000.0;
+        out["dst"]              = span_json(dst_st.size(), dst_lcp, a, b, dst_widened, n_media(dst_v, a, b), view_text(dst_v, a, b));
+        out["draft"]            = draft;
+        out["checkpoints"]      = ckpts;
+        out["t_ms"]             = (ggml_time_us() - t_start) / 1000.0;
 
         SLT_INF(slot, "kv splice: [%d, %d) of %zu tokens replaced by [%d, %d) of another state: %zu -> %zu tokens (%.1f ms)\n",
-                a, b, dst_state.size(), q0, q1, dst_state.size(), new_tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+                a, b, n_before, q0, q1, n_before, n_after, (ggml_time_us() - t_start) / 1000.0);
 
         return true;
     }
@@ -5346,33 +5481,35 @@ void server_routes::init_routes() {
 
         // a context is a chat request body ("messages", "tools", template options), rendered exactly like
         // /v1/chat/completions renders it, or a raw "prompt"
-        auto render = [&](const char * key) -> llama_tokens {
+        auto render = [&](const char * key) -> server_tokens {
             if (!body.contains(key) || !body.at(key).is_object()) {
                 throw std::invalid_argument(std::string("missing object \"") + key + "\" (a chat request body or {\"prompt\": ...})");
             }
             const json & spec = body.at(key);
-            json prompt;
             if (spec.contains("messages")) {
                 std::vector<raw_buffer> files;
                 json chat = spec;
                 const json parsed = oaicompat_chat_params_parse(chat, meta->chat_params, files);
-                if (!files.empty()) {
-                    throw std::invalid_argument("/kv/splice does not support contexts with media");
+                if (ctx_server.mctx != nullptr) {
+                    return process_mtmd_prompt(ctx_server.mctx, parsed.at("prompt").get<std::string>(), files, ctx_server.init_opt);
                 }
-                prompt = parsed.at("prompt");
-            } else if (spec.contains("prompt")) {
-                prompt = spec.at("prompt");
-            } else {
-                throw std::invalid_argument(std::string("\"") + key + "\" needs \"messages\" or \"prompt\"");
+                auto toks = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), true, true, ctx_server.init_opt);
+                if (toks.size() != 1) {
+                    throw std::invalid_argument(std::string("\"") + key + "\" must render to a single prompt");
+                }
+                return std::move(toks[0]);
             }
-            auto toks = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
-            if (toks.size() != 1) {
-                throw std::invalid_argument(std::string("\"") + key + "\" must render to a single prompt");
+            if (spec.contains("prompt")) {
+                auto toks = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, spec.at("prompt"), true, true, ctx_server.init_opt);
+                if (toks.size() != 1) {
+                    throw std::invalid_argument(std::string("\"") + key + "\" must render to a single prompt");
+                }
+                return std::move(toks[0]);
             }
-            return toks[0].get_text_tokens();
+            throw std::invalid_argument(std::string("\"") + key + "\" needs \"messages\" or \"prompt\"");
         };
 
-        auto span = [&](const char * which, std::string & text, int32_t range[2], std::string & occurrence) {
+        auto span = [&](const char * which, std::string & text, std::string & text_end, int32_t range[2], std::string & occurrence) {
             const std::string k_span  = std::string(which) + "_span";
             const std::string k_range = std::string(which) + "_range";
             const std::string k_occ   = std::string(which) + "_occurrence";
@@ -5383,6 +5520,13 @@ void server_routes::init_routes() {
                 }
                 range[0] = r[0];
                 range[1] = r[1];
+            } else if (body.contains(k_span) && body.at(k_span).is_object()) {
+                // {"start": "...", "end": "..."}: from the start of one text to the end of the next match of another
+                text     = json_value(body.at(k_span), "start", std::string());
+                text_end = json_value(body.at(k_span), "end",   std::string());
+                if (text.empty() || text_end.empty()) {
+                    throw std::invalid_argument(k_span + " as an object needs non-empty \"start\" and \"end\"");
+                }
             } else if (body.contains(k_span)) {
                 text = body.at(k_span).get<std::string>();
             } else {
@@ -5396,10 +5540,11 @@ void server_routes::init_routes() {
 
         server_task task(SERVER_TASK_TYPE_KV_SPLICE);
         task.kv_splice.id_slot    = json_value(body, "id_slot", -1);
-        task.kv_splice.src_tokens = render("src");
-        task.kv_splice.dst_tokens = render("dst");
-        span("src", task.kv_splice.src_span, task.kv_splice.src_range, task.kv_splice.src_occurrence);
-        span("dst", task.kv_splice.dst_span, task.kv_splice.dst_range, task.kv_splice.dst_occurrence);
+        task.kv_splice.src_ctx     = render("src");
+        task.kv_splice.dst_ctx     = render("dst");
+        task.kv_splice.media_edges = json_value(body, "media_edges", true);
+        span("src", task.kv_splice.src_span, task.kv_splice.src_span_end, task.kv_splice.src_range, task.kv_splice.src_occurrence);
+        span("dst", task.kv_splice.dst_span, task.kv_splice.dst_span_end, task.kv_splice.dst_range, task.kv_splice.dst_occurrence);
 
         auto & rd = res->rd;
         task.id = rd.get_new_id();

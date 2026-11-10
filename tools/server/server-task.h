@@ -179,10 +179,13 @@ struct server_task {
     // spans are found, by text or token range, in those states' own tokens
     struct kv_splice_params {
         int id_slot = -1;
-        llama_tokens src_tokens;
-        llama_tokens dst_tokens;
-        std::string  src_span;
+        server_tokens src_ctx;      // the rendered contexts (they may hold media)
+        server_tokens dst_ctx;
+        std::string  src_span;      // the text, or with src_span_end the start text
+        std::string  src_span_end;  // non-empty: the span runs from the start of src_span to the end of this text
         std::string  dst_span;
+        std::string  dst_span_end;
+        bool         media_edges = true; // take in images right at a span's edges
         int32_t      src_range[2] = { -1, -1 };
         int32_t      dst_range[2] = { -1, -1 };
         std::string  src_occurrence = "unique"; // "unique", "first", "last" or an index
