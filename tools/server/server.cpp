@@ -254,6 +254,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
         routes.post_kv_splice              = models_routes->proxy_post;
+        routes.post_kv_splice2             = models_routes->proxy_post;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -310,6 +311,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     // KV splice: replace a span of a cached conversation with a span of another one (fork addition)
     ctx_http.post("/kv/splice",                ex_wrapper(routes.post_kv_splice));
+    ctx_http.post("/kv/splice2",               ex_wrapper(routes.post_kv_splice2));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

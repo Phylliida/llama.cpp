@@ -30,6 +30,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_KV_SPLICE,
+    SERVER_TASK_TYPE_KV_SPLICE2,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -192,6 +193,23 @@ struct server_task {
         std::string  dst_occurrence = "unique";
     };
     kv_splice_params kv_splice;
+
+    // used by SERVER_TASK_TYPE_KV_SPLICE2 (POST /kv/splice2, or /kv/splice with "request"): build the cache of the
+    // next request from pieces of cached conversations, evaluating only the tokens between them
+    struct kv_splice2_piece {
+        bool          has_ctx = false; // src is a request (src_ctx) rather than a reply (reply)
+        server_tokens src_ctx;
+        std::string   reply;
+        std::string   anchor;
+    };
+    struct kv_splice2_params {
+        int id_slot = -1;
+        server_tokens request;
+        std::vector<kv_splice2_piece> pieces;
+        int32_t min_tokens  = 16;   // a shorter piece is evaluated instead
+        int32_t max_advance = 2048; // advance a checkpoint over at most this many tokens to reach a piece's end
+    };
+    kv_splice2_params kv_splice2;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -685,6 +703,14 @@ struct server_prompt_disk {
 
     // if a stored prompt beats the slot's prompt and every RAM entry for tokens_new, read it into the RAM cache
     bool fetch(server_prompt_cache & cache, const server_prompt & prompt, const server_tokens & tokens_new);
+
+    // KV splice2: the longest common prefix of tokens with a stored prompt
+    size_t best_lcp(const server_tokens & tokens);
+
+    // KV splice2: the first n tokens of the most recent stored prompt whose first n tokens hash to h (text only)
+    bool find_prefix_hash(uint64_t h, size_t n, llama_tokens & out);
+
+    const std::string & get_dir() const { return dir; }
 
     static uint64_t hash(const void * data, size_t size, uint64_t h = 14695981039346656037ull);
 

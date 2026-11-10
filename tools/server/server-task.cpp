@@ -2072,6 +2072,49 @@ bool server_prompt_disk::has(const server_tokens & tokens) {
     return false;
 }
 
+size_t server_prompt_disk::best_lcp(const server_tokens & tokens) {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    size_t best = 0;
+    if (pending) {
+        best = std::max(best, tokens.get_common_prefix(pending->prompt.tokens));
+    }
+    for (const auto & e : entries) {
+        if (e.tokens.size() > 0) {
+            best = std::max(best, tokens.get_common_prefix(e.tokens));
+        }
+    }
+
+    return best;
+}
+
+bool server_prompt_disk::find_prefix_hash(uint64_t h, size_t n, llama_tokens & out) {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    auto check = [&](const server_tokens & st) {
+        if (st.size() < n) {
+            return false;
+        }
+        const llama_tokens toks = st.get_text_tokens();
+        if (toks.size() != st.size() || hash(toks.data(), n*sizeof(llama_token)) != h) {
+            return false;
+        }
+        out.assign(toks.begin(), toks.begin() + n);
+        return true;
+    };
+
+    if (pending && check(pending->prompt.tokens)) {
+        return true;
+    }
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it) { // most recently used first
+        if (it->tokens.size() > 0 && check(it->tokens)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void server_prompt_disk::save(server_prompt_cache_state && state) {
     {
         std::lock_guard<std::mutex> lock(mtx);
