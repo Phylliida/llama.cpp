@@ -1929,6 +1929,23 @@ private:
         }
         const llama_tokens span_tokens(src_state.begin() + q0, src_state.begin() + q1);
 
+        // every token of the span must have its cache entry (the last sampled token of a state has none yet)
+        {
+            uint32_t n_cells = 0;
+            memcpy(&n_cells, blob.data() + 12, sizeof(n_cells));
+            bool contiguous = n_cells == (uint32_t) (q1 - q0);
+            for (uint32_t j = 0; contiguous && j < n_cells; ++j) {
+                llama_pos pos;
+                memcpy(&pos, blob.data() + 16 + j*sizeof(llama_pos), sizeof(pos));
+                contiguous = pos == q0 + (llama_pos) j;
+            }
+            if (!contiguous) {
+                err = "src_span [" + std::to_string(q0) + ", " + std::to_string(q1) + ") has " + std::to_string(n_cells) +
+                      " cache entries, not one per token (does it include the state's last, not yet processed token?)";
+                return false;
+            }
+        }
+
         // sampled tokens are not always the tokenizer's own split of their text: then a prompt that contains the
         // text matches the spliced state only up to the first difference
         const std::string span_text = common_detokenize(ctx_tgt, span_tokens, true);
@@ -1945,6 +1962,10 @@ private:
         int32_t a = 0, b = 0;
         bool dst_widened = false;
         if (!resolve("dst", dst_state, p.dst_span, p.dst_range, p.dst_occurrence, a, b, dst_widened)) {
+            return false;
+        }
+        if (llama_memory_seq_pos_max(mem, slot.id) < b - 1) {
+            err = "dst_span ends at token " + std::to_string(b) + ", past the cached entries of the destination state";
             return false;
         }
         if ((size_t) b > dst_lcp) {
