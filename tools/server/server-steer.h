@@ -215,6 +215,11 @@ struct server_explore_round {
     int                             n_new    = 0; // bins found in this round
     double                          new_mass = 0.0; // weight that landed in them
     std::vector<server_explore_bin> bins;          // by mass, heaviest first
+    double                          mass  = 0.0;   // total weight, live and finished (beam: the mass the top walkers hold)
+    double                          eff   = 0.0;   // effective number of live walkers, (sum w)^2 / sum w^2
+    int                             n_par = 0;     // walkers of the previous step that have children in this one
+    std::vector<std::vector<int32_t>> top;         // the heaviest walkers (live or finished), n_ex of them
+    std::vector<double>               top_w;
 };
 
 struct server_explore_walker {
@@ -223,6 +228,7 @@ struct server_explore_walker {
     double               w    = 0.0;
     int                  bin  = -1;
     int                  done = 0; // 0 live at the end, 1 end of document, 2 loop, 3 incoherent
+    int                  node = -1; // with history: its last node
 };
 
 struct server_explore_params {
@@ -239,7 +245,9 @@ struct server_explore_params {
     // walkers: every step each walker's top `fc_top` next tokens (and its remaining tail) become candidates weighted
     // w p(x), the heavy ones are kept as they are and the rest are resampled by stratified sampling with weight c, where
     // sum min(1, q / c) = walkers (Fearnhead & Clifford 2003, optimal resampling for discrete states): no duplicates,
-    // the head is exact, unbiased; bins only label the walkers
+    // the head is exact, unbiased; bins only label the walkers. "beam": no sampling and no bins: every step keeps the
+    // `walkers` children with the highest joint probability; a walker's weight is its exact joint probability, so the
+    // weights sum to the probability mass the top walkers hold (finished ones keep theirs)
     std::string method = "we";
     int         fc_top = 64;
     bool        history = false; // keep every visited node (the population at every step) in the result

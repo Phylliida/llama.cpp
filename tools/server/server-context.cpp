@@ -5561,7 +5561,10 @@ void server_routes::init_routes() {
                     for (size_t i = 0; i < b.ex.size(); ++i) ex.push_back({{"text", tokens_to_str(vocab, llama_tokens(b.ex[i].begin(), b.ex[i].end()))}, {"w", b.ex_w[i]}});
                     bins.push_back({{"id", b.id}, {"mass", b.mass}, {"n", b.n_walk}, {"born", b.born}, {"ex", ex}});
                 }
-                return json{{"step", r.step}, {"live", r.n_live}, {"done", r.n_done}, {"new", r.n_new}, {"new_mass", r.new_mass}, {"bins", bins}};
+                json top = json::array();
+                for (size_t i = 0; i < r.top.size(); ++i) top.push_back({{"text", tokens_to_str(vocab, llama_tokens(r.top[i].begin(), r.top[i].end()))}, {"w", r.top_w[i]}});
+                return json{{"step", r.step}, {"live", r.n_live}, {"done", r.n_done}, {"new", r.n_new}, {"new_mass", r.new_mass}, {"bins", bins},
+                            {"mass", r.mass}, {"eff", r.eff}, {"n_par", r.n_par}, {"top", top}};
             };
             auto final_json = [vocab, round_json, pos, n_tok = (int) tokens.size()](const server_explore_result & r) {
                 json ws = json::array();
@@ -5569,7 +5572,7 @@ void server_routes::init_routes() {
                 for (const auto & w : r.walkers) {
                     tot += w.w;
                     ws.push_back({{"text", tokens_to_str(vocab, llama_tokens(w.toks.begin(), w.toks.end()))}, {"tokens", w.toks}, {"lp", w.lp},
-                                  {"w", w.w}, {"bin", w.bin}, {"done", w.done}});
+                                  {"w", w.w}, {"bin", w.bin}, {"done", w.done}, {"node", w.node}});
                 }
                 json o = round_json(r.last);
                 o["walkers"]    = ws;
@@ -5577,6 +5580,12 @@ void server_routes::init_routes() {
                     json nodes = json::array();
                     for (const auto & n : r.nodes) nodes.push_back(json::array({n.parent, n.tok, n.step, n.w, n.lp}));
                     o["nodes"] = nodes; // [parent, token, step, weight, log p]
+                    json pieces = json::object();
+                    for (const auto & n : r.nodes) {
+                        const std::string k = std::to_string(n.tok);
+                        if (!pieces.contains(k)) pieces[k] = common_token_to_piece(vocab, n.tok, true);
+                    }
+                    o["pieces"] = pieces;
                 }
                 o["mass_total"] = tot;
                 o["radius"]     = r.radius;

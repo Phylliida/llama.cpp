@@ -1080,8 +1080,9 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     if (p.max_bins < 1 || p.max_bins > 1024) { err = "explore: max_bins must be in [1, 1024]"; return false; }
     if (!(p.alpha >= 0.1f && p.alpha <= 2.0f)) { err = "explore: alpha must be in [0.1, 2]"; return false; }
     if (p.n_ex < 0 || p.n_ex > 8) { err = "explore: n_ex must be in [0, 8]"; return false; }
-    const bool fc = p.method == "fc", plain = p.method == "plain" || !p.resample;
-    if (!fc && p.method != "we" && p.method != "plain") { err = "explore: method must be we, fc or plain"; return false; }
+    const bool beam = p.method == "beam";
+    const bool fc = p.method == "fc" || beam, plain = p.method == "plain" || (!p.resample && !fc);
+    if (!fc && p.method != "we" && p.method != "plain") { err = "explore: method must be we, fc, beam or plain"; return false; }
     if (fc && (p.fc_top < 1 || p.fc_top > 1024)) { err = "explore: fc_top must be in [1, 1024]"; return false; }
     if (p.n_gen < 1 || s + 1 + (long long) W * p.n_gen > N_CTX) {
         err = "explore: need n_gen >= 1 and text + walkers x n_gen <= " + std::to_string(N_CTX) + " (the steering context)";
@@ -1189,8 +1190,23 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         for (int d = 0; d < n_embd; ++d) { const double x = (a[d] - b[d]) * inv_sd[d]; d2 += x * x; }
         return std::sqrt(d2 / n_embd);
     };
-    int n_rounds = 0;
+    int n_rounds = 0, last_npar = 0;
     auto do_round = [&](int step, bool resample_now, server_explore_round & rd) {
+        if (beam) {
+            rd = server_explore_round();
+            rd.step = step; rd.n_live = (int) live.size(); rd.n_done = (int) fin.size(); rd.n_par = last_npar;
+            double sw = 0.0, sw2 = 0.0;
+            std::vector<std::pair<double, const std::vector<int32_t> *>> m;
+            for (const auto & wk : live) { sw += wk.w; sw2 += wk.w * wk.w; m.push_back({wk.w, &wk.toks}); }
+            rd.eff = sw2 > 0.0 ? sw * sw / sw2 : 0.0;
+            rd.mass = sw;
+            for (const auto & f : fin) { rd.mass += f.w; m.push_back({f.w, &f.toks}); }
+            const int nt = std::min<int>(p.n_ex, (int) m.size());
+            std::partial_sort(m.begin(), m.begin() + nt, m.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+            for (int k = 0; k < nt; ++k) { rd.top.push_back(*m[k].second); rd.top_w.push_back(m[k].first); }
+            n_rounds++;
+            return;
+        }
         for (const auto & wk : live) {
             f_n++;
             for (int d = 0; d < n_embd; ++d) { const double x = wk.feat[d], dl = x - f_mean[d]; f_mean[d] += dl / f_n; f_m2[d] += dl * (x - f_mean[d]); }
@@ -1341,7 +1357,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
             const auto & lp = live[i].lp;
             std::vector<int32_t> ord(n_vocab);
             std::iota(ord.begin(), ord.end(), 0);
-            const int kk = std::min(p.fc_top, n_vocab);
+            const int kk = std::min(beam ? W : p.fc_top, n_vocab); // beam: the top W overall may all share a parent
             std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(), [&](int32_t a, int32_t b) { return lp[a] > lp[b]; });
             ord.resize(kk);
             double m = 0.0;
@@ -1356,7 +1372,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         for (auto & x : tu) x = ud(rng);
         parallel_for((int) live.size(), n_threads, [&](int i) {
             const double qt = live[i].w * tail[i];
-            if (!(qt > 0.0)) return;
+            if (beam || !(qt > 0.0)) return; // beam: only the top children compete
             const int np = std::max(1, (int) std::ceil(qt * W));
             std::vector<char> in_top(n_vocab, 0);
             for (int32_t x : tops[i]) in_top[x] = 1;
@@ -1389,8 +1405,9 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
             for (k = 0; k < N; ++k) { c = suf[k] / (N - k); if (cs[k].q < c) break; }
         }
         std::vector<std::pair<int, double>> pick; // candidate, new weight
+        if (beam) k = std::min(nc, N);
         for (int j = 0; j < k; ++j) pick.push_back({j, cs[j].q});
-        if (k < nc && k < N && c > 0.0) {
+        if (!beam && k < nc && k < N && c > 0.0) {
             double acc = 0.0, at = ud(rng) * c;
             for (int j = k; j < nc; ++j) {
                 acc += cs[j].q;
@@ -1403,6 +1420,8 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         // children are dropped
         std::vector<std::vector<int>> kids(live.size());
         for (size_t t = 0; t < pick.size(); ++t) kids[cs[pick[t].first].parent].push_back((int) t);
+        last_npar = 0;
+        for (const auto & kd : kids) last_npar += !kd.empty();
         for (int i = 0; i < (int) live.size(); ++i) if (kids[i].empty()) release(live[i].seq);
         std::vector<walker> next;
         for (int i = 0; i < (int) live.size(); ++i) {
@@ -1473,7 +1492,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
             wk.hot = ent[i] > INCOH_H ? wk.hot + 1 : 0;
             const int end = llama_vocab_is_eog(vocab, tok[i]) || llama_vocab_is_control(vocab, tok[i]) ? 1 : find_loop(wk.toks, LOOP_MAX_P, LOOP_MIN_SPAN) > 0 ? 2 : wk.hot >= INCOH_RUN ? 3 : 0;
             if (end) {
-                fin.push_back({wk.toks, wk.path, wk.w, -1, end});
+                fin.push_back({wk.toks, wk.path, wk.w, -1, end, wk.node});
                 fin_feat.push_back(wk.feat);
                 release(wk.seq);
             } else {
@@ -1488,7 +1507,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         }
     }
     do_round(steps, false, out.last);
-    for (const auto & wk : live) out.walkers.push_back({wk.toks, wk.path, wk.w, wk.bin, 0});
+    for (const auto & wk : live) out.walkers.push_back({wk.toks, wk.path, wk.w, wk.bin, 0, wk.node});
     for (const auto & f : fin) out.walkers.push_back(f);
     out.radius   = R;
     out.n_rounds = n_rounds;
