@@ -170,8 +170,8 @@ void flush_group() {
                  g.dirs.size(), names.empty() ? "several" : names.c_str(), g.mode == "maximize" ? "maximize" :
                  ("tilt p(x) exp(beta z), |beta| <= " + std::to_string(g.max_beta).substr(0, 5)).c_str());
     } else if (g.kind == "explore") {
-        snprintf(manip, sizeof(manip), "weighted-ensemble exploration, no push: ancestral sampling with unbiased split/merge of walkers between "
-                 "feature bins; %s", g.mode.c_str());
+        snprintf(manip, sizeof(manip), "exploration with weighted walkers, no push: ancestral sampling with unbiased resampling of the walkers; %s",
+                 g.mode.c_str());
     } else if (g.kind == "superpose") {
         snprintf(manip, sizeof(manip), "superposed input, no push: at every step the probability-weighted mean of the top candidates' input "
                  "embeddings is fed instead of a token (off the token manifold); %s", g.mode.c_str());
@@ -1511,7 +1511,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     } else {
         char row[2048];
         snprintf(row, sizeof(row), "%s,loom-explore,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g_steer.model_name).c_str(),
-                 csv_q(std::string("weighted-ensemble exploration, no push: ancestral sampling with unbiased split/merge of walkers; ") + mode).c_str(),
+                 csv_q(std::string("exploration with weighted walkers, no push: ancestral sampling with unbiased resampling of the walkers; ") + mode).c_str(),
                  0.0, n_tok, (int) out.walkers.size(), csv_q(ENDPOINT_DESC).c_str(), out.walkers.empty() ? 0.0 : (double) n_end / out.walkers.size(),
                  csv_q("llama-server /steer (explore)" + (p.note.empty() ? "" : "; " + p.note)).c_str());
         write_log_row(row);
