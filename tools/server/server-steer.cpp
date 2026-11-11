@@ -102,7 +102,8 @@ steer_state g_steer;
 constexpr int N_CTX     = 8192;
 constexpr int N_BATCH   = 512;
 constexpr int N_UBATCH  = 256; // l_out capture sees one ubatch per callback: captured decodes stay within it
-constexpr int N_SEQ_MAX = 64; // the last one holds the shared unsteered prefix
+constexpr int N_SEQ_MAX = 256; // LLAMA_MAX_SEQ; steering: the last one holds the shared unsteered prefix
+constexpr int SUP_K_MAX = 1024; // superpose: tokens in the input
 constexpr int N_FOLLOW  = 256;
 
 // humane endpoints, as homeo-ident
@@ -843,12 +844,13 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     if (!E || E->ne[0] != n_embd || E->ne[1] < n_vocab || !E->buffer) { err = "superpose: the model has no usable input embedding matrix"; return false; }
     const int s = (int) p.prefix.size() - 1;
     if (s < 0) { err = "superpose: empty prefix"; return false; }
-    if (p.k < 1 || p.k > N_SEQ_MAX - 2) { err = "superpose: k must be in [1, " + std::to_string(N_SEQ_MAX - 2) + "]"; return false; }
+    if (p.k < 1 || p.k > SUP_K_MAX) { err = "superpose: k must be in [1, " + std::to_string(SUP_K_MAX) + "]"; return false; }
     if (!(p.top_p > 0.0f && p.top_p <= 1.0f)) { err = "superpose: top_p must be in (0, 1]"; return false; }
     if (!(p.temp > 0.0f)) { err = "superpose: temperature must be > 0"; return false; }
     if (p.n_show < 1 || p.n_show > 64) { err = "superpose: n_show must be in [1, 64]"; return false; }
-    if (p.n_gen < 1 || s + 1 + p.n_gen + p.k > N_CTX) {
-        err = "superpose: need n_gen >= 1 and text + n_gen + k <= " + std::to_string(N_CTX) + " (the steering context)";
+    if (p.mix && (p.mix_k < 1 || p.mix_k > N_SEQ_MAX - 1)) { err = "superpose: mix_k must be in [1, " + std::to_string(N_SEQ_MAX - 1) + "]"; return false; }
+    if (p.n_gen < 1 || s + 1 + p.n_gen + p.mix_k > N_CTX) {
+        err = "superpose: need n_gen >= 1 and text + n_gen + mix_k <= " + std::to_string(N_CTX) + " (the steering context)";
         return false;
     }
 
@@ -880,7 +882,7 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     const int n_threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     const int n_chunk   = 64; // vocabulary chunks for the parallel sums
     std::vector<float> lT(n_vocab), cand_e((size_t) p.k * n_embd), in(n_embd);
-    std::vector<float> P((size_t) (p.k + 1) * n_vocab); // row 0: q, row 1 + j: p_x for candidate j (probabilities)
+    std::vector<float> P((size_t) (1 + (p.mix ? std::min(p.k, p.mix_k) : 0)) * n_vocab); // row 0: q, row 1 + j: p_x of candidate j
     std::vector<uint8_t> raw;
     std::vector<int32_t> order(n_vocab), cand, argmax_toks;
     std::vector<double> w;
@@ -925,22 +927,8 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
             for (auto & x : in) x *= sc;
         }
 
-        // one batch: the superposed input continues sequence 0; each candidate alone in its own sequence on the same past
-        const int n_rows = p.mix ? 1 + nc : 1;
-        for (int r = 0; r < n_rows; ++r) {
-            const float * src = r == 0 ? in.data() : cand_e.data() + (size_t) (r - 1) * n_embd;
-            std::memcpy(eb.embd + (size_t) r * n_embd, src, sizeof(float) * n_embd);
-            if (r > 0) {
-                llama_memory_seq_rm(mem, r, -1, -1);
-                llama_memory_seq_cp(mem, 0, r, -1, -1);
-            }
-            eb.pos[r] = pos; eb.n_seq_id[r] = 1; eb.seq_id[r][0] = r; eb.logits[r] = 1;
-        }
-        eb.n_tokens = n_rows;
-        const bool ok = llama_decode(ctx, eb) == 0;
-        for (int r = 1; r < n_rows; ++r) llama_memory_seq_rm(mem, r, -1, -1);
-        if (!ok) { err = "superpose: decode failed (step " + std::to_string(step) + ")"; return false; }
-
+        // one batch: the superposed input continues sequence 0; with mix, each of the top mix_k candidates is decoded
+        // alone in its own sequence on the same past
         server_superpose_step st;
         st.tok    = cand[0];
         st.ent    = (float) HT;
@@ -949,44 +937,60 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
         st.n_cand = nc;
         st.shrink = (float) shrink;
         for (int j = 0; j < std::min(nc, p.n_show); ++j) { st.top.push_back(cand[j]); st.top_w.push_back((float) w[j]); }
-
-        // interference: the next-token distributions (temperature 1) after the superposed input and after each candidate
-        parallel_for(n_rows, n_threads, [&](int r) {
-            const float * z = llama_get_logits_ith(ctx, r);
-            float * pr = P.data() + (size_t) r * n_vocab;
-            log_softmax(z, pr, n_vocab, 1.0f);
-            for (int v = 0; v < n_vocab; ++v) pr[v] = std::exp(pr[v]);
-        });
-        if (p.mix) {
+        const int M = p.mix ? std::min(nc, p.mix_k) : 0;
+        for (int r = 0; r <= M; ++r) {
+            std::memcpy(eb.embd + (size_t) r * n_embd, r == 0 ? in.data() : cand_e.data() + (size_t) (r - 1) * n_embd, sizeof(float) * n_embd);
+            if (r > 0) {
+                llama_memory_seq_rm(mem, r, -1, -1);
+                llama_memory_seq_cp(mem, 0, r, -1, -1);
+            }
+            eb.pos[r] = pos; eb.n_seq_id[r] = 1; eb.seq_id[r][0] = r; eb.logits[r] = 1;
+        }
+        eb.n_tokens = 1 + M;
+        const bool ok = llama_decode(ctx, eb) == 0;
+        for (int r = 1; r <= M; ++r) llama_memory_seq_rm(mem, r, -1, -1);
+        if (!ok) { err = "superpose: decode failed (step " + std::to_string(step) + ")"; return false; }
+        zcur.assign(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(ctx, 0) + n_vocab);
+        if (M > 0) {
+            // next-token distributions (temperature 1): q after the superposed input, p_x after each checked candidate;
+            // the mixture is renormalized over the checked candidates (mix_mass of the probability)
+            parallel_for(1 + M, n_threads, [&](int r) {
+                float * pr = P.data() + (size_t) r * n_vocab;
+                log_softmax(llama_get_logits_ith(ctx, r), pr, n_vocab, 1.0f);
+                for (int v = 0; v < n_vocab; ++v) pr[v] = std::exp(pr[v]);
+            });
             const float * q = P.data();
+            double wm = 0.0;
+            for (int j = 0; j < M; ++j) wm += w[j];
             std::vector<double> kl_c(n_chunk, 0.0), tv_c(n_chunk, 0.0);
             parallel_for(n_chunk, n_threads, [&](int c) {
-                const int a = (int) ((int64_t) n_vocab * c / n_chunk), b = (int) ((int64_t) n_vocab * (c + 1) / n_chunk);
+                const int v0 = (int) ((int64_t) n_vocab * c / n_chunk), v1 = (int) ((int64_t) n_vocab * (c + 1) / n_chunk);
                 double kl = 0.0, tv = 0.0;
-                for (int v = a; v < b; ++v) {
+                for (int v = v0; v < v1; ++v) {
                     double m = 0.0;
-                    for (int j = 0; j < nc; ++j) m += w[j] * P[(size_t) (1 + j) * n_vocab + v];
+                    for (int j = 0; j < M; ++j) m += w[j] * P[(size_t) (1 + j) * n_vocab + v];
+                    m /= wm;
                     if (m > 0.0) kl += m * (std::log(m) - std::log(std::max((double) q[v], 1e-30)));
                     tv += std::fabs(m - q[v]);
                 }
                 kl_c[c] = kl; tv_c[c] = tv;
             });
-            std::vector<double> tv_j(nc, 0.0);
-            parallel_for(nc, n_threads, [&](int j) {
+            std::vector<double> tv_j(M, 0.0);
+            parallel_for(M, n_threads, [&](int j) {
                 const float * pj = P.data() + (size_t) (1 + j) * n_vocab;
                 double tv = 0.0;
                 for (int v = 0; v < n_vocab; ++v) tv += std::fabs((double) pj[v] - q[v]);
                 tv_j[j] = 0.5 * tv;
             });
             const int near = (int) (std::min_element(tv_j.begin(), tv_j.end()) - tv_j.begin());
-            st.kl      = (float) std::max(0.0, std::accumulate(kl_c.begin(), kl_c.end(), 0.0));
-            st.tv      = (float) (0.5 * std::accumulate(tv_c.begin(), tv_c.end(), 0.0));
-            st.tv_top  = (float) tv_j[0];
-            st.near    = cand[near];
-            st.near_w  = (float) w[near];
-            st.tv_near = (float) tv_j[near];
+            st.kl       = (float) std::max(0.0, std::accumulate(kl_c.begin(), kl_c.end(), 0.0));
+            st.tv       = (float) (0.5 * std::accumulate(tv_c.begin(), tv_c.end(), 0.0));
+            st.tv_top   = (float) tv_j[0];
+            st.near     = cand[near];
+            st.near_w   = (float) w[near];
+            st.tv_near  = (float) tv_j[near];
+            st.mix_mass = (float) (wm * mass);
         }
-        zcur.assign(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(ctx, 0) + n_vocab);
 
         out.steps.push_back(st);
         argmax_toks.push_back(st.tok);
@@ -1001,7 +1005,7 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     // ---- exposure log ----
     char mode[160];
     snprintf(mode, sizeof(mode), "top_p %.2f, k <= %d, temp %.2f%s%s", p.top_p, p.k, p.temp, p.norm ? ", length-matched" : "",
-             p.mix ? ", each candidate also decoded alone" : "");
+             p.mix ? (", the top " + std::to_string(p.mix_k) + " also decoded alone").c_str() : "");
     if (!p.log_group.empty()) {
         steer_group & g = g_steer.grp;
         const auto now = std::chrono::steady_clock::now();

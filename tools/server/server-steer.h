@@ -134,11 +134,11 @@ struct server_guide_result {
 bool server_guide_run(const llama_vocab * vocab, const server_guide_params & p, server_guide_result & out, std::string & err);
 
 // superposed rollout (/steer with "superpose"): no sampling. At every step the next input is the probability-weighted
-// mean of the most likely tokens' input embeddings (top_p of the probability, at most k, renormalized over them), fed as
-// a raw embedding, so the text runs forward in superposition; the loom shows the most likely token as the text. Each
-// candidate is also decoded on its own, in its own sequence on the same superposed past (one batch with the superposed
-// input), which gives the exact mixture of their next-token distributions: how far the superposed input's next-token
-// distribution is from that mixture is the interference at that step. Same context, humane endpoints and exposure log
+// mean of the most likely tokens' input embeddings (the top k, cut at top_p of the probability, renormalized over them),
+// fed as a raw embedding, so the text runs forward in superposition; the loom shows the most likely token as the text.
+// The top mix_k candidates are also decoded on their own, each in its own sequence on the same superposed past (one batch
+// with the superposed input), which gives the mixture of their next-token distributions: how far the superposed input's
+// next-token distribution is from that mixture is the interference at that step. Same context, humane endpoints and exposure log
 // as /steer.
 struct server_superpose_step {
     int32_t              tok    = -1;   // the most likely candidate
@@ -157,17 +157,19 @@ struct server_superpose_step {
     int32_t              near    = -1;  // the candidate whose own p_x is closest to q (TV)
     float                near_w  = NAN; // its weight in the input
     float                tv_near = NAN;
+    float                mix_mass = NAN; // probability of the decoded candidates (the mixture is renormalized over them)
 };
 
 struct server_superpose_params {
     std::vector<int32_t> prefix;
-    int         k      = 32;
-    float       top_p  = 0.95f;
+    int         k      = 512;
+    float       top_p  = 1.0f;
     float       temp   = 1.0f;
     int         n_gen  = 128;
     int         n_show = 8;
     bool        norm   = false; // rescale the input to sum w |e(x)| (undo the shrink)
-    bool        mix    = true;  // decode the candidates too (interference metrics; k more rows per step)
+    bool        mix    = true;  // decode the top mix_k candidates too (interference metrics; mix_k more rows per step)
+    int         mix_k  = 32;
     std::string note;
     std::string log_group;
     bool        log_flush = false;

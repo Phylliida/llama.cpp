@@ -5536,8 +5536,9 @@ void server_routes::init_routes() {
             const json & g = body.at("superpose");
             server_superpose_params sp;
             sp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
-            sp.k         = json_value(g, "k", 32);
-            sp.top_p     = json_value(g, "top_p", 0.95f);
+            sp.k         = json_value(g, "k", 512);
+            sp.top_p     = json_value(g, "top_p", 1.0f);
+            sp.mix_k     = json_value(g, "mix_k", 32);
             sp.norm      = json_value(g, "norm", false);
             sp.mix       = json_value(g, "mix", true);
             sp.n_show    = json_value(g, "n_show", 8);
@@ -5553,6 +5554,7 @@ void server_routes::init_routes() {
                 if (std::isfinite(s.tv)) {
                     j["kl"] = s.kl; j["tv"] = s.tv; j["tv_top"] = s.tv_top; j["tv_near"] = s.tv_near; j["near_w"] = s.near_w;
                     j["near"] = json::array({s.near, common_token_to_piece(vocab, s.near, true)});
+                    j["mix_mass"] = s.mix_mass;
                 }
                 return j;
             };
