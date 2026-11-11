@@ -5443,7 +5443,8 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         const bool guided = body.count("guide") != 0;
         const bool superposed = body.count("superpose") != 0;
-        if (!guided && !superposed && !server_jlens_dirs_enabled()) {
+        const bool explored = body.count("explore") != 0;
+        if (!guided && !superposed && !explored && !server_jlens_dirs_enabled()) {
             { bad("/steer needs direction probes (start the server with --jlens PATH --probe-dirs PATH)", 404); return res; }
         }
         llama_tokens tokens;
@@ -5529,6 +5530,86 @@ void server_routes::init_routes() {
                 return true;
             });
         };
+
+        if (explored) {
+            // weighted-ensemble exploration (server_explore_run): walkers split and merged between feature bins; streamed
+            // rounds carry the bins (mass, walkers, examples), the final event also every walker's text and weight
+            const json & g = body.at("explore");
+            server_explore_params ep;
+            ep.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
+            ep.walkers   = json_value(g, "walkers", 64);
+            ep.tau       = json_value(g, "tau", 4);
+            ep.layer     = json_value(g, "layer", 40);
+            ep.ema       = json_value(g, "ema", 0.25f);
+            ep.radius    = json_value(g, "radius", 1.0f);
+            ep.max_bins  = json_value(g, "max_bins", 32);
+            ep.alpha     = json_value(g, "alpha", 1.0f);
+            ep.resample  = json_value(g, "resample", true);
+            ep.n_ex      = json_value(g, "n_ex", 2);
+            ep.method    = json_value(g, "method", std::string(ep.resample ? "we" : "plain"));
+            ep.fc_top    = json_value(g, "fc_top", 64);
+            ep.history   = json_value(g, "history", false);
+            ep.n_gen     = json_value(body, "n_gen", 48);
+            ep.seed      = json_value(body, "seed", 1);
+            ep.note      = json_value(body, "note", std::string());
+            ep.log_group = json_value(body, "log_group", std::string());
+            ep.log_flush = json_value(body, "log_flush", false);
+            auto round_json = [vocab](const server_explore_round & r) {
+                json bins = json::array();
+                for (const auto & b : r.bins) {
+                    json ex = json::array();
+                    for (size_t i = 0; i < b.ex.size(); ++i) ex.push_back({{"text", tokens_to_str(vocab, llama_tokens(b.ex[i].begin(), b.ex[i].end()))}, {"w", b.ex_w[i]}});
+                    bins.push_back({{"id", b.id}, {"mass", b.mass}, {"n", b.n_walk}, {"born", b.born}, {"ex", ex}});
+                }
+                return json{{"step", r.step}, {"live", r.n_live}, {"done", r.n_done}, {"new", r.n_new}, {"new_mass", r.new_mass}, {"bins", bins}};
+            };
+            auto final_json = [vocab, round_json, pos, n_tok = (int) tokens.size()](const server_explore_result & r) {
+                json ws = json::array();
+                double tot = 0.0;
+                for (const auto & w : r.walkers) {
+                    tot += w.w;
+                    ws.push_back({{"text", tokens_to_str(vocab, llama_tokens(w.toks.begin(), w.toks.end()))}, {"tokens", w.toks}, {"lp", w.lp},
+                                  {"w", w.w}, {"bin", w.bin}, {"done", w.done}});
+                }
+                json o = round_json(r.last);
+                o["walkers"]    = ws;
+                if (!r.nodes.empty()) {
+                    json nodes = json::array();
+                    for (const auto & n : r.nodes) nodes.push_back(json::array({n.parent, n.tok, n.step, n.w, n.lp}));
+                    o["nodes"] = nodes; // [parent, token, step, weight, log p]
+                }
+                o["mass_total"] = tot;
+                o["radius"]     = r.radius;
+                o["rounds"]     = r.n_rounds;
+                o["n_tok"]      = r.n_tok;
+                o["sec"]        = r.sec;
+                o["pos"]        = pos;
+                o["n_tokens"]   = n_tok;
+                return o;
+            };
+            if (json_value(body, "stream", false)) {
+                auto st = std::make_shared<steer_stream>();
+                ep.on_round = [st, sse, round_json](const server_explore_round & r) {
+                    std::lock_guard<std::mutex> lk(st->m);
+                    st->q.push_back(sse(json{{"explore", round_json(r)}}));
+                    st->cv.notify_all();
+                    return !st->cancel;
+                };
+                std::thread([st, ep, vocab, finish, final_json]() {
+                    server_explore_result r;
+                    std::string err;
+                    const bool ok = server_explore_run(vocab, ep, r, err);
+                    finish(*st, ok, err, ok ? final_json(r) : json());
+                }).detach();
+                serve(st);
+                return res;
+            }
+            server_explore_result r;
+            std::string err;
+            if (!server_explore_run(vocab, ep, r, err)) { bad(err); return res; }
+            res->ok(final_json(r));
+            return res;
+        }
 
         if (superposed) {
             // superposed rollout (server_superpose_run): the probability-weighted mean of the top candidates' input

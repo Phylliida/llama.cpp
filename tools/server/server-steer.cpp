@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -99,7 +100,7 @@ struct steer_state {
 
 steer_state g_steer;
 
-constexpr int N_CTX     = 8192;
+constexpr int N_CTX     = 16384; // explore: walkers x tokens
 constexpr int N_BATCH   = 512;
 constexpr int N_UBATCH  = 256; // l_out capture sees one ubatch per callback: captured decodes stay within it
 constexpr int N_SEQ_MAX = 256; // LLAMA_MAX_SEQ; steering: the last one holds the shared unsteered prefix
@@ -168,6 +169,9 @@ void flush_group() {
         snprintf(manip, sizeof(manip), "probe-guided sampling, no push: each token chosen among the top candidates by %zu metric(s) (%s); %s",
                  g.dirs.size(), names.empty() ? "several" : names.c_str(), g.mode == "maximize" ? "maximize" :
                  ("tilt p(x) exp(beta z), |beta| <= " + std::to_string(g.max_beta).substr(0, 5)).c_str());
+    } else if (g.kind == "explore") {
+        snprintf(manip, sizeof(manip), "weighted-ensemble exploration, no push: ancestral sampling with unbiased split/merge of walkers between "
+                 "feature bins; %s", g.mode.c_str());
     } else if (g.kind == "superpose") {
         snprintf(manip, sizeof(manip), "superposed input, no push: at every step the probability-weighted mean of the top candidates' input "
                  "embeddings is fed instead of a token (off the token manifold); %s", g.mode.c_str());
@@ -1053,6 +1057,463 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
                                    "instead of a token at every step (off the token manifold); ") + mode).c_str(),
                  0.0, (long long) out.steps.size(), 1, csv_q(ENDPOINT_DESC).c_str(), out.endpoint != 0 ? 1.0 : 0.0,
                  csv_q("llama-server /steer (superpose)" + (p.note.empty() ? "" : "; " + p.note)).c_str());
+        write_log_row(row);
+    }
+    return true;
+}
+
+bool server_explore_run(const llama_vocab * vocab, const server_explore_params & p, server_explore_result & out, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_steer.mutex);
+    const auto t_start = std::chrono::steady_clock::now();
+    if (!g_steer.model) { err = "explore: not initialized (model reloading?)"; return false; }
+    const int n_embd  = llama_model_n_embd(g_steer.model);
+    const int n_layer = llama_model_n_layer(g_steer.model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int s = (int) p.prefix.size() - 1;
+    const int W = p.walkers;
+    if (s < 0) { err = "explore: empty prefix"; return false; }
+    if (W < 1 || W > N_SEQ_MAX - 1) { err = "explore: walkers must be in [1, " + std::to_string(N_SEQ_MAX - 1) + "]"; return false; }
+    if (p.tau < 1) { err = "explore: tau must be >= 1"; return false; }
+    if (p.layer < 0 || p.layer >= n_layer) { err = "explore: layer out of range"; return false; }
+    if (!(p.ema > 0.0f && p.ema <= 1.0f)) { err = "explore: ema must be in (0, 1]"; return false; }
+    if (!(p.radius > 0.0f)) { err = "explore: radius must be > 0"; return false; }
+    if (p.max_bins < 1 || p.max_bins > 1024) { err = "explore: max_bins must be in [1, 1024]"; return false; }
+    if (!(p.alpha >= 0.1f && p.alpha <= 2.0f)) { err = "explore: alpha must be in [0.1, 2]"; return false; }
+    if (p.n_ex < 0 || p.n_ex > 8) { err = "explore: n_ex must be in [0, 8]"; return false; }
+    const bool fc = p.method == "fc", plain = p.method == "plain" || !p.resample;
+    if (!fc && p.method != "we" && p.method != "plain") { err = "explore: method must be we, fc or plain"; return false; }
+    if (fc && (p.fc_top < 1 || p.fc_top > 1024)) { err = "explore: fc_top must be in [1, 1024]"; return false; }
+    if (p.n_gen < 1 || s + 1 + (long long) W * p.n_gen > N_CTX) {
+        err = "explore: need n_gen >= 1 and text + walkers x n_gen <= " + std::to_string(N_CTX) + " (the steering context)";
+        return false;
+    }
+
+    if (!ensure_ctx(err)) return false;
+    llama_context * ctx = g_steer.ctx;
+    llama_memory_t  mem = llama_get_memory(ctx);
+    steer_capture & cap = g_steer.cap;
+    cap.enabled = false;
+    cap.lin_on.clear();
+    cap.n_embd  = n_embd;
+    cap.name    = "l_out-" + std::to_string(p.layer);
+    llama_memory_clear(mem, true);
+    if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { err = "explore: cvec clear failed"; return false; }
+    llama_batch batch = llama_batch_init(std::max(N_BATCH, N_SEQ_MAX), 0, 1);
+    struct run_guard {
+        llama_batch & b; llama_memory_t m; steer_capture & c;
+        ~run_guard() { llama_batch_free(b); llama_memory_clear(m, true); c.enabled = false; }
+    } rg{batch, mem, cap};
+    auto decode_cap = [&](int n_rows, const char * what) {
+        cap.rows = 0;
+        cap.enabled = true;
+        const bool ok = llama_decode(ctx, batch) == 0;
+        cap.enabled = false;
+        if (!ok) { err = std::string("explore: decode failed (") + what + ")"; return false; }
+        if (cap.rows != n_rows) { err = std::string("explore: l_out capture failed (") + what + ")"; return false; }
+        return true;
+    };
+
+    // the text up to the last token, then the last token alone: its next-token distribution and features
+    for (int cur = 0; cur < s; cur += N_UBATCH) {
+        const int n = std::min(N_UBATCH, s - cur);
+        batch.n_tokens = n;
+        for (int j = 0; j < n; ++j) {
+            batch.token[j] = p.prefix[cur + j]; batch.pos[j] = cur + j; batch.n_seq_id[j] = 1; batch.seq_id[j][0] = 0; batch.logits[j] = 0;
+        }
+        if (llama_decode(ctx, batch) != 0) { err = "explore: decode failed (prefix)"; return false; }
+    }
+    batch.n_tokens = 1;
+    batch.token[0] = p.prefix[s]; batch.pos[0] = s; batch.n_seq_id[0] = 1; batch.seq_id[0][0] = 0; batch.logits[0] = 1;
+    if (!decode_cap(1, "last token")) return false;
+    const std::vector<float> h0(cap.buf.begin(), cap.buf.begin() + n_embd);
+    std::vector<float> lp0(n_vocab);
+    log_softmax(llama_get_logits_ith(ctx, 0), lp0.data(), n_vocab, 1.0f);
+
+    const int n_threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+    std::mt19937_64 rng(p.seed);
+    std::uniform_real_distribution<double> ud(0.0, 1.0);
+    struct walker {
+        int                  seq = -1;
+        std::vector<int32_t> toks;
+        std::vector<float>   path;     // exact log p of each token
+        double               w = 0.0;
+        std::vector<float>   lp, feat; // next-token log probabilities; feature moving average
+        int                  bin = -1, forced = -1, hot = 0, fam = -1, node = -1;
+    };
+    std::vector<walker> live;
+    std::vector<server_explore_walker> fin;
+    std::vector<std::vector<float>>    fin_feat;
+    std::vector<int> free_ids;
+    for (int i = N_SEQ_MAX - 1; i >= 1; --i) free_ids.push_back(i);
+    auto alloc   = [&]() { const int id = free_ids.back(); free_ids.pop_back(); return id; };
+    auto release = [&](int id) { llama_memory_seq_rm(mem, id, -1, -1); free_ids.push_back(id); };
+
+    // c tokens by systematic sampling from exp(lp), in random order: each one is marginally ~ p, together they are spread
+    auto systematic = [&](const std::vector<float> & lp, int c) {
+        std::vector<int32_t> r;
+        const double u = ud(rng);
+        double cum = 0.0;
+        int k = 0, best = 0;
+        for (int v = 0; v < n_vocab && k < c; ++v) {
+            if (lp[v] > lp[best]) best = v;
+            cum += std::exp((double) lp[v]);
+            while (k < c && (k + u) / c < cum) { r.push_back(v); k++; }
+        }
+        while (k++ < c) r.push_back(best); // rounding: the sum fell short of 1
+        std::shuffle(r.begin(), r.end(), rng);
+        return r;
+    };
+
+    for (int i = 0; i < (fc ? 1 : W); ++i) { // fc: one walker with all the weight; the first selection fans it out
+        walker wk;
+        wk.seq = alloc();
+        llama_memory_seq_cp(mem, 0, wk.seq, -1, -1);
+        wk.w = fc ? 1.0 : 1.0 / W; wk.lp = lp0; wk.feat = h0;
+        live.push_back(std::move(wk));
+    }
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    if (!fc && !plain) {
+        const auto t0 = systematic(lp0, W);
+        for (int i = 0; i < W; ++i) live[i].forced = t0[i];
+    }
+
+    // ---- bins: Voronoi cells around centers made on the fly, in features standardized by running statistics ----
+    std::vector<double> f_mean(n_embd, 0.0), f_m2(n_embd, 0.0);
+    long long f_n = 0;
+    std::vector<float> inv_sd(n_embd, 1.0f);
+    std::vector<std::vector<float>> centers;
+    std::vector<int> born;
+    double R = -1.0;
+    auto dist = [&](const std::vector<float> & a, const std::vector<float> & b) {
+        double d2 = 0.0;
+        for (int d = 0; d < n_embd; ++d) { const double x = (a[d] - b[d]) * inv_sd[d]; d2 += x * x; }
+        return std::sqrt(d2 / n_embd);
+    };
+    int n_rounds = 0;
+    auto do_round = [&](int step, bool resample_now, server_explore_round & rd) {
+        for (const auto & wk : live) {
+            f_n++;
+            for (int d = 0; d < n_embd; ++d) { const double x = wk.feat[d], dl = x - f_mean[d]; f_mean[d] += dl / f_n; f_m2[d] += dl * (x - f_mean[d]); }
+        }
+        if (f_n > 1) {
+            double vbar = 0.0;
+            for (int d = 0; d < n_embd; ++d) vbar += f_m2[d] / (f_n - 1);
+            vbar /= n_embd;
+            for (int d = 0; d < n_embd; ++d) inv_sd[d] = (float) (1.0 / std::sqrt(f_m2[d] / (f_n - 1) + 1e-3 * vbar + 1e-12));
+        }
+        // items: the live walkers, then finished walkers without a bin yet
+        std::vector<const std::vector<float> *> items;
+        std::vector<int> item_of; // >= 0: live index; < 0: -1 - finished index
+        for (size_t i = 0; i < live.size(); ++i) { items.push_back(&live[i].feat); item_of.push_back((int) i); }
+        for (size_t i = 0; i < fin.size(); ++i) if (fin[i].bin < 0) { items.push_back(&fin_feat[i]); item_of.push_back(-1 - (int) i); }
+        const int NI = (int) items.size();
+        if (R < 0.0 && live.size() >= 2) {
+            // the novelty radius, once: radius x the median distance between the walkers at the first round
+            const int nl = (int) std::min<size_t>(live.size(), 128);
+            std::vector<std::pair<int, int>> pairs;
+            for (int i = 0; i < nl; ++i) for (int j = i + 1; j < nl; ++j) pairs.push_back({i, j});
+            std::vector<double> dd(pairs.size());
+            parallel_for((int) pairs.size(), n_threads, [&](int k) { dd[k] = dist(live[pairs[k].first].feat, live[pairs[k].second].feat); });
+            std::nth_element(dd.begin(), dd.begin() + dd.size() / 2, dd.end());
+            R = p.radius * dd[dd.size() / 2];
+            if (!(R > 0.0)) R = -1.0; // all identical so far: try again next round
+        }
+        std::vector<double> nd(NI, INFINITY);
+        std::vector<int> nb(NI, -1);
+        auto add_center_dists = [&](int c) {
+            parallel_for(NI, n_threads, [&](int i) { const double d = dist(*items[i], centers[c]); if (d < nd[i]) { nd[i] = d; nb[i] = c; } });
+        };
+        for (int c = 0; c < (int) centers.size(); ++c) add_center_dists(c);
+        if ((int) centers.size() >= p.max_bins) {
+            // at the cap: retire centers no walker (live or finished) is nearest to, so new regions can still get bins
+            std::vector<int> cnt(centers.size(), 0);
+            for (int i = 0; i < NI; ++i) if (nb[i] >= 0) cnt[nb[i]]++;
+            for (const auto & f : fin) if (f.bin >= 0) cnt[f.bin]++;
+            std::vector<int> remap(centers.size(), -1);
+            std::vector<std::vector<float>> c2;
+            std::vector<int> b2;
+            for (size_t c = 0; c < centers.size(); ++c) if (cnt[c] > 0) { remap[c] = (int) c2.size(); c2.push_back(std::move(centers[c])); b2.push_back(born[c]); }
+            centers = std::move(c2);
+            born = std::move(b2);
+            for (auto & f : fin) if (f.bin >= 0) f.bin = remap[f.bin];
+            for (auto & x : nb) if (x >= 0) x = remap[x];
+        }
+        int n_new = 0;
+        while (NI > 0 && (int) centers.size() < p.max_bins) {
+            const int imax = (int) (std::max_element(nd.begin(), nd.end()) - nd.begin());
+            if (!centers.empty() && !(R > 0.0 && nd[imax] > R)) break;
+            centers.push_back(*items[imax]);
+            born.push_back(step);
+            n_new++;
+            add_center_dists((int) centers.size() - 1);
+        }
+        for (int i = 0; i < NI; ++i) {
+            if (item_of[i] >= 0) live[item_of[i]].bin = nb[i]; else fin[-1 - item_of[i]].bin = nb[i];
+        }
+        double new_mass = 0.0;
+        for (const auto & wk : live) if (n_new > 0 && wk.bin >= 0 && born[wk.bin] == step) new_mass += wk.w;
+
+        if (resample_now && !live.empty()) {
+            // an equal share of the population per occupied bin (the remainder to the heaviest bins)
+            std::map<int, double> bmass;
+            for (const auto & wk : live) bmass[wk.bin] += wk.w;
+            std::vector<std::pair<double, int>> occ;
+            for (const auto & kv : bmass) occ.push_back({kv.second, kv.first});
+            std::sort(occ.begin(), occ.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+            const int n_occ = (int) occ.size(), base = W / n_occ, rem = W % n_occ;
+            std::map<int, int> target;
+            for (int r = 0; r < n_occ; ++r) target[occ[r].second] = std::max(1, base + (r < rem ? 1 : 0));
+            // merge: the two lightest walkers of a crowded bin become one, kept at random in proportion to the weights
+            std::vector<char> dead(live.size(), 0);
+            for (const auto & kv : target) {
+                std::vector<int> mem_b;
+                for (int i = 0; i < (int) live.size(); ++i) if (live[i].bin == kv.first) mem_b.push_back(i);
+                while ((int) mem_b.size() > kv.second) {
+                    std::sort(mem_b.begin(), mem_b.end(), [&](int a, int b) { return live[a].w < live[b].w; });
+                    const int a = mem_b[0], b = mem_b[1];
+                    const double wa = live[a].w, wb = live[b].w;
+                    const bool keep_a = ud(rng) * (wa + wb) < wa;
+                    const int k = keep_a ? a : b, g = keep_a ? b : a;
+                    live[k].w = wa + wb;
+                    dead[g] = 1;
+                    release(live[g].seq);
+                    mem_b.erase(std::find(mem_b.begin(), mem_b.end(), g));
+                }
+            }
+            std::vector<walker> kept;
+            for (size_t i = 0; i < live.size(); ++i) if (!dead[i]) kept.push_back(std::move(live[i]));
+            live = std::move(kept);
+            // split: the heaviest walker of a sparse bin becomes two with half the weight each
+            for (int i = 0; i < (int) live.size(); ++i) live[i].fam = i;
+            for (const auto & kv : target) {
+                std::vector<int> mem_b;
+                for (int i = 0; i < (int) live.size(); ++i) if (live[i].bin == kv.first) mem_b.push_back(i);
+                while ((int) mem_b.size() < kv.second && !free_ids.empty()) {
+                    const int a = *std::max_element(mem_b.begin(), mem_b.end(), [&](int x, int y) { return live[x].w < live[y].w; });
+                    walker c = live[a];
+                    c.seq = alloc();
+                    llama_memory_seq_cp(mem, live[a].seq, c.seq, -1, -1);
+                    live[a].w *= 0.5;
+                    c.w = live[a].w;
+                    live.push_back(std::move(c));
+                    mem_b.push_back((int) live.size() - 1);
+                }
+            }
+            // copies of one walker take stratified next tokens from its exact distribution
+            std::map<int, std::vector<int>> fams;
+            for (int i = 0; i < (int) live.size(); ++i) fams[live[i].fam].push_back(i);
+            for (const auto & kv : fams) {
+                if (kv.second.size() < 2) continue;
+                const auto t = systematic(live[kv.second[0]].lp, (int) kv.second.size());
+                for (size_t j = 0; j < kv.second.size(); ++j) live[kv.second[j]].forced = t[j];
+            }
+        }
+
+        rd = server_explore_round();
+        rd.step = step; rd.n_live = (int) live.size(); rd.n_done = (int) fin.size(); rd.n_new = n_new; rd.new_mass = new_mass;
+        for (int c = 0; c < (int) centers.size(); ++c) {
+            server_explore_bin b;
+            b.id = c; b.born = born[c];
+            std::vector<std::pair<double, const std::vector<int32_t> *>> m;
+            for (const auto & wk : live) if (wk.bin == c) { b.mass += wk.w; b.n_walk++; m.push_back({wk.w, &wk.toks}); }
+            for (const auto & f : fin) if (f.bin == c) { b.mass += f.w; m.push_back({f.w, &f.toks}); }
+            if (m.empty()) continue;
+            std::sort(m.begin(), m.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+            for (int k = 0; k < std::min<int>(p.n_ex, (int) m.size()); ++k) { b.ex.push_back(*m[k].second); b.ex_w.push_back(m[k].first); }
+            rd.bins.push_back(std::move(b));
+        }
+        std::sort(rd.bins.begin(), rd.bins.end(), [](const auto & x, const auto & y) { return x.mass > y.mass; });
+        n_rounds++;
+    };
+
+    // ---- generation: one token per live walker per step, all in one batch ----
+    long long n_tok = 0;
+    int steps = 0;
+    std::vector<int32_t> tok;
+    std::vector<double> u;
+    std::vector<float> ent;
+    // fc: the next population from the children of the current one (sets each new walker's next token as forced)
+    auto fc_select = [&]() {
+        struct cand { int parent; int32_t tok; double q; };
+        std::vector<std::vector<int32_t>> tops(live.size());
+        std::vector<double> tail(live.size(), 0.0);
+        parallel_for((int) live.size(), n_threads, [&](int i) {
+            const auto & lp = live[i].lp;
+            std::vector<int32_t> ord(n_vocab);
+            std::iota(ord.begin(), ord.end(), 0);
+            const int kk = std::min(p.fc_top, n_vocab);
+            std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(), [&](int32_t a, int32_t b) { return lp[a] > lp[b]; });
+            ord.resize(kk);
+            double m = 0.0;
+            for (int32_t x : ord) m += std::exp((double) lp[x]);
+            tops[i] = std::move(ord);
+            tail[i] = std::max(0.0, 1.0 - m);
+        });
+        // a walker's tail (the tokens outside its top) is split into pieces of about 1 / walkers of the weight, each with
+        // a token drawn from the tail by stratified sampling (one heavy tail walker would make the estimates noisy)
+        std::vector<std::vector<std::pair<int32_t, double>>> tailc(live.size());
+        std::vector<double> tu(live.size());
+        for (auto & x : tu) x = ud(rng);
+        parallel_for((int) live.size(), n_threads, [&](int i) {
+            const double qt = live[i].w * tail[i];
+            if (!(qt > 0.0)) return;
+            const int np = std::max(1, (int) std::ceil(qt * W));
+            std::vector<char> in_top(n_vocab, 0);
+            for (int32_t x : tops[i]) in_top[x] = 1;
+            std::map<int32_t, int> cnt;
+            double cum = 0.0;
+            int k = 0;
+            int32_t last = -1;
+            for (int v = 0; v < n_vocab && k < np; ++v) {
+                if (in_top[v]) continue;
+                cum += std::exp((double) live[i].lp[v]);
+                last = v;
+                while (k < np && (k + tu[i]) / np * tail[i] < cum) { cnt[v]++; k++; }
+            }
+            if (k < np && last >= 0) cnt[last] += np - k;
+            for (const auto & kv : cnt) tailc[i].push_back({kv.first, qt * kv.second / np});
+        });
+        std::vector<cand> cs;
+        for (int i = 0; i < (int) live.size(); ++i) {
+            for (int32_t x : tops[i]) cs.push_back({i, x, live[i].w * std::exp((double) live[i].lp[x])});
+            for (const auto & tc : tailc[i]) cs.push_back({i, tc.first, tc.second});
+        }
+        std::sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.q > b.q; });
+        const int nc = (int) cs.size(), N = W;
+        std::vector<double> suf(nc + 1, 0.0);
+        for (int j = nc - 1; j >= 0; --j) suf[j] = suf[j + 1] + cs[j].q;
+        // threshold c: keep the k heaviest, sum over the rest of q / c = N - k with every rest q < c
+        int k = 0;
+        double c = 0.0;
+        if (nc <= N) { k = nc; } else {
+            for (k = 0; k < N; ++k) { c = suf[k] / (N - k); if (cs[k].q < c) break; }
+        }
+        std::vector<std::pair<int, double>> pick; // candidate, new weight
+        for (int j = 0; j < k; ++j) pick.push_back({j, cs[j].q});
+        if (k < nc && k < N && c > 0.0) {
+            double acc = 0.0, at = ud(rng) * c;
+            for (int j = k; j < nc; ++j) {
+                acc += cs[j].q;
+                while (acc > at && (int) pick.size() < N) { pick.push_back({j, c}); at += c; } // rounding never adds one
+            }
+        }
+        std::vector<int32_t> ptok(pick.size());
+        for (size_t t = 0; t < pick.size(); ++t) ptok[t] = cs[pick[t].first].tok;
+        // the new population: a parent's first child keeps its sequence, further children copy it, parents without
+        // children are dropped
+        std::vector<std::vector<int>> kids(live.size());
+        for (size_t t = 0; t < pick.size(); ++t) kids[cs[pick[t].first].parent].push_back((int) t);
+        for (int i = 0; i < (int) live.size(); ++i) if (kids[i].empty()) release(live[i].seq);
+        std::vector<walker> next;
+        for (int i = 0; i < (int) live.size(); ++i) {
+            for (size_t j = 0; j < kids[i].size(); ++j) {
+                const int t = kids[i][j];
+                walker c2 = j + 1 < kids[i].size() ? live[i] : std::move(live[i]);
+                if (j + 1 < kids[i].size()) {
+                    c2.seq = alloc();
+                    llama_memory_seq_cp(mem, live[i].seq, c2.seq, -1, -1);
+                }
+                c2.w = pick[t].second;
+                c2.forced = ptok[t];
+                next.push_back(std::move(c2));
+            }
+        }
+        live = std::move(next);
+    };
+
+    for (int step = 0; step < p.n_gen && !live.empty(); ++step) {
+        if (fc) fc_select();
+        const int nl = (int) live.size();
+        tok.assign(nl, 0); u.assign(nl, 0.0); ent.assign(nl, 0.0f);
+        for (int i = 0; i < nl; ++i) u[i] = ud(rng);
+        parallel_for(nl, n_threads, [&](int i) {
+            walker & wk = live[i];
+            if (wk.forced >= 0) { tok[i] = wk.forced; wk.forced = -1; wk.path.push_back(wk.lp[tok[i]]); return; }
+            // proposal q = p^alpha / Z (alpha = 1: p itself); the weight carries p / q
+            double lz = 0.0;
+            if (p.alpha != 1.0f) {
+                double m = -INFINITY;
+                for (int v = 0; v < n_vocab; ++v) m = std::max(m, (double) p.alpha * wk.lp[v]);
+                double z = 0.0;
+                for (int v = 0; v < n_vocab; ++v) z += std::exp(p.alpha * wk.lp[v] - m);
+                lz = m + std::log(z);
+            }
+            double cum = 0.0;
+            int x = n_vocab - 1;
+            for (int v = 0; v < n_vocab; ++v) {
+                cum += std::exp(p.alpha == 1.0f ? (double) wk.lp[v] : p.alpha * wk.lp[v] - lz);
+                if (cum >= u[i]) { x = v; break; }
+            }
+            if (p.alpha != 1.0f) wk.w *= std::exp((double) wk.lp[x] - (p.alpha * wk.lp[x] - lz));
+            tok[i] = x;
+            wk.path.push_back(wk.lp[x]);
+        });
+        for (int i = 0; i < nl; ++i) {
+            batch.token[i] = tok[i]; batch.pos[i] = s + 1 + step; batch.n_seq_id[i] = 1; batch.seq_id[i][0] = live[i].seq; batch.logits[i] = 1;
+        }
+        batch.n_tokens = nl;
+        if (!decode_cap(nl, "step")) return false;
+        n_tok += nl;
+        steps = step + 1;
+        parallel_for(nl, n_threads, [&](int i) {
+            walker & wk = live[i];
+            log_softmax(llama_get_logits_ith(ctx, i), wk.lp.data(), n_vocab, 1.0f);
+            double H = 0.0;
+            for (int v = 0; v < n_vocab; ++v) H -= std::exp((double) wk.lp[v]) * wk.lp[v];
+            ent[i] = (float) H;
+            const float * h = cap.buf.data() + (size_t) i * n_embd;
+            for (int d = 0; d < n_embd; ++d) wk.feat[d] = (1.0f - p.ema) * wk.feat[d] + p.ema * h[d];
+            wk.toks.push_back(tok[i]);
+        });
+        // finished walkers leave the population: end of document, or a humane endpoint (loop, incoherence)
+        std::vector<walker> kept;
+        for (int i = 0; i < nl; ++i) {
+            walker & wk = live[i];
+            if (p.history) { out.nodes.push_back({wk.node, tok[i], step, wk.w, wk.path.back()}); wk.node = (int) out.nodes.size() - 1; }
+            wk.hot = ent[i] > INCOH_H ? wk.hot + 1 : 0;
+            const int end = llama_vocab_is_eog(vocab, tok[i]) || llama_vocab_is_control(vocab, tok[i]) ? 1 : find_loop(wk.toks, LOOP_MAX_P, LOOP_MIN_SPAN) > 0 ? 2 : wk.hot >= INCOH_RUN ? 3 : 0;
+            if (end) {
+                fin.push_back({wk.toks, wk.path, wk.w, -1, end});
+                fin_feat.push_back(wk.feat);
+                release(wk.seq);
+            } else {
+                kept.push_back(std::move(wk));
+            }
+        }
+        live = std::move(kept);
+        if (!live.empty() && (step + 1) % p.tau == 0 && step + 1 < p.n_gen) {
+            server_explore_round rd;
+            do_round(step + 1, !fc && !plain, rd);
+            if (p.on_round && !p.on_round(rd)) break;
+        }
+    }
+    do_round(steps, false, out.last);
+    for (const auto & wk : live) out.walkers.push_back({wk.toks, wk.path, wk.w, wk.bin, 0});
+    for (const auto & f : fin) out.walkers.push_back(f);
+    out.radius   = R;
+    out.n_rounds = n_rounds;
+    out.n_tok    = n_tok;
+    out.sec      = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+
+    // ---- exposure log: plain sampling (proposal p^alpha), no push; counted like rollouts ----
+    int n_end = 0;
+    for (const auto & f : fin) n_end += f.done >= 2;
+    char mode[256];
+    snprintf(mode, sizeof(mode), "%d walkers, %s, features L%d, proposal p^%.2f", W, fc ? "optimal resampling of the top children every token" :
+             plain ? "no resampling (plain rollouts)" : ("split/merge between bins every " + std::to_string(p.tau) + " tokens").c_str(), p.layer, p.alpha);
+    if (!p.log_group.empty()) {
+        steer_group & g = g_steer.grp;
+        const auto now = std::chrono::steady_clock::now();
+        if (g.n_req > 0 && (g.kind != "explore" || g.name != p.log_group || g.mode != mode)) flush_group();
+        if (g.n_req == 0) { g.kind = "explore"; g.name = p.log_group; g.mode = mode; g.model = g_steer.model_name; g.note = p.note; g.t0 = now; }
+        g.tok += n_tok; g.n_ctx += (int) out.walkers.size(); g.n_end += n_end; g.n_req++;
+        if (p.log_flush || g.n_req >= 100 || now - g.t0 > std::chrono::minutes(10)) flush_group();
+    } else {
+        char row[2048];
+        snprintf(row, sizeof(row), "%s,loom-explore,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g_steer.model_name).c_str(),
+                 csv_q(std::string("weighted-ensemble exploration, no push: ancestral sampling with unbiased split/merge of walkers; ") + mode).c_str(),
+                 0.0, n_tok, (int) out.walkers.size(), csv_q(ENDPOINT_DESC).c_str(), out.walkers.empty() ? 0.0 : (double) n_end / out.walkers.size(),
+                 csv_q("llama-server /steer (explore)" + (p.note.empty() ? "" : "; " + p.note)).c_str());
         write_log_row(row);
     }
     return true;
