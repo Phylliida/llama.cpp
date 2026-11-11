@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "log.h"
+#include "src/llama-model.h"
 
 #include <algorithm>
 #include <chrono>
@@ -166,15 +167,18 @@ void flush_group() {
         snprintf(manip, sizeof(manip), "probe-guided sampling, no push: each token chosen among the top candidates by %zu metric(s) (%s); %s",
                  g.dirs.size(), names.empty() ? "several" : names.c_str(), g.mode == "maximize" ? "maximize" :
                  ("tilt p(x) exp(beta z), |beta| <= " + std::to_string(g.max_beta).substr(0, 5)).c_str());
+    } else if (g.kind == "superpose") {
+        snprintf(manip, sizeof(manip), "superposed input, no push: at every step the probability-weighted mean of the top candidates' input "
+                 "embeddings is fed instead of a token (off the token manifold); %s", g.mode.c_str());
     } else {
         snprintf(manip, sizeof(manip), "steer along %zu layer-sweep probe directions (%s) x dose x mean|h| (%.1f-%.1f); %s", g.dirs.size(),
                  names.empty() ? "blocks of each" : names.c_str(), g.h_lo, g.h_hi, g.mode.c_str());
     }
     char row[2048];
-    snprintf(row, sizeof(row), "%s,%s,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), g.kind == "guide" ? "loom-guide" : "loom-steer",
+    snprintf(row, sizeof(row), "%s,%s,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), ("loom-" + g.kind).c_str(),
              csv_q(g.model).c_str(), csv_q(manip).c_str(),
              g.max_dose, g.tok, g.n_ctx, csv_q(ENDPOINT_DESC).c_str(), g.n_ctx ? (double) g.n_end / g.n_ctx : 0.0,
-             csv_q("llama-server /steer" + std::string(g.kind == "guide" ? " (guide)" : "") + ", log group '" + g.name + "': " + std::to_string(g.n_req) + " requests" + (g.note.empty() ? "" : "; " + g.note)).c_str());
+             csv_q("llama-server /steer" + std::string(g.kind == "steer" ? "" : " (" + g.kind + ")") + ", log group '" + g.name + "': " + std::to_string(g.n_req) + " requests" + (g.note.empty() ? "" : "; " + g.note)).c_str());
     write_log_row(row);
     g = steer_group();
 }
@@ -811,6 +815,207 @@ bool server_guide_run(const llama_vocab * vocab, const server_guide_params & p, 
         snprintf(row, sizeof(row), "%s,loom-guide,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g_steer.model_name).c_str(), csv_q(manip).c_str(),
                  0.0, (long long) out.tok.size(), 1, csv_q(ENDPOINT_DESC).c_str(), out.endpoint != 0 ? 1.0 : 0.0,
                  csv_q("llama-server /steer (guide)" + (p.note.empty() ? "" : "; " + p.note)).c_str());
+        write_log_row(row);
+    }
+    return true;
+}
+
+// one row of the input embedding matrix, dequantized (the matrix may live on the GPU)
+static bool embd_row(const ggml_tensor * t, int32_t tok, float * out, std::vector<uint8_t> & raw) {
+    const int64_t n  = t->ne[0];
+    const size_t  rs = ggml_row_size(t->type, n);
+    raw.resize(rs);
+    ggml_backend_tensor_get(t, raw.data(), (size_t) tok * t->nb[1], rs);
+    if (t->type == GGML_TYPE_F32) { std::memcpy(out, raw.data(), (size_t) n * sizeof(float)); return true; }
+    const auto * tr = ggml_get_type_traits(t->type);
+    if (!tr->to_float) return false;
+    tr->to_float(raw.data(), out, n);
+    return true;
+}
+
+bool server_superpose_run(const llama_vocab * vocab, const server_superpose_params & p, server_superpose_result & out, std::string & err) {
+    std::lock_guard<std::mutex> lock(g_steer.mutex);
+    const auto t_start = std::chrono::steady_clock::now();
+    if (!g_steer.model) { err = "superpose: not initialized (model reloading?)"; return false; }
+    const int n_embd  = llama_model_n_embd(g_steer.model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const ggml_tensor * E = g_steer.model->tok_embd;
+    if (!E || E->ne[0] != n_embd || E->ne[1] < n_vocab || !E->buffer) { err = "superpose: the model has no usable input embedding matrix"; return false; }
+    const int s = (int) p.prefix.size() - 1;
+    if (s < 0) { err = "superpose: empty prefix"; return false; }
+    if (p.k < 1 || p.k > N_SEQ_MAX - 2) { err = "superpose: k must be in [1, " + std::to_string(N_SEQ_MAX - 2) + "]"; return false; }
+    if (!(p.top_p > 0.0f && p.top_p <= 1.0f)) { err = "superpose: top_p must be in (0, 1]"; return false; }
+    if (!(p.temp > 0.0f)) { err = "superpose: temperature must be > 0"; return false; }
+    if (p.n_show < 1 || p.n_show > 64) { err = "superpose: n_show must be in [1, 64]"; return false; }
+    if (p.n_gen < 1 || s + 1 + p.n_gen + p.k > N_CTX) {
+        err = "superpose: need n_gen >= 1 and text + n_gen + k <= " + std::to_string(N_CTX) + " (the steering context)";
+        return false;
+    }
+
+    if (!ensure_ctx(err)) return false;
+    llama_context * ctx = g_steer.ctx;
+    llama_memory_t  mem = llama_get_memory(ctx);
+    steer_capture & cap = g_steer.cap;
+    cap.enabled = false;
+    cap.lin_on.clear();
+    llama_memory_clear(mem, true);
+    if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { err = "superpose: cvec clear failed"; return false; }
+    llama_batch tb = llama_batch_init(N_BATCH, 0, 1);
+    llama_batch eb = llama_batch_init(N_SEQ_MAX, n_embd, 1); // raw embeddings: the superposed input + each candidate
+    struct run_guard {
+        llama_batch & t; llama_batch & e; llama_memory_t m;
+        ~run_guard() { llama_batch_free(t); llama_batch_free(e); llama_memory_clear(m, true); }
+    } rg{tb, eb, mem};
+
+    for (int cur = 0; cur <= s; cur += N_UBATCH) {
+        const int n = std::min(N_UBATCH, s + 1 - cur);
+        tb.n_tokens = n;
+        for (int j = 0; j < n; ++j) {
+            tb.token[j] = p.prefix[cur + j]; tb.pos[j] = cur + j; tb.n_seq_id[j] = 1; tb.seq_id[j][0] = 0; tb.logits[j] = cur + j == s;
+        }
+        if (llama_decode(ctx, tb) != 0) { err = "superpose: decode failed (prefix)"; return false; }
+    }
+    std::vector<float> zcur(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
+
+    const int n_threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+    const int n_chunk   = 64; // vocabulary chunks for the parallel sums
+    std::vector<float> lT(n_vocab), cand_e((size_t) p.k * n_embd), in(n_embd);
+    std::vector<float> P((size_t) (p.k + 1) * n_vocab); // row 0: q, row 1 + j: p_x for candidate j (probabilities)
+    std::vector<uint8_t> raw;
+    std::vector<int32_t> order(n_vocab), cand, argmax_toks;
+    std::vector<double> w;
+    int hot = 0;
+    for (int step = 0; step < p.n_gen; ++step) {
+        const int pos = s + 1 + step;
+        log_softmax(zcur.data(), lT.data(), n_vocab, p.temp);
+        double HT = 0.0;
+        for (int v = 0; v < n_vocab; ++v) HT -= std::exp((double) lT[v]) * lT[v];
+
+        // candidates: most likely first, until top_p of the probability or k of them; weights renormalized over them
+        std::iota(order.begin(), order.end(), 0);
+        const int kk = std::min(p.k, n_vocab);
+        std::partial_sort(order.begin(), order.begin() + kk, order.end(), [&](int32_t x, int32_t y) { return lT[x] > lT[y]; });
+        cand.clear();
+        double mass = 0.0;
+        for (int i = 0; i < kk; ++i) {
+            cand.push_back(order[i]);
+            mass += std::exp((double) lT[order[i]]);
+            if (mass >= p.top_p) break;
+        }
+        const int nc = (int) cand.size();
+        w.assign(nc, 0.0);
+        double sw2 = 0.0;
+        for (int j = 0; j < nc; ++j) { w[j] = std::exp((double) lT[cand[j]]) / mass; sw2 += w[j] * w[j]; }
+
+        // the superposed input: sum w e(x), optionally rescaled to the weighted mean length of the e(x)
+        std::fill(in.begin(), in.end(), 0.0f);
+        double len_w = 0.0;
+        for (int j = 0; j < nc; ++j) {
+            float * e = cand_e.data() + (size_t) j * n_embd;
+            if (!embd_row(E, cand[j], e, raw)) { err = "superpose: cannot dequantize the input embeddings"; return false; }
+            double e2 = 0.0;
+            for (int d = 0; d < n_embd; ++d) { in[d] += (float) w[j] * e[d]; e2 += (double) e[d] * e[d]; }
+            len_w += w[j] * std::sqrt(e2);
+        }
+        double in2 = 0.0;
+        for (int d = 0; d < n_embd; ++d) in2 += (double) in[d] * in[d];
+        const double shrink = len_w > 0.0 ? std::sqrt(in2) / len_w : 1.0;
+        if (p.norm && in2 > 0.0) {
+            const float sc = (float) (len_w / std::sqrt(in2));
+            for (auto & x : in) x *= sc;
+        }
+
+        // one batch: the superposed input continues sequence 0; each candidate alone in its own sequence on the same past
+        const int n_rows = p.mix ? 1 + nc : 1;
+        for (int r = 0; r < n_rows; ++r) {
+            const float * src = r == 0 ? in.data() : cand_e.data() + (size_t) (r - 1) * n_embd;
+            std::memcpy(eb.embd + (size_t) r * n_embd, src, sizeof(float) * n_embd);
+            if (r > 0) {
+                llama_memory_seq_rm(mem, r, -1, -1);
+                llama_memory_seq_cp(mem, 0, r, -1, -1);
+            }
+            eb.pos[r] = pos; eb.n_seq_id[r] = 1; eb.seq_id[r][0] = r; eb.logits[r] = 1;
+        }
+        eb.n_tokens = n_rows;
+        const bool ok = llama_decode(ctx, eb) == 0;
+        for (int r = 1; r < n_rows; ++r) llama_memory_seq_rm(mem, r, -1, -1);
+        if (!ok) { err = "superpose: decode failed (step " + std::to_string(step) + ")"; return false; }
+
+        server_superpose_step st;
+        st.tok    = cand[0];
+        st.ent    = (float) HT;
+        st.eff    = (float) (1.0 / sw2);
+        st.mass   = (float) mass;
+        st.n_cand = nc;
+        st.shrink = (float) shrink;
+        for (int j = 0; j < std::min(nc, p.n_show); ++j) { st.top.push_back(cand[j]); st.top_w.push_back((float) w[j]); }
+
+        // interference: the next-token distributions (temperature 1) after the superposed input and after each candidate
+        parallel_for(n_rows, n_threads, [&](int r) {
+            const float * z = llama_get_logits_ith(ctx, r);
+            float * pr = P.data() + (size_t) r * n_vocab;
+            log_softmax(z, pr, n_vocab, 1.0f);
+            for (int v = 0; v < n_vocab; ++v) pr[v] = std::exp(pr[v]);
+        });
+        if (p.mix) {
+            const float * q = P.data();
+            std::vector<double> kl_c(n_chunk, 0.0), tv_c(n_chunk, 0.0);
+            parallel_for(n_chunk, n_threads, [&](int c) {
+                const int a = (int) ((int64_t) n_vocab * c / n_chunk), b = (int) ((int64_t) n_vocab * (c + 1) / n_chunk);
+                double kl = 0.0, tv = 0.0;
+                for (int v = a; v < b; ++v) {
+                    double m = 0.0;
+                    for (int j = 0; j < nc; ++j) m += w[j] * P[(size_t) (1 + j) * n_vocab + v];
+                    if (m > 0.0) kl += m * (std::log(m) - std::log(std::max((double) q[v], 1e-30)));
+                    tv += std::fabs(m - q[v]);
+                }
+                kl_c[c] = kl; tv_c[c] = tv;
+            });
+            std::vector<double> tv_j(nc, 0.0);
+            parallel_for(nc, n_threads, [&](int j) {
+                const float * pj = P.data() + (size_t) (1 + j) * n_vocab;
+                double tv = 0.0;
+                for (int v = 0; v < n_vocab; ++v) tv += std::fabs((double) pj[v] - q[v]);
+                tv_j[j] = 0.5 * tv;
+            });
+            const int near = (int) (std::min_element(tv_j.begin(), tv_j.end()) - tv_j.begin());
+            st.kl      = (float) std::max(0.0, std::accumulate(kl_c.begin(), kl_c.end(), 0.0));
+            st.tv      = (float) (0.5 * std::accumulate(tv_c.begin(), tv_c.end(), 0.0));
+            st.tv_top  = (float) tv_j[0];
+            st.near    = cand[near];
+            st.near_w  = (float) w[near];
+            st.tv_near = (float) tv_j[near];
+        }
+        zcur.assign(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(ctx, 0) + n_vocab);
+
+        out.steps.push_back(st);
+        argmax_toks.push_back(st.tok);
+        if (p.on_step && !p.on_step(st)) break;
+        hot = HT > INCOH_H ? hot + 1 : 0;
+        if (hot >= INCOH_RUN) { out.endpoint = 2; break; }
+        if (find_loop(argmax_toks, LOOP_MAX_P, LOOP_MIN_SPAN) > 0) { out.endpoint = 1; break; }
+        if (llama_vocab_is_eog(vocab, st.tok)) break; // end of document: stop, not an endpoint
+    }
+    out.sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+
+    // ---- exposure log ----
+    char mode[160];
+    snprintf(mode, sizeof(mode), "top_p %.2f, k <= %d, temp %.2f%s%s", p.top_p, p.k, p.temp, p.norm ? ", length-matched" : "",
+             p.mix ? ", each candidate also decoded alone" : "");
+    if (!p.log_group.empty()) {
+        steer_group & g = g_steer.grp;
+        const auto now = std::chrono::steady_clock::now();
+        if (g.n_req > 0 && (g.kind != "superpose" || g.name != p.log_group || g.mode != mode)) flush_group();
+        if (g.n_req == 0) { g.kind = "superpose"; g.name = p.log_group; g.mode = mode; g.model = g_steer.model_name; g.note = p.note; g.t0 = now; }
+        g.tok += (long long) out.steps.size(); g.n_ctx++; g.n_end += out.endpoint != 0; g.n_req++;
+        if (p.log_flush || g.n_req >= 100 || now - g.t0 > std::chrono::minutes(10)) flush_group();
+    } else {
+        char row[2048];
+        snprintf(row, sizeof(row), "%s,loom-superpose,%s,%s,%.3f,%lld,%d,%s,%.3f,%s\n", today().c_str(), csv_q(g_steer.model_name).c_str(),
+                 csv_q(std::string("superposed input, no push: the probability-weighted mean of the top candidates' input embeddings fed "
+                                   "instead of a token at every step (off the token manifold); ") + mode).c_str(),
+                 0.0, (long long) out.steps.size(), 1, csv_q(ENDPOINT_DESC).c_str(), out.endpoint != 0 ? 1.0 : 0.0,
+                 csv_q("llama-server /steer (superpose)" + (p.note.empty() ? "" : "; " + p.note)).c_str());
         write_log_row(row);
     }
     return true;

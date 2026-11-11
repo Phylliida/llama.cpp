@@ -78,11 +78,9 @@ llama_model_glm4::graph::graph(const llama_model & model, const llm_graph_params
 
     inpL = build_inp_embd(model.tok_embd);
 
+    // raw embeddings without M-RoPE run with ordinary 1-D positions: right for text-only input given as embeddings (the
+    // superposed inputs of the server's /steer), wrong for images, which need a GGUF with rope sections
     bool use_mrope = hparams.use_mrope();
-    if (ubatch.embd && !use_mrope) {
-        // unfortunately, we need to forcefully stop here, to avoid users complaining about wrong results
-        GGML_ABORT("This GGUF does not support multimodal. Please reconvert it.");
-    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();

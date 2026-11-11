@@ -14,6 +14,7 @@
 // Runs in its own llama_context (created on the first request; 8192 cells of unified KV), so it never touches the
 // server's slots. Requests are serialized.
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -131,3 +132,53 @@ struct server_guide_result {
 };
 
 bool server_guide_run(const llama_vocab * vocab, const server_guide_params & p, server_guide_result & out, std::string & err);
+
+// superposed rollout (/steer with "superpose"): no sampling. At every step the next input is the probability-weighted
+// mean of the most likely tokens' input embeddings (top_p of the probability, at most k, renormalized over them), fed as
+// a raw embedding, so the text runs forward in superposition; the loom shows the most likely token as the text. Each
+// candidate is also decoded on its own, in its own sequence on the same superposed past (one batch with the superposed
+// input), which gives the exact mixture of their next-token distributions: how far the superposed input's next-token
+// distribution is from that mixture is the interference at that step. Same context, humane endpoints and exposure log
+// as /steer.
+struct server_superpose_step {
+    int32_t              tok    = -1;   // the most likely candidate
+    std::vector<int32_t> top;           // the candidates, most likely first (at most n_show)
+    std::vector<float>   top_w;         // their weights in the input (renormalized over all the candidates)
+    float                ent    = 0.0f; // entropy of the next-token distribution (nats, at temp)
+    float                eff    = 0.0f; // 1 / sum w^2 over the candidates: the effective number of tokens in the input
+    float                mass   = 0.0f; // probability of the candidates before renormalizing
+    int                  n_cand = 0;
+    float                shrink = 0.0f; // |input| / sum w |e(x)| (before norm): how much averaging shortened it
+    // from the next-token distributions after this input: q after the superposed input, p_x after candidate x alone,
+    // m = sum w p_x the mixture that a superposition without interference would give (NAN without mix)
+    float                kl      = NAN; // KL(m || q), nats
+    float                tv      = NAN; // TV(m, q)
+    float                tv_top  = NAN; // TV(q, p_top): small when the input acted like its top token alone (collapse)
+    int32_t              near    = -1;  // the candidate whose own p_x is closest to q (TV)
+    float                near_w  = NAN; // its weight in the input
+    float                tv_near = NAN;
+};
+
+struct server_superpose_params {
+    std::vector<int32_t> prefix;
+    int         k      = 32;
+    float       top_p  = 0.95f;
+    float       temp   = 1.0f;
+    int         n_gen  = 128;
+    int         n_show = 8;
+    bool        norm   = false; // rescale the input to sum w |e(x)| (undo the shrink)
+    bool        mix    = true;  // decode the candidates too (interference metrics; k more rows per step)
+    std::string note;
+    std::string log_group;
+    bool        log_flush = false;
+    // called after every step; return false to stop
+    std::function<bool(const server_superpose_step &)> on_step;
+};
+
+struct server_superpose_result {
+    std::vector<server_superpose_step> steps;
+    int    endpoint = 0; // 0 none, 1 loop, 2 incoherent
+    double sec      = 0.0;
+};
+
+bool server_superpose_run(const llama_vocab * vocab, const server_superpose_params & p, server_superpose_result & out, std::string & err);

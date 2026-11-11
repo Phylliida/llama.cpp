@@ -5442,7 +5442,8 @@ void server_routes::init_routes() {
         };
         const json body = json::parse(req.body);
         const bool guided = body.count("guide") != 0;
-        if (!guided && !server_jlens_dirs_enabled()) {
+        const bool superposed = body.count("superpose") != 0;
+        if (!guided && !superposed && !server_jlens_dirs_enabled()) {
             { bad("/steer needs direction probes (start the server with --jlens PATH --probe-dirs PATH)", 404); return res; }
         }
         llama_tokens tokens;
@@ -5528,6 +5529,77 @@ void server_routes::init_routes() {
                 return true;
             });
         };
+
+        if (superposed) {
+            // superposed rollout (server_superpose_run): the probability-weighted mean of the top candidates' input
+            // embeddings is fed at every step instead of a token; streamed steps carry the mixture and the interference
+            const json & g = body.at("superpose");
+            server_superpose_params sp;
+            sp.prefix.assign(tokens.begin(), tokens.begin() + pos + 1);
+            sp.k         = json_value(g, "k", 32);
+            sp.top_p     = json_value(g, "top_p", 0.95f);
+            sp.norm      = json_value(g, "norm", false);
+            sp.mix       = json_value(g, "mix", true);
+            sp.n_show    = json_value(g, "n_show", 8);
+            sp.n_gen     = json_value(body, "n_gen", 128);
+            sp.temp      = json_value(body, "temperature", 1.0f);
+            sp.note      = json_value(body, "note", std::string());
+            sp.log_group = json_value(body, "log_group", std::string());
+            sp.log_flush = json_value(body, "log_flush", false);
+            auto step_json = [vocab](const server_superpose_step & s) {
+                json top = json::array();
+                for (size_t i = 0; i < s.top.size(); ++i) top.push_back(json::array({s.top[i], common_token_to_piece(vocab, s.top[i], true), s.top_w[i]}));
+                json j = {{"top", top}, {"ent", s.ent}, {"eff", s.eff}, {"mass", s.mass}, {"n_cand", s.n_cand}, {"shrink", s.shrink}};
+                if (std::isfinite(s.tv)) {
+                    j["kl"] = s.kl; j["tv"] = s.tv; j["tv_top"] = s.tv_top; j["tv_near"] = s.tv_near; j["near_w"] = s.near_w;
+                    j["near"] = json::array({s.near, common_token_to_piece(vocab, s.near, true)});
+                }
+                return j;
+            };
+            auto summary = [pos, n_tok = (int) tokens.size()](const server_superpose_result & r) {
+                double eff = 0.0, tv = 0.0, tv_max = 0.0, n_tv = 0.0, n1 = 0.0;
+                for (const auto & s : r.steps) {
+                    eff += s.eff; n1 += s.eff < 1.5f;
+                    if (std::isfinite(s.tv)) { tv += s.tv; tv_max = std::max(tv_max, (double) s.tv); n_tv++; }
+                }
+                const double n = std::max<double>(1.0, (double) r.steps.size());
+                return json{
+                    {"n_gen",     (int) r.steps.size()},
+                    {"endpoint",  r.endpoint == 1 ? "loop" : r.endpoint == 2 ? "incoherent" : ""},
+                    {"mean_eff",  eff / n},
+                    {"frac_one",  n1 / n}, // steps whose input was essentially one token (1 / sum w^2 < 1.5)
+                    {"mean_tv",   n_tv > 0 ? tv / n_tv : 0.0},
+                    {"max_tv",    tv_max},
+                    {"pos",       pos},
+                    {"n_tokens",  n_tok},
+                    {"sec",       r.sec},
+                };
+            };
+            if (json_value(body, "stream", false)) {
+                auto st = std::make_shared<steer_stream>();
+                sp.on_step = [st, push_token, step_json](const server_superpose_step & s) { return push_token(*st, s.tok, json{{"sup", step_json(s)}}); };
+                std::thread([st, sp, vocab, finish, summary]() {
+                    server_superpose_result r;
+                    std::string err;
+                    const bool ok = server_superpose_run(vocab, sp, r, err);
+                    finish(*st, ok, err, ok ? summary(r) : json());
+                }).detach();
+                serve(st);
+                return res;
+            }
+            server_superpose_result r;
+            std::string err;
+            if (!server_superpose_run(vocab, sp, r, err)) { bad(err); return res; }
+            json out = summary(r);
+            llama_tokens toks;
+            json steps = json::array();
+            for (const auto & s : r.steps) { toks.push_back(s.tok); steps.push_back(step_json(s)); }
+            out["tokens"] = toks;
+            out["text"]   = tokens_to_str(vocab, toks);
+            out["steps"]  = steps;
+            res->ok(out);
+            return res;
+        }
 
         if (guided) {
             // guided sampling (server_guide_run): no push, each token chosen among the top candidates by a metric
