@@ -5441,6 +5441,12 @@ void server_routes::init_routes() {
             res->error(json{{"code", code}, {"message", msg}, {"type", code == 404 ? "not_found_error" : "invalid_request_error"}});
         };
         const json body = json::parse(req.body);
+        if (body.count("explore_stop") != 0) {
+            // finish the running exploration after its current step (its stream then ends with what it found)
+            server_explore_stop();
+            res->ok(json{{"ok", true}});
+            return res;
+        }
         const bool guided = body.count("guide") != 0;
         const bool superposed = body.count("superpose") != 0;
         const bool explored = body.count("explore") != 0;
@@ -5589,6 +5595,7 @@ void server_routes::init_routes() {
                 }
                 o["mass_total"] = tot;
                 o["radius"]     = r.radius;
+                o["stopped"]    = r.stopped;
                 o["rounds"]     = r.n_rounds;
                 o["n_tok"]      = r.n_tok;
                 o["sec"]        = r.sec;

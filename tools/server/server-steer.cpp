@@ -8,6 +8,7 @@
 #include "src/llama-model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1062,8 +1063,13 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     return true;
 }
 
+static std::atomic<bool> g_explore_stop{false};
+
+void server_explore_stop() { g_explore_stop = true; }
+
 bool server_explore_run(const llama_vocab * vocab, const server_explore_params & p, server_explore_result & out, std::string & err) {
     std::lock_guard<std::mutex> lock(g_steer.mutex);
+    g_explore_stop = false;
     const auto t_start = std::chrono::steady_clock::now();
     if (!g_steer.model) { err = "explore: not initialized (model reloading?)"; return false; }
     const int n_embd  = llama_model_n_embd(g_steer.model);
@@ -1505,6 +1511,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
             do_round(step + 1, !fc && !plain, rd);
             if (p.on_round && !p.on_round(rd)) break;
         }
+        if (g_explore_stop.exchange(false)) { out.stopped = true; break; }
     }
     do_round(steps, false, out.last);
     for (const auto & wk : live) out.walkers.push_back({wk.toks, wk.path, wk.w, wk.bin, 0, wk.node});

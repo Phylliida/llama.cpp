@@ -273,9 +273,13 @@ struct server_explore_result {
     std::vector<server_explore_node>   nodes;   // with history: every walker at every step
     server_explore_round               last;    // the final binning
     double    radius   = 0.0; // the novelty radius used (standardized RMS units)
+    bool      stopped  = false; // ended early by server_explore_stop (the result holds what was found so far)
     int       n_rounds = 0;
     long long n_tok    = 0;
     double    sec      = 0.0;
 };
 
 bool server_explore_run(const llama_vocab * vocab, const server_explore_params & p, server_explore_result & out, std::string & err);
+
+// ask the running exploration to finish after its current step and return what it has (thread-safe; no-op if none runs)
+void server_explore_stop();
