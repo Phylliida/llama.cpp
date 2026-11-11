@@ -848,6 +848,8 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     if (!(p.top_p > 0.0f && p.top_p <= 1.0f)) { err = "superpose: top_p must be in (0, 1]"; return false; }
     if (!(p.temp > 0.0f)) { err = "superpose: temperature must be > 0"; return false; }
     if (p.n_show < 1 || p.n_show > 64) { err = "superpose: n_show must be in [1, 64]"; return false; }
+    const bool resid = p.input == "resid" || p.input == "resid_norm";
+    if (!resid && p.input != "mix") { err = "superpose: input must be mix, resid or resid_norm"; return false; }
     if (p.mix && (p.mix_k < 1 || p.mix_k > N_SEQ_MAX - 1)) { err = "superpose: mix_k must be in [1, " + std::to_string(N_SEQ_MAX - 1) + "]"; return false; }
     if (p.n_gen < 1 || s + 1 + p.n_gen + p.mix_k > N_CTX) {
         err = "superpose: need n_gen >= 1 and text + n_gen + mix_k <= " + std::to_string(N_CTX) + " (the steering context)";
@@ -860,14 +862,30 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     steer_capture & cap = g_steer.cap;
     cap.enabled = false;
     cap.lin_on.clear();
+    cap.n_embd  = n_embd;
+    cap.name    = p.input == "resid" ? "l_out-" + std::to_string(llama_model_n_layer(g_steer.model) - 1) : "result_norm";
     llama_memory_clear(mem, true);
     if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { err = "superpose: cvec clear failed"; return false; }
     llama_batch tb = llama_batch_init(N_BATCH, 0, 1);
     llama_batch eb = llama_batch_init(N_SEQ_MAX, n_embd, 1); // raw embeddings: the superposed input + each candidate
     struct run_guard {
-        llama_batch & t; llama_batch & e; llama_memory_t m;
-        ~run_guard() { llama_batch_free(t); llama_batch_free(e); llama_memory_clear(m, true); }
-    } rg{tb, eb, mem};
+        llama_batch & t; llama_batch & e; llama_memory_t m; steer_capture & c;
+        ~run_guard() { llama_batch_free(t); llama_batch_free(e); llama_memory_clear(m, true); c.enabled = false; }
+    } rg{tb, eb, mem, cap};
+    // resid: decode with the last block's output (or the final norm's) captured; fb = its row for the superposed input
+    std::vector<float> fb(n_embd);
+    auto decode_cap = [&](llama_batch & b, int row, const char * what) {
+        cap.rows = 0;
+        cap.enabled = resid;
+        const bool ok = llama_decode(ctx, b) == 0;
+        cap.enabled = false;
+        if (!ok) { err = std::string("superpose: decode failed (") + what + ")"; return false; }
+        if (resid) {
+            if (cap.rows <= row) { err = std::string("superpose: residual capture failed (") + what + ")"; return false; }
+            std::copy(cap.buf.begin() + (size_t) row * n_embd, cap.buf.begin() + (size_t) (row + 1) * n_embd, fb.begin());
+        }
+        return true;
+    };
 
     for (int cur = 0; cur <= s; cur += N_UBATCH) {
         const int n = std::min(N_UBATCH, s + 1 - cur);
@@ -875,7 +893,8 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
         for (int j = 0; j < n; ++j) {
             tb.token[j] = p.prefix[cur + j]; tb.pos[j] = cur + j; tb.n_seq_id[j] = 1; tb.seq_id[j][0] = 0; tb.logits[j] = cur + j == s;
         }
-        if (llama_decode(ctx, tb) != 0) { err = "superpose: decode failed (prefix)"; return false; }
+        if (cur + n > s) { if (!decode_cap(tb, 0, "prefix")) return false; } // the only output row: the last token
+        else if (llama_decode(ctx, tb) != 0) { err = "superpose: decode failed (prefix)"; return false; }
     }
     std::vector<float> zcur(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab);
 
@@ -909,7 +928,7 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
         double sw2 = 0.0;
         for (int j = 0; j < nc; ++j) { w[j] = std::exp((double) lT[cand[j]]) / mass; sw2 += w[j] * w[j]; }
 
-        // the superposed input: sum w e(x), optionally rescaled to the weighted mean length of the e(x)
+        // the superposed input: sum w e(x), optionally rescaled to the weighted mean length of the e(x); or the residual
         std::fill(in.begin(), in.end(), 0.0f);
         double len_w = 0.0;
         for (int j = 0; j < nc; ++j) {
@@ -919,13 +938,23 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
             for (int d = 0; d < n_embd; ++d) { in[d] += (float) w[j] * e[d]; e2 += (double) e[d] * e[d]; }
             len_w += w[j] * std::sqrt(e2);
         }
-        double in2 = 0.0;
-        for (int d = 0; d < n_embd; ++d) in2 += (double) in[d] * in[d];
+        auto dot = [&](const float * a, const float * b) { double r = 0.0; for (int d = 0; d < n_embd; ++d) r += (double) a[d] * b[d]; return r; };
+        const std::vector<float> mixv = in;
+        if (resid) {
+            in = fb;
+            if (p.input == "resid_norm") {
+                const double f2 = dot(in.data(), in.data());
+                if (f2 > 0.0) { const float sc = (float) (len_w / std::sqrt(f2)); for (auto & x : in) x *= sc; }
+            }
+        }
+        double in2 = dot(in.data(), in.data());
         const double shrink = len_w > 0.0 ? std::sqrt(in2) / len_w : 1.0;
-        if (p.norm && in2 > 0.0) {
+        if (!resid && p.norm && in2 > 0.0) {
             const float sc = (float) (len_w / std::sqrt(in2));
             for (auto & x : in) x *= sc;
+            in2 = dot(in.data(), in.data());
         }
+        const double t2 = dot(cand_e.data(), cand_e.data()), m2 = dot(mixv.data(), mixv.data());
 
         // one batch: the superposed input continues sequence 0; with mix, each of the top mix_k candidates is decoded
         // alone in its own sequence on the same past
@@ -936,6 +965,8 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
         st.mass   = (float) mass;
         st.n_cand = nc;
         st.shrink = (float) shrink;
+        if (in2 > 0.0 && t2 > 0.0) st.cos_top = (float) (dot(in.data(), cand_e.data()) / std::sqrt(in2 * t2));
+        if (in2 > 0.0 && m2 > 0.0) st.cos_mix = (float) (dot(in.data(), mixv.data()) / std::sqrt(in2 * m2));
         for (int j = 0; j < std::min(nc, p.n_show); ++j) { st.top.push_back(cand[j]); st.top_w.push_back((float) w[j]); }
         const int M = p.mix ? std::min(nc, p.mix_k) : 0;
         for (int r = 0; r <= M; ++r) {
@@ -947,9 +978,9 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
             eb.pos[r] = pos; eb.n_seq_id[r] = 1; eb.seq_id[r][0] = r; eb.logits[r] = 1;
         }
         eb.n_tokens = 1 + M;
-        const bool ok = llama_decode(ctx, eb) == 0;
+        const bool ok = decode_cap(eb, 0, "step");
         for (int r = 1; r <= M; ++r) llama_memory_seq_rm(mem, r, -1, -1);
-        if (!ok) { err = "superpose: decode failed (step " + std::to_string(step) + ")"; return false; }
+        if (!ok) return false;
         zcur.assign(llama_get_logits_ith(ctx, 0), llama_get_logits_ith(ctx, 0) + n_vocab);
         if (M > 0) {
             // next-token distributions (temperature 1): q after the superposed input, p_x after each checked candidate;
@@ -1003,8 +1034,10 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     out.sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
     // ---- exposure log ----
-    char mode[160];
-    snprintf(mode, sizeof(mode), "top_p %.2f, k <= %d, temp %.2f%s%s", p.top_p, p.k, p.temp, p.norm ? ", length-matched" : "",
+    char mode[320];
+    snprintf(mode, sizeof(mode), "%s; top_p %.2f, k <= %d, temp %.2f%s%s", p.input == "mix" ? "input sum w e(x)" : p.input == "resid" ?
+             "input = the last block's output at the previous position (raw)" : "input = the final-norm output at the previous position, rescaled to sum w |e(x)|",
+             p.top_p, p.k, p.temp, p.norm ? ", length-matched" : "",
              p.mix ? (", the top " + std::to_string(p.mix_k) + " also decoded alone").c_str() : "");
     if (!p.log_group.empty()) {
         steer_group & g = g_steer.grp;

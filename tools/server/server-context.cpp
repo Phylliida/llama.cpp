@@ -5539,6 +5539,7 @@ void server_routes::init_routes() {
             sp.k         = json_value(g, "k", 512);
             sp.top_p     = json_value(g, "top_p", 1.0f);
             sp.mix_k     = json_value(g, "mix_k", 32);
+            sp.input     = json_value(g, "input", std::string("mix"));
             sp.norm      = json_value(g, "norm", false);
             sp.mix       = json_value(g, "mix", true);
             sp.n_show    = json_value(g, "n_show", 8);
@@ -5550,7 +5551,8 @@ void server_routes::init_routes() {
             auto step_json = [vocab](const server_superpose_step & s) {
                 json top = json::array();
                 for (size_t i = 0; i < s.top.size(); ++i) top.push_back(json::array({s.top[i], common_token_to_piece(vocab, s.top[i], true), s.top_w[i]}));
-                json j = {{"top", top}, {"ent", s.ent}, {"eff", s.eff}, {"mass", s.mass}, {"n_cand", s.n_cand}, {"shrink", s.shrink}};
+                json j = {{"top", top}, {"ent", s.ent}, {"eff", s.eff}, {"mass", s.mass}, {"n_cand", s.n_cand}, {"shrink", s.shrink},
+                          {"cos_top", s.cos_top}, {"cos_mix", s.cos_mix}};
                 if (std::isfinite(s.tv)) {
                     j["kl"] = s.kl; j["tv"] = s.tv; j["tv_top"] = s.tv_top; j["tv_near"] = s.tv_near; j["near_w"] = s.near_w;
                     j["near"] = json::array({s.near, common_token_to_piece(vocab, s.near, true)});

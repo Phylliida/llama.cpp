@@ -158,6 +158,8 @@ struct server_superpose_step {
     float                near_w  = NAN; // its weight in the input
     float                tv_near = NAN;
     float                mix_mass = NAN; // probability of the decoded candidates (the mixture is renormalized over them)
+    float                cos_top  = NAN; // cosine of the input with the top token's embedding
+    float                cos_mix  = NAN; // cosine of the input with sum w e(x)
 };
 
 struct server_superpose_params {
@@ -168,6 +170,9 @@ struct server_superpose_params {
     int         n_gen  = 128;
     int         n_show = 8;
     bool        norm   = false; // rescale the input to sum w |e(x)| (undo the shrink)
+    // the input: "mix" sum w e(x); "resid" the last block's output at the previous position, as it is; "resid_norm" the
+    // same after the final norm, rescaled to sum w |e(x)| (the candidates are still computed, for the view and the check)
+    std::string input  = "mix";
     bool        mix    = true;  // decode the top mix_k candidates too (interference metrics; mix_k more rows per step)
     int         mix_k  = 32;
     std::string note;
