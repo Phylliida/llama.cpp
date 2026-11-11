@@ -218,6 +218,7 @@ struct server_explore_round {
     double                          mass  = 0.0;   // total weight, live and finished (beam: the mass the top walkers hold)
     double                          eff   = 0.0;   // effective number of live walkers, (sum w)^2 / sum w^2
     int                             n_par = 0;     // walkers of the previous step that have children in this one
+    long long                       cells = 0;     // KV cells the prompt and the live walkers' histories use (shared prefixes once)
     std::vector<std::vector<int32_t>> top;         // the heaviest walkers (live or finished), n_ex of them
     std::vector<double>               top_w;
 };
@@ -251,6 +252,7 @@ struct server_explore_params {
     std::string method = "we";
     int         fc_top = 64;
     bool        history = false; // keep every visited node (the population at every step) in the result
+    float       duty    = 1.0f;  // after the first 5 s, rest between steps so the GPU computes this fraction of the time
     int         n_gen    = 48;
     int         n_ex     = 2;     // examples per bin
     uint64_t    seed     = 1;
@@ -273,13 +275,17 @@ struct server_explore_result {
     std::vector<server_explore_node>   nodes;   // with history: every walker at every step
     server_explore_round               last;    // the final binning
     double    radius   = 0.0; // the novelty radius used (standardized RMS units)
-    bool      stopped  = false; // ended early by server_explore_stop (the result holds what was found so far)
+    bool      stopped  = false; // ended early (the result holds what was found so far)
+    std::string stop_reason;    // "user" (server_explore_stop) or "memory" (the next step might not fit in the KV cache)
     int       n_rounds = 0;
     long long n_tok    = 0;
     double    sec      = 0.0;
 };
 
 bool server_explore_run(const llama_vocab * vocab, const server_explore_params & p, server_explore_result & out, std::string & err);
+
+// KV cells of the steering context (what the walkers' live tree must fit in)
+int server_explore_n_ctx();
 
 // ask the running exploration to finish after its current step and return what it has (thread-safe; no-op if none runs)
 void server_explore_stop();

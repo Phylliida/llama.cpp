@@ -5555,6 +5555,7 @@ void server_routes::init_routes() {
             ep.method    = json_value(g, "method", std::string(ep.resample ? "we" : "plain"));
             ep.fc_top    = json_value(g, "fc_top", 64);
             ep.history   = json_value(g, "history", false);
+            ep.duty      = json_value(g, "duty", 1.0f);
             ep.n_gen     = json_value(body, "n_gen", 48);
             ep.seed      = json_value(body, "seed", 1);
             ep.note      = json_value(body, "note", std::string());
@@ -5570,7 +5571,7 @@ void server_routes::init_routes() {
                 json top = json::array();
                 for (size_t i = 0; i < r.top.size(); ++i) top.push_back({{"text", tokens_to_str(vocab, llama_tokens(r.top[i].begin(), r.top[i].end()))}, {"w", r.top_w[i]}});
                 return json{{"step", r.step}, {"live", r.n_live}, {"done", r.n_done}, {"new", r.n_new}, {"new_mass", r.new_mass}, {"bins", bins},
-                            {"mass", r.mass}, {"eff", r.eff}, {"n_par", r.n_par}, {"top", top}};
+                            {"mass", r.mass}, {"eff", r.eff}, {"n_par", r.n_par}, {"cells", r.cells}, {"top", top}};
             };
             auto final_json = [vocab, round_json, pos, n_tok = (int) tokens.size()](const server_explore_result & r) {
                 json ws = json::array();
@@ -5596,6 +5597,8 @@ void server_routes::init_routes() {
                 o["mass_total"] = tot;
                 o["radius"]     = r.radius;
                 o["stopped"]    = r.stopped;
+                o["stop_reason"] = r.stop_reason;
+                o["n_ctx"]      = server_explore_n_ctx();
                 o["rounds"]     = r.n_rounds;
                 o["n_tok"]      = r.n_tok;
                 o["sec"]        = r.sec;

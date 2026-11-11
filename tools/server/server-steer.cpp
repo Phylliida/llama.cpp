@@ -1067,6 +1067,8 @@ static std::atomic<bool> g_explore_stop{false};
 
 void server_explore_stop() { g_explore_stop = true; }
 
+int server_explore_n_ctx() { return N_CTX; }
+
 bool server_explore_run(const llama_vocab * vocab, const server_explore_params & p, server_explore_result & out, std::string & err) {
     std::lock_guard<std::mutex> lock(g_steer.mutex);
     g_explore_stop = false;
@@ -1086,12 +1088,15 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     if (p.max_bins < 1 || p.max_bins > 1024) { err = "explore: max_bins must be in [1, 1024]"; return false; }
     if (!(p.alpha >= 0.1f && p.alpha <= 2.0f)) { err = "explore: alpha must be in [0.1, 2]"; return false; }
     if (p.n_ex < 0 || p.n_ex > 8) { err = "explore: n_ex must be in [0, 8]"; return false; }
+    if (!(p.duty >= 0.1f && p.duty <= 1.0f)) { err = "explore: duty must be in [0.1, 1]"; return false; }
     const bool beam = p.method == "beam";
     const bool fc = p.method == "fc" || beam, plain = p.method == "plain" || (!p.resample && !fc);
     if (!fc && p.method != "we" && p.method != "plain") { err = "explore: method must be we, fc, beam or plain"; return false; }
     if (fc && (p.fc_top < 1 || p.fc_top > 1024)) { err = "explore: fc_top must be in [1, 1024]"; return false; }
-    if (p.n_gen < 1 || s + 1 + (long long) W * p.n_gen > N_CTX) {
-        err = "explore: need n_gen >= 1 and text + walkers x n_gen <= " + std::to_string(N_CTX) + " (the steering context)";
+    // the walkers share their histories in the KV cache (a copy shares its parent's cells, a dropped walker frees the ones
+    // only it held), so what has to fit is the live tree, checked every step; here only the first step
+    if (p.n_gen < 1 || s + 1 + W + 16 > N_CTX) {
+        err = "explore: need n_gen >= 1 and text + walkers <= " + std::to_string(N_CTX - 16) + " (the steering context)";
         return false;
     }
 
@@ -1150,6 +1155,16 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     std::vector<walker> live;
     std::vector<server_explore_walker> fin;
     std::vector<std::vector<float>>    fin_feat;
+    // every walker's history as a tree: node = one token at one step (one KV cell), npar its parent (-1: the prompt)
+    std::vector<int> npar, mark;
+    int mark_id = 0;
+    auto live_cells = [&]() {
+        mark.resize(npar.size(), 0);
+        ++mark_id;
+        long long n = s + 1;
+        for (const auto & wk : live) for (int i = wk.node; i >= 0 && mark[i] != mark_id; i = npar[i]) { mark[i] = mark_id; n++; }
+        return n;
+    };
     std::vector<int> free_ids;
     for (int i = N_SEQ_MAX - 1; i >= 1; --i) free_ids.push_back(i);
     auto alloc   = [&]() { const int id = free_ids.back(); free_ids.pop_back(); return id; };
@@ -1447,6 +1462,9 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     };
 
     for (int step = 0; step < p.n_gen && !live.empty(); ++step) {
+        const auto t_step = std::chrono::steady_clock::now();
+        // stop before the cache could overflow: a step adds at most W cells
+        if (live_cells() + W + 16 > N_CTX) { out.stopped = true; out.stop_reason = "memory"; break; }
         if (fc) fc_select();
         const int nl = (int) live.size();
         tok.assign(nl, 0); u.assign(nl, 0.0); ent.assign(nl, 0.0f);
@@ -1477,7 +1495,26 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
             batch.token[i] = tok[i]; batch.pos[i] = s + 1 + step; batch.n_seq_id[i] = 1; batch.seq_id[i][0] = live[i].seq; batch.logits[i] = 1;
         }
         batch.n_tokens = nl;
-        if (!decode_cap(nl, "step")) return false;
+        cap.rows = 0;
+        cap.enabled = true;
+        const int rc = llama_decode(ctx, batch);
+        cap.enabled = false;
+        if (rc == 1) {
+            // no room for the batch after all (scattered free cells): keep the chosen tokens, undecoded, and stop
+            for (int i = 0; i < nl; ++i) {
+                walker & wk = live[i];
+                wk.toks.push_back(tok[i]);
+                npar.push_back(wk.node);
+                if (p.history) out.nodes.push_back({wk.node, tok[i], step, wk.w, wk.path.back()});
+                wk.node = (int) npar.size() - 1;
+            }
+            steps = step + 1;
+            out.stopped = true;
+            out.stop_reason = "memory";
+            break;
+        }
+        if (rc != 0) { err = "explore: decode failed (step " + std::to_string(step) + ")"; return false; }
+        if (cap.rows != nl) { err = "explore: l_out capture failed (step " + std::to_string(step) + ")"; return false; }
         n_tok += nl;
         steps = step + 1;
         parallel_for(nl, n_threads, [&](int i) {
@@ -1494,7 +1531,9 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         std::vector<walker> kept;
         for (int i = 0; i < nl; ++i) {
             walker & wk = live[i];
-            if (p.history) { out.nodes.push_back({wk.node, tok[i], step, wk.w, wk.path.back()}); wk.node = (int) out.nodes.size() - 1; }
+            npar.push_back(wk.node);
+            if (p.history) out.nodes.push_back({wk.node, tok[i], step, wk.w, wk.path.back()});
+            wk.node = (int) npar.size() - 1;
             wk.hot = ent[i] > INCOH_H ? wk.hot + 1 : 0;
             const int end = llama_vocab_is_eog(vocab, tok[i]) || llama_vocab_is_control(vocab, tok[i]) ? 1 : find_loop(wk.toks, LOOP_MAX_P, LOOP_MIN_SPAN) > 0 ? 2 : wk.hot >= INCOH_RUN ? 3 : 0;
             if (end) {
@@ -1509,11 +1548,18 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         if (!live.empty() && (step + 1) % p.tau == 0 && step + 1 < p.n_gen) {
             server_explore_round rd;
             do_round(step + 1, !fc && !plain, rd);
+            rd.cells = live_cells();
             if (p.on_round && !p.on_round(rd)) break;
         }
-        if (g_explore_stop.exchange(false)) { out.stopped = true; break; }
+        if (g_explore_stop.exchange(false)) { out.stopped = true; out.stop_reason = "user"; break; }
+        // pacing for long runs: rest (1 / duty - 1) x this step's time, so the GPU cools
+        const auto now = std::chrono::steady_clock::now();
+        if (p.duty < 1.0f && now - t_start > std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(std::chrono::duration<double>(now - t_step).count() * (1.0 / p.duty - 1.0)));
+        }
     }
     do_round(steps, false, out.last);
+    out.last.cells = live_cells();
     for (const auto & wk : live) out.walkers.push_back({wk.toks, wk.path, wk.w, wk.bin, 0, wk.node});
     for (const auto & f : fin) out.walkers.push_back(f);
     out.radius   = R;
