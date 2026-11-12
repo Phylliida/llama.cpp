@@ -30,6 +30,7 @@ struct steer_capture {
     int64_t            rows    = 0;
     int64_t            n_embd  = 0;
     bool               enabled = false;
+    bool               append  = false; // explore: a decode spans several ubatches; rows accumulate in batch order
     // guided sampling: per row, the sum over the layers in lin_on of w_L . h_L, and |h|^2 at those layers
     const float *       lin_w = nullptr; // [n_layer][n_embd]
     std::vector<char>   lin_on;          // per layer; empty: capture l_out-L named by name instead
@@ -72,9 +73,10 @@ bool steer_cb_eval(ggml_tensor * t, bool ask, void * ud) {
         c->rows = -1; // checked by the caller
         return true;
     }
-    c->rows = ggml_nrows(t);
+    const int64_t off = c->append ? c->rows : 0;
+    c->rows = off + ggml_nrows(t);
     c->buf.resize((size_t) c->rows * c->n_embd);
-    ggml_backend_tensor_get(t, c->buf.data(), 0, ggml_nbytes(t));
+    ggml_backend_tensor_get(t, c->buf.data() + (size_t) off * c->n_embd, 0, ggml_nbytes(t));
     return true;
 }
 
@@ -101,10 +103,11 @@ struct steer_state {
 
 steer_state g_steer;
 
-constexpr int N_CTX     = 16384; // explore: walkers x tokens
-constexpr int N_BATCH   = 512;
-constexpr int N_UBATCH  = 256; // l_out capture sees one ubatch per callback: captured decodes stay within it
-constexpr int N_SEQ_MAX = 256; // LLAMA_MAX_SEQ; steering: the last one holds the shared unsteered prefix
+constexpr int N_CTX     = 32768; // explore: the walkers' live tree
+constexpr int N_BATCH   = 2048;  // explore: one row per walker in a step
+constexpr int N_UBATCH  = 256;   // l_out capture sees one ubatch per callback: steer/guide/superpose decodes stay within it
+constexpr int N_ROWS_1U = N_UBATCH - 1; // their sequence budget (explore's capture appends across ubatches instead)
+constexpr int N_SEQ_MAX = 2048;  // LLAMA_MAX_SEQ (raised in this fork); steering: the last one holds the shared unsteered prefix
 constexpr int SUP_K_MAX = 1024; // superpose: tokens in the input
 constexpr int N_FOLLOW  = 256;
 
@@ -308,8 +311,8 @@ bool server_steer_run(const llama_vocab * vocab, const server_steer_params & p, 
     const int s = (int) p.prefix.size() - 1; // the push token
     const int n_f = std::min((int) p.follow.size(), N_FOLLOW);
     if (s < 0) { err = "steer: empty prefix"; return false; }
-    if (NS < 1 || G < 1 || G > 512 || n_arm * NS > N_SEQ_MAX - 1) {
-        err = "steer: need 1 <= n_gen <= 512 and (arms x n_seq) <= " + std::to_string(N_SEQ_MAX - 1);
+    if (NS < 1 || G < 1 || G > 512 || n_arm * NS > N_ROWS_1U) {
+        err = "steer: need 1 <= n_gen <= 512 and (arms x n_seq) <= " + std::to_string(N_ROWS_1U);
         return false;
     }
     if (!(p.temp > 0.0f)) { err = "steer: temperature must be > 0"; return false; }
@@ -642,7 +645,7 @@ bool server_guide_run(const llama_vocab * vocab, const server_guide_params & p, 
     }
     const int s = (int) p.prefix.size() - 1;
     if (s < 0) { err = "guide: empty prefix"; return false; }
-    if (p.k < 1 || p.k > N_SEQ_MAX - 2) { err = "guide: k must be in [1, " + std::to_string(N_SEQ_MAX - 2) + "]"; return false; }
+    if (p.k < 1 || p.k > N_ROWS_1U - 1) { err = "guide: k must be in [1, " + std::to_string(N_ROWS_1U - 1) + "]"; return false; }
     if (!(p.top_p > 0.0f && p.top_p <= 1.0f)) { err = "guide: top_p must be in (0, 1]"; return false; }
     if (!(p.temp > 0.0f)) { err = "guide: temperature must be > 0"; return false; }
     if (!std::isfinite(p.beta) || std::fabs(p.beta) > 50.0f) { err = "guide: |beta| must be <= 50"; return false; }
@@ -855,7 +858,7 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     if (p.n_show < 1 || p.n_show > 64) { err = "superpose: n_show must be in [1, 64]"; return false; }
     const bool resid = p.input == "resid" || p.input == "resid_norm";
     if (!resid && p.input != "mix") { err = "superpose: input must be mix, resid or resid_norm"; return false; }
-    if (p.mix && (p.mix_k < 1 || p.mix_k > N_SEQ_MAX - 1)) { err = "superpose: mix_k must be in [1, " + std::to_string(N_SEQ_MAX - 1) + "]"; return false; }
+    if (p.mix && (p.mix_k < 1 || p.mix_k > N_ROWS_1U)) { err = "superpose: mix_k must be in [1, " + std::to_string(N_ROWS_1U) + "]"; return false; }
     if (p.n_gen < 1 || s + 1 + p.n_gen + p.mix_k > N_CTX) {
         err = "superpose: need n_gen >= 1 and text + n_gen + mix_k <= " + std::to_string(N_CTX) + " (the steering context)";
         return false;
@@ -872,7 +875,7 @@ bool server_superpose_run(const llama_vocab * vocab, const server_superpose_para
     llama_memory_clear(mem, true);
     if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { err = "superpose: cvec clear failed"; return false; }
     llama_batch tb = llama_batch_init(N_BATCH, 0, 1);
-    llama_batch eb = llama_batch_init(N_SEQ_MAX, n_embd, 1); // raw embeddings: the superposed input + each candidate
+    llama_batch eb = llama_batch_init(N_ROWS_1U + 1, n_embd, 1); // raw embeddings: the superposed input + each candidate
     struct run_guard {
         llama_batch & t; llama_batch & e; llama_memory_t m; steer_capture & c;
         ~run_guard() { llama_batch_free(t); llama_batch_free(e); llama_memory_clear(m, true); c.enabled = false; }
@@ -1108,12 +1111,13 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
     cap.lin_on.clear();
     cap.n_embd  = n_embd;
     cap.name    = "l_out-" + std::to_string(p.layer);
+    cap.append  = true;
     llama_memory_clear(mem, true);
-    if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { err = "explore: cvec clear failed"; return false; }
+    if (llama_set_adapter_cvec(ctx, nullptr, 0, n_embd, 0, 0) != 0) { cap.append = false; err = "explore: cvec clear failed"; return false; }
     llama_batch batch = llama_batch_init(std::max(N_BATCH, N_SEQ_MAX), 0, 1);
     struct run_guard {
         llama_batch & b; llama_memory_t m; steer_capture & c;
-        ~run_guard() { llama_batch_free(b); llama_memory_clear(m, true); c.enabled = false; }
+        ~run_guard() { llama_batch_free(b); llama_memory_clear(m, true); c.enabled = false; c.append = false; }
     } rg{batch, mem, cap};
     auto decode_cap = [&](int n_rows, const char * what) {
         cap.rows = 0;
@@ -1151,6 +1155,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         double               w = 0.0;
         std::vector<float>   lp, feat; // next-token log probabilities; feature moving average
         int                  bin = -1, forced = -1, hot = 0, fam = -1, node = -1;
+        bool                 pushed = false; // the forced token's log p is already in path (fc/beam children)
     };
     std::vector<walker> live;
     std::vector<server_explore_walker> fin;
@@ -1374,18 +1379,52 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         struct cand { int parent; int32_t tok; double q; };
         std::vector<std::vector<int32_t>> tops(live.size());
         std::vector<double> tail(live.size(), 0.0);
+        // beam: each walker's top min(W, 64) first, then, against the W-th best candidate so far, every walker whose last
+        // kept child still clears it gets all its children that do (later candidates only raise the bar, so this is exact)
+        const int k0 = std::min(beam ? std::min(W, 64) : p.fc_top, n_vocab);
         parallel_for((int) live.size(), n_threads, [&](int i) {
             const auto & lp = live[i].lp;
             std::vector<int32_t> ord(n_vocab);
             std::iota(ord.begin(), ord.end(), 0);
-            const int kk = std::min(beam ? W : p.fc_top, n_vocab); // beam: the top W overall may all share a parent
-            std::partial_sort(ord.begin(), ord.begin() + kk, ord.end(), [&](int32_t a, int32_t b) { return lp[a] > lp[b]; });
-            ord.resize(kk);
+            auto by_lp = [&](int32_t a, int32_t b) { return lp[a] > lp[b]; };
+            std::nth_element(ord.begin(), ord.begin() + (k0 - 1), ord.end(), by_lp);
+            std::sort(ord.begin(), ord.begin() + k0, by_lp);
+            ord.resize(k0);
             double m = 0.0;
             for (int32_t x : ord) m += std::exp((double) lp[x]);
             tops[i] = std::move(ord);
             tail[i] = std::max(0.0, 1.0 - m);
         });
+        if (beam && k0 < std::min(W, n_vocab)) {
+            std::vector<double> qs;
+            for (int i = 0; i < (int) live.size(); ++i) for (int32_t x : tops[i]) qs.push_back(live[i].w * std::exp((double) live[i].lp[x]));
+            // fewer candidates than W (the first step, or few walkers): no bar yet, every walker gives its top W
+            double bar = 0.0;
+            if ((int) qs.size() >= W) {
+                std::nth_element(qs.begin(), qs.begin() + (W - 1), qs.end(), std::greater<double>());
+                bar = qs[W - 1];
+            }
+            const int kw = std::min(W, n_vocab);
+            parallel_for((int) live.size(), n_threads, [&](int i) {
+                const auto & lp = live[i].lp;
+                if (!(live[i].w > 0.0) || live[i].w * std::exp((double) lp[tops[i].back()]) < bar) return;
+                auto by_lp = [&](int32_t a, int32_t b) { return lp[a] > lp[b]; };
+                std::vector<int32_t> more;
+                if (bar > 0.0) {
+                    const float lbar = (float) std::log(bar / live[i].w);
+                    for (int v = 0; v < n_vocab; ++v) if (lp[v] >= lbar) more.push_back(v);
+                    std::sort(more.begin(), more.end(), by_lp);
+                    if ((int) more.size() > kw) more.resize(kw);
+                } else {
+                    more.resize(n_vocab);
+                    std::iota(more.begin(), more.end(), 0);
+                    std::nth_element(more.begin(), more.begin() + (kw - 1), more.end(), by_lp);
+                    std::sort(more.begin(), more.begin() + kw, by_lp);
+                    more.resize(kw);
+                }
+                if (more.size() > tops[i].size()) tops[i] = std::move(more);
+            });
+        }
         // a walker's tail (the tokens outside its top) is split into pieces of about 1 / walkers of the weight, each with
         // a token drawn from the tail by stratified sampling (one heavy tail walker would make the estimates noisy)
         std::vector<std::vector<std::pair<int32_t, double>>> tailc(live.size());
@@ -1448,13 +1487,21 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         for (int i = 0; i < (int) live.size(); ++i) {
             for (size_t j = 0; j < kids[i].size(); ++j) {
                 const int t = kids[i][j];
-                walker c2 = j + 1 < kids[i].size() ? live[i] : std::move(live[i]);
+                const float lpx = live[i].lp[ptok[t]];
+                walker c2;
                 if (j + 1 < kids[i].size()) {
+                    // a copy: everything but the next-token distribution (the decode replaces it)
+                    c2.toks = live[i].toks; c2.path = live[i].path; c2.feat = live[i].feat;
+                    c2.bin = live[i].bin; c2.hot = live[i].hot; c2.fam = live[i].fam; c2.node = live[i].node;
                     c2.seq = alloc();
                     llama_memory_seq_cp(mem, live[i].seq, c2.seq, -1, -1);
+                } else {
+                    c2 = std::move(live[i]);
                 }
                 c2.w = pick[t].second;
                 c2.forced = ptok[t];
+                c2.path.push_back(lpx);
+                c2.pushed = true;
                 next.push_back(std::move(c2));
             }
         }
@@ -1471,7 +1518,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         for (int i = 0; i < nl; ++i) u[i] = ud(rng);
         parallel_for(nl, n_threads, [&](int i) {
             walker & wk = live[i];
-            if (wk.forced >= 0) { tok[i] = wk.forced; wk.forced = -1; wk.path.push_back(wk.lp[tok[i]]); return; }
+            if (wk.forced >= 0) { tok[i] = wk.forced; wk.forced = -1; if (!wk.pushed) wk.path.push_back(wk.lp[tok[i]]); wk.pushed = false; return; }
             // proposal q = p^alpha / Z (alpha = 1: p itself); the weight carries p / q
             double lz = 0.0;
             if (p.alpha != 1.0f) {
@@ -1519,6 +1566,7 @@ bool server_explore_run(const llama_vocab * vocab, const server_explore_params &
         steps = step + 1;
         parallel_for(nl, n_threads, [&](int i) {
             walker & wk = live[i];
+            wk.lp.resize(n_vocab); // fc/beam copies start without one
             log_softmax(llama_get_logits_ith(ctx, i), wk.lp.data(), n_vocab, 1.0f);
             double H = 0.0;
             for (int v = 0; v < n_vocab; ++v) H -= std::exp((double) wk.lp[v]) * wk.lp[v];
